@@ -642,11 +642,16 @@ argv = ["codex", "exec", "--sandbox", "workspace-write", "--skip-git-repo-check"
 # CLAUDE-ONLY, and interactive-only. It applies to the `claude` interactive command, not
 # generically to every backend. The headless builder/reviewer must NOT carry it: it starts
 # an *interactive* session and they have no human to reach.
+# Pinned to Opus at high effort (2026-11-05) for both interactive leaves. Unset, the CLI
+# took the operator's ~/.claude/settings.json default, so a session opened in whatever
+# model the operator last chose interactively, not a choice this instance made.
 [leaves.planner]
 mode = "command"
 family = "claude"
 interactive = true
 agent = "planner"
+model = "opus"
+effort = "high"
 argv = ["claude", "--remote-control", "--agent", "planner", "--permission-mode", "acceptEdits"]
 
 [leaves.signoff]
@@ -654,6 +659,8 @@ mode = "command"
 family = "claude"
 interactive = true
 agent = "signoff"
+model = "opus"
+effort = "high"
 argv = ["claude", "--remote-control", "--agent", "signoff", "--permission-mode", "acceptEdits"]
 
 [leaves.act]
