@@ -52,20 +52,20 @@ nl-shell-pdca                       # the status dashboard (bare invocation)
 Before `make install`, run it from source as `python -m pdca_harness.cli flow 123`
 (with `PYTHONPATH=src`).
 
-Run `nl-shell-pdca flow` **in a real terminal** — the Plan, sign-off, publish and Act
-steps open Claude interactively. **Trust:** the first interactive session asks once to
-*trust* the project — a one-time **global** setting (`~/.claude.json`), not something
-`make setup` can write (`setup` handles file *permissions*). Accept it.
+Run `nl-shell-pdca flow` **in a real terminal** — Plan opens Codex interactively;
+sign-off, publish and Act open Claude. **Trust:** the first interactive Claude session
+asks once to *trust* the project — a one-time **global** setting (`~/.claude.json`), not
+something `make setup` can write (`setup` handles file *permissions*). Accept it.
 
 What happens, step by step (the cycle has four beats; review/sign-off/publish are
 steps *within* Check):
 
-1. **Plan** (interactive) — Claude reads your input documents (e.g. a tracker CSV
+1. **Plan** (interactive) — Codex reads your input documents (e.g. a tracker CSV
    via `--from-csv`) and, with you, writes `results/issue_<id>/brief.md`.
    An unbriefed id is auto-planned; already-briefed ids go straight to Do.
-2. **Do** (headless) — Claude implements the brief: `patch.diff`, the test, `build-notes.md`.
+2. **Do** (headless) — Codex implements the brief: `patch.diff`, the test, `build-notes.md`.
 3. **Check** — the deterministic gates run (`→ … still working` heartbeats while
-   they do), then a headless advisory reviewer.
+   they do), then a headless Claude advisory reviewer.
 4. **Sign-off** (Check step, interactive) — Claude reviews the result *with* you; you
    clear the §6 items and decide `accept` / `iterate-do` / `iterate-plan`. The driver
    records §9 under the C6 guard.
@@ -142,8 +142,10 @@ PCDA/               the generic model (reference docs)
 
 - **Iteration is built in.** `iterate-do` rebuilds against the same brief;
   `iterate-plan` re-opens Plan. The flow loops until `COMPLETE` (bounded).
-- **Nothing is pushed for you.** The builder may open a *draft* PR for CI but can
-  never mark it ready/merge — enforced by `.claude/hooks/builder_guard.py`.
+- **Model leaves do not push.** After human sign-off, the deterministic publish step
+  opens the draft PR. No model leaf may mark it ready or merge it. The active Codex
+  builder uses the driver's `gh` PATH shim, while the Claude publisher uses
+  `.claude/hooks/builder_guard.py`.
 - **Rendered from a template.** This project was generated from a Copier PDCA
   template; run `copier update` to pull upstream harness improvements.
 

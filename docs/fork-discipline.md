@@ -71,9 +71,10 @@ it there, not by editing this file (so `copier update` keeps the rules current).
   `merge_requires = "required"` skips all of this and trusts the host's branch
   protection, stale base included. A fork keeps the default `wave_mode = "stack"`, where
   nothing is ever readied or merged for you.
-- No push / PR-open / ready-mark happens without explicit instruction. This is
-  **mechanically enforced** by the builder/publisher PreToolUse hook (`builder_guard.py`),
-  not left to prompt discipline.
+- Model leaves do not push or open PRs; the deterministic publish step owns those
+  mechanics after human sign-off. Ready-mark and merge are **mechanically blocked** on
+  the builder/publisher paths by the family-appropriate backstop: `builder_guard.py` for
+  Claude roles and the driver's `gh` PATH shim for non-Claude roles.
 - If a brief seems to require marking a PR ready, that is a brief defect — surface it
   and stop; do not work around the block.
 

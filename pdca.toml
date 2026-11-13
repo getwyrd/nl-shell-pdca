@@ -495,12 +495,12 @@ base_remote = "origin"
 
 [leaves.builder]
 mode = "command"
-family = "claude"
+family = "codex"
 interactive = false
-# Role prompt: canonical body agents/builder.md. Claude resolves it via the baked
-# `--agent builder`; codex (no agent flag) has it inlined into the prompt.
+# Role prompt: canonical body agents/builder.md, inlined for codex / resolved via
+# `--agent builder` for claude.
 agent = "builder"
-argv = ["claude", "-p", "--agent", "builder", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Edit,Write,Bash,Grep,Glob"]
+argv = ["codex", "exec", "--sandbox", "workspace-write"]
 
 # Builder escalation ladder (issue #135) — optional. A bundle that fails Check and
 # iterates re-runs the builder; without escalation it re-fails with the same model until
@@ -592,21 +592,18 @@ argv = ["claude", "-p", "--agent", "sizer", "--allowedTools", "Read", "Write", "
 
 [leaves.reviewer]
 mode = "command"
-family = "codex"
+family = "claude"
 interactive = false
-# Role prompt: canonical body agents/reviewer.md, inlined for codex / resolved via
-# `--agent reviewer` for claude. (AGENTS.md now carries general codex project context.)
+# Role prompt: canonical body agents/reviewer.md, resolved via `--agent reviewer`
+# for claude / inlined for codex.
 agent = "reviewer"
-# `codex exec --sandbox workspace-write` — the reviewer re-runs red/green evidence
-# (git stash/unstash) and re-checks path:line on $PDCA_TARGET, which the driver grants as a
-# writable root via the family's --add-dir grounding. The role prompt forbids writing the FIX.
-# --skip-git-repo-check: the reviewer's cwd is a temp SANDBOX (not a git repo), which codex
-# exec otherwise refuses to run in ("Not inside a trusted directory").
-argv = ["codex", "exec", "--sandbox", "workspace-write", "--skip-git-repo-check"]
+# Claude runs the reviewer agent with read/execute-only tools; the role prompt forbids
+# writing the fix it judges.
+argv = ["claude", "-p", "--agent", "reviewer", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Bash,Grep,Glob"]
 
 # Interactive leaves — the human-in-the-loop touch points (Plan, Sign-off, Publish,
-# Act) hand the terminal to a seeded model+human REPL, chosen by `interactive_family`
-# (claude). Claude gets a `claude --agent <name>` REPL; codex gets a
+# Act) hand the terminal to a seeded model+human REPL, chosen per leaf below.
+# Claude gets a `claude --agent <name>` REPL; codex gets a
 # `codex` TUI (workspace-write, so edits don't each need approval — the human is present)
 # with the role prompt (agents/<name>.md) inlined via the `agent` key. Independent of the
 # builder/reviewer family above.
@@ -614,25 +611,26 @@ argv = ["codex", "exec", "--sandbox", "workspace-write", "--skip-git-repo-check"
 #
 # The four leaves below (planner, sign-off, publisher, Act) hand the terminal to a REPL and
 # BLOCK there, so a rendered instance inherits a hard constraint that is easy to miss: the
-# human must be sitting at the terminal the flow runs in, for the whole batch. A `nl-shell-pdca flow`
-# over six bundles can park on one sign-off adjudication for hours because nobody is at that
-# machine.
+# human must be sitting at the terminal the flow runs in, for the whole batch. A
+# `nl-shell-pdca flow` over six bundles can park on one sign-off adjudication for hours
+# because nobody is at that machine. The Codex planner remains local; Remote Control is
+# available only to the three Claude leaves.
 #
 # Claude Code's `--remote-control` removes it. Each interactive leaf is its own `claude`
 # subprocess with argv taken straight from this file, so enabling Remote Control in your OWN
 # shell does NOT reach them — which is exactly why this is worth writing down rather than
 # leaving to be discovered.
 #
-# To enable, APPEND the flag to the argv line below — do not add a second `argv = [...]`,
-# which would be a duplicate key the moment you uncomment it. Put it anywhere but LAST:
-# the driver seeds every interactive leaf by appending the prompt as one positional after
-# this argv, and `--remote-control` takes an optional [name] value — as the final token it
-# swallows the whole seed as the RC session name (RC fails with "check the debug log" and
-# the REPL opens unseeded, issue #396). The same holds for ANY flag with an optional
-# value, so none may sit last. The claude spawn inserts `--` before the seed as a
-# backstop; non-last placement is the posture every family supports.
+# To enable on sign-off, publisher, or Act, APPEND the flag to that leaf's argv line.
+# Do not add a second `argv = [...]`, which would be a duplicate key the moment you
+# uncomment it. Put it anywhere but LAST: the driver seeds every interactive leaf by appending the
+# prompt as one positional after this argv, and `--remote-control` takes an optional [name]
+# value — as the final token it swallows the whole seed as the RC session name (RC fails
+# with "check the debug log" and the REPL opens unseeded, issue #396). The same holds for
+# ANY flag with an optional value, so none may sit last. The claude spawn inserts `--`
+# before the seed as a backstop; non-last placement is the posture every family supports.
 #
-#   argv = ["claude", "--remote-control", "--agent", "planner",
+#   argv = ["claude", "--remote-control", "--agent", "signoff",
 #           "--permission-mode", "acceptEdits"]
 #
 # The device must be enrolled first (`/login`). Left off by default because a flag that
@@ -642,17 +640,15 @@ argv = ["codex", "exec", "--sandbox", "workspace-write", "--skip-git-repo-check"
 # CLAUDE-ONLY, and interactive-only. It applies to the `claude` interactive command, not
 # generically to every backend. The headless builder/reviewer must NOT carry it: it starts
 # an *interactive* session and they have no human to reach.
-# Pinned to Opus at high effort (2026-11-05) for both interactive leaves. Unset, the CLI
-# took the operator's ~/.claude/settings.json default, so a session opened in whatever
-# model the operator last chose interactively, not a choice this instance made.
+# Planning uses Codex at high effort; sign-off remains pinned to Claude Opus at high
+# effort. Unset model values use the selected CLI's configured default.
 [leaves.planner]
 mode = "command"
-family = "claude"
+family = "codex"
 interactive = true
 agent = "planner"
-model = "opus"
 effort = "high"
-argv = ["claude", "--remote-control", "--agent", "planner", "--permission-mode", "acceptEdits"]
+argv = ["codex", "--sandbox", "workspace-write"]
 
 [leaves.signoff]
 mode = "command"
@@ -753,7 +749,7 @@ argv = ["claude", "-p", "--agent", "adversary", "--permission-mode", "acceptEdit
 # self-reported field must not route a patch away from the review that would catch the
 # mis-rating (wyrd-pdca dropped the same gate from its adversary for that reason). A patch
 # that touches no attacker-reachable input gets a one-line verdict, so the cost stays small.
-# Claude, like the builder: it stands apart by ROLE, as the adversary does.
+# Claude, unlike the Codex builder: it stands apart by both VENDOR and ROLE.
 #
 # Live with the cycle leaves since nl-shell-pdca#5 (a stub writes a canned artifact and
 # reviews nothing, which looks like coverage and is worse than off).

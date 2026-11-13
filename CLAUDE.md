@@ -10,7 +10,7 @@ read it for tracker, branch targets, fixtures, and the conformance ruleset.
 
 `pdca` advances a result bundle through the cycle (`nl-shell-pdca status`, `nl-shell-pdca run <id>`,
 `nl-shell-pdca signoff <id> --accept`, `nl-shell-pdca publish <id>`), or runs it as one continuous
-Claude-driven flow (`nl-shell-pdca flow <id> [--from-csv …] [--no-publish] [--no-act]`). State is
+mixed Codex/Claude flow (`nl-shell-pdca flow <id> [--from-csv …] [--no-publish] [--no-act]`). State is
 the files in `results/issue_<id>/`; nothing is hidden in a database.
 
 The driver is deterministic — **no model decides control flow**. The cycle has exactly
@@ -37,11 +37,11 @@ optional Act; `--no-publish` stops at COMPLETE.
   `build-notes.md` (your rationale — withheld from the reviewer by the driver).
 - The test must fail pre-fix and pass post-fix. Cite `path:line` on the target
   branch for every change.
-- **STOP discipline:** you MAY push to a feature/draft branch and open a draft PR
-  (useful for CI). You MUST NOT mark a PR ready or merge it — that is the human's
-  sign-off step. This is enforced mechanically: the `builder` subagent
-  (`.claude/agents/builder.md`) runs a PreToolUse hook
-  (`.claude/hooks/builder_guard.py`) that blocks `gh pr ready` / `gh pr merge`.
+- **STOP discipline:** do not branch, push or open a PR; the deterministic publish step
+  owns those mechanics after human sign-off. No model leaf may mark a PR ready or merge
+  it. The active Codex builder receives the driver's `gh` PATH shim; if Claude is selected
+  as builder, `.claude/agents/builder.md` applies the equivalent
+  `.claude/hooks/builder_guard.py` PreToolUse hook.
 
 ## Check sign-off (human) — not the model's to perform
 
