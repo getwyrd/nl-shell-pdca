@@ -46,3 +46,6 @@ results/issue_selftest/
 # ignored in case a checkout lives inside the project tree.
 *.pdca-wt/
 *.pdca-wt-l*/
+
+# Claude Code machine-local files: may hold recorded commands with secrets; never commit
+CLAUDE.local.md
