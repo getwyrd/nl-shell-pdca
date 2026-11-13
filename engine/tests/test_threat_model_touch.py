@@ -44,6 +44,43 @@ class ThreatModelTouch(unittest.TestCase):
         self.assertEqual(r.returncode, 77, r.stdout)
         self.assertIn("src/nl_shell/gate.py", r.stdout)
 
+    def test_security_sensitive_target_and_runtime_paths_are_unverifiable(self) -> None:
+        paths = [
+            "targets/ubuntu-26.04/gate-vectors.toml",
+            "targets/ubuntu-26.04/sensitive.toml",
+            "targets/ubuntu-26.04/target.toml",
+            "targets/ubuntu-26.04/prompts/reader.yaml",
+            "src/nl_shell/teacher_client.py",
+            "src/nl_shell/cli.py",
+            "src/nl_shell/failure_classes.py",
+            "src/nl_shell/render.py",
+            "src/nl_shell/_unicode_tables.py",
+            "scripts/gen_unicode_tables.py",
+            "src/nl_shell/proposal.py",
+            "src/nl_shell/config.py",
+            "src/nl_shell/targets.py",
+            "src/nl_shell/command_provider.py",
+            "src/nl_shell/repl.py",
+            "src/nl_shell/input_modes.py",
+            "src/nl_shell/prompts.py",
+            "pyproject.toml",
+        ]
+        for path in paths:
+            with self.subTest(path=path):
+                r = self._run([path])
+                self.assertEqual(r.returncode, 77, r.stdout)
+                self.assertIn(path, r.stdout)
+
+    def test_adjacent_target_and_runtime_paths_stay_unrelated(self) -> None:
+        paths = [
+            "targets/ubuntu-26.04/prompts/prompts.yaml",
+        ]
+        for path in paths:
+            with self.subTest(path=path):
+                r = self._run([path])
+                self.assertEqual(r.returncode, 0, r.stdout)
+                self.assertIn("no security-relevant path", r.stdout)
+
     def test_spec_change_counts_as_security_relevant(self) -> None:
         r = self._run(["docs/design/specs/policy-gate/v1.md"])
         self.assertEqual(r.returncode, 77, r.stdout)
