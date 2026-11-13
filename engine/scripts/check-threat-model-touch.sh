@@ -19,8 +19,10 @@ for p in "${CHANGED[@]}"; do
     src/nl_shell/*gate*|src/nl_shell/*policy*|src/nl_shell/*pty*|src/nl_shell/*session*| \
     src/nl_shell/*sudo*|src/nl_shell/*passthrough*|src/nl_shell/*taint*|src/nl_shell/*reader*| \
     src/nl_shell/*history*|src/nl_shell/*log*|src/nl_shell/*install*|src/nl_shell/*backend*| \
-    src/nl_shell/*teacher*|src/nl_shell/cli.py|src/nl_shell/*failure_class*| \
-    src/nl_shell/render.py|src/nl_shell/*charsafety*|targets/*/*.toml| \
+    src/nl_shell/*teacher*|src/nl_shell/*cli*|src/nl_shell/*failure_class*| \
+    src/nl_shell/*render*|src/nl_shell/*proposal*|src/nl_shell/*config*| \
+    src/nl_shell/*targets*|src/nl_shell/*command_provider*|src/nl_shell/*unicode_tables*| \
+    scripts/*unicode_tables*|targets/*/*.toml|targets/*/prompts/reader.yaml| \
     docs/design/specs/policy-gate/*|docs/design/specs/pty-protocol/*| \
     docs/design/specs/reader-schema/*|docs/design/specs/proposal/*)
       SECURITY+=("$p") ;;
