@@ -22,7 +22,8 @@ for p in "${CHANGED[@]}"; do
     src/nl_shell/*teacher*|src/nl_shell/*cli*|src/nl_shell/*failure_class*| \
     src/nl_shell/*render*|src/nl_shell/*proposal*|src/nl_shell/*config*| \
     src/nl_shell/*targets*|src/nl_shell/*command_provider*|src/nl_shell/*unicode_tables*| \
-    scripts/*unicode_tables*|targets/*/*.toml|targets/*/prompts/reader.yaml| \
+    src/nl_shell/*repl*|src/nl_shell/*input_mode*|src/nl_shell/*prompts*| \
+    scripts/*unicode_tables*|targets/*/*.toml|targets/*/prompts/reader.yaml|pyproject.toml| \
     docs/design/specs/policy-gate/*|docs/design/specs/pty-protocol/*| \
     docs/design/specs/reader-schema/*|docs/design/specs/proposal/*)
       SECURITY+=("$p") ;;

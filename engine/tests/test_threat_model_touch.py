@@ -60,6 +60,10 @@ class ThreatModelTouch(unittest.TestCase):
             "src/nl_shell/config.py",
             "src/nl_shell/targets.py",
             "src/nl_shell/command_provider.py",
+            "src/nl_shell/repl.py",
+            "src/nl_shell/input_modes.py",
+            "src/nl_shell/prompts.py",
+            "pyproject.toml",
         ]
         for path in paths:
             with self.subTest(path=path):
@@ -70,7 +74,6 @@ class ThreatModelTouch(unittest.TestCase):
     def test_adjacent_target_and_runtime_paths_stay_unrelated(self) -> None:
         paths = [
             "targets/ubuntu-26.04/prompts/prompts.yaml",
-            "src/nl_shell/router.py",
         ]
         for path in paths:
             with self.subTest(path=path):

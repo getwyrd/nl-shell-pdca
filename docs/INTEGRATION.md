@@ -248,9 +248,10 @@ For those slices:
 `engine/scripts/check-threat-model-touch.sh` (advisory): a patch touching nl-shell's gate,
 policy, PTY, session, sudo, passthrough, taint, reader, history, logging, backend,
 installer, teacher endpoint, CLI, failure classification, proposal, configuration,
-target loading, package-name filtering, rendering or Unicode-table code; target TOML
-contracts or the quarantined-reader prompt; or the policy-gate, PTY, reader or proposal
-specs, without touching `.oss-scanner/threat_model.md` lands in §6 for a human decision.
+target loading, package-name filtering, rendering, Unicode-table, REPL, input-mode or
+prompt-building code; target TOML contracts, the quarantined-reader prompt or parser
+dependency pins; or the policy-gate, PTY, reader or proposal specs, without touching
+`.oss-scanner/threat_model.md` lands in §6 for a human decision.
 
 ## Answering an interactive leaf from another device
 
