@@ -749,7 +749,7 @@ argv = ["claude", "-p", "--agent", "adversary", "--permission-mode", "acceptEdit
 # self-reported field must not route a patch away from the review that would catch the
 # mis-rating (wyrd-pdca dropped the same gate from its adversary for that reason). A patch
 # that touches no attacker-reachable input gets a one-line verdict, so the cost stays small.
-# Claude, like the builder: it stands apart by ROLE, as the adversary does.
+# Claude, unlike the Codex builder: it stands apart by both VENDOR and ROLE.
 #
 # Live with the cycle leaves since nl-shell-pdca#5 (a stub writes a canned artifact and
 # reviews nothing, which looks like coverage and is worse than off).
