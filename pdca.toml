@@ -1270,10 +1270,9 @@ checks = [
 # checkout; at Check without a patched worktree the rows read UNVERIFIABLE (→ §6), and
 # publish refuses rather than push content the declared CI never saw. Empty / absent
 # (the default) ⇒ byte-identical behaviour everywhere.
-# host_ci = [
-#   "typos",
-#   { id = "docs-lint", cmd = "make docs-lint" },
-# ]
+host_ci = [
+  { id = "host-docs", label = "host docs checks: immutability, checker tests, links, and ADR index", cmd = "bash -o pipefail -c 'set -euo pipefail; python3 -I -m unittest discover -s .github/docs-check -v; index=/tmp/pdca-host-docs-index-$$; test ! -e \"$index\"; trap \"unlink \\\"$index\\\" 2>/dev/null || true\" EXIT; export GIT_INDEX_FILE=$index; git read-tree HEAD; git apply --cached \"$PDCA_BUNDLE/patch.diff\"; base=$(git rev-parse HEAD); tree=$(git write-tree); patched=$(printf \"pdca host docs\\n\" | git -c user.name=PDCA -c user.email=pdca@invalid commit-tree \"$tree\" -p \"$base\"); git show \"${base}:scripts/docs_checks.py\" | python3 -I - immutability \"$base\" \"$patched\"; git show \"${base}:.github/docs-check/docs_links.py\" | python3 -I -; git show \"${base}:.github/docs-check/adr_index.py\" | python3 -I -'" },
+]
 
 # Reverse registry-consistency (issue #205). The FORWARD direction (a source file a patch
 # adds must be registered in a manifest) is a project gate; this is the REVERSE, generic in
