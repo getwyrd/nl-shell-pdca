@@ -379,6 +379,37 @@ class PublishSlice(unittest.TestCase):
         self.assertEqual(pj["pr_url"], "")                       # recorded, but empty
         self.assertEqual(pj["branch"], "fix/PUBFAIL-my-fix")     # branch was pushed
 
+    def test_republish_updates_the_already_open_pr(self) -> None:
+        """A re-publish whose branch already has an open PR edits that PR and records its
+        URL — never `gh pr create` (which fails "already exists" and left pr_url empty)."""
+        d = _bundle(self.cfg, "REPUB", brief_body=_FIX_BRIEF, accepted=True)
+        url = "https://github.com/example-org/example-repo/pull/7"
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, *a, **k):
+            calls.append(cmd)
+            if cmd[:3] == ["gh", "pr", "list"]:
+                return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps([{
+                    "url": url, "number": 7, "headRefName": "fix/REPUB-my-fix",
+                    "headRepositoryOwner": {"login": "example-org"}}]))
+            if cmd[:3] == ["gh", "pr", "create"]:
+                return SimpleNamespace(returncode=1, stdout="", stderr="already exists")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        buf = io.StringIO()
+        with mock.patch.object(publish, "_check_repo", return_value=0), \
+             mock.patch.object(publish, "_fork_owner", return_value=""), \
+             mock.patch.object(publish.subprocess, "run", side_effect=fake_run), \
+             redirect_stdout(buf), redirect_stderr(buf):
+            rc = publish.publish(self.cfg, "REPUB", by="Tester", today="2026-06-05")
+        self.assertEqual(rc, 0, buf.getvalue())
+        self.assertFalse([c for c in calls if c[:3] == ["gh", "pr", "create"]])
+        edit = [c for c in calls if c[:3] == ["gh", "pr", "edit"]]
+        self.assertEqual(len(edit), 1)
+        self.assertEqual(edit[0][3], url)
+        pj = json.loads((d / "publish.json").read_text(encoding="utf-8"))
+        self.assertEqual(pj["pr_url"], url)
+
     def _publish(self, iid: str, **kw) -> tuple[int, str]:
         """Dry-run publish; return (rc, stderr text)."""
         err = io.StringIO()

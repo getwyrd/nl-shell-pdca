@@ -401,7 +401,28 @@ def publish(
 
     pr_url = ""
     pr_failed = False
+    # Re-publish (#108 force-pushed the rebuilt branch): the branch already has an open PR,
+    # so `gh pr create` would fail "a pull request … already exists". Update that PR's
+    # title/body/base instead and record its URL. Filter by the bare branch, owner-checked
+    # in code (_existing_pr, #58).
+    existing = ""
     if open_pr:
+        existing = _existing_pr(
+            ["gh", "pr", "list", "--repo", repo_spec, "--head", branch, "--state", "open",
+             "--json", "url,number,headRefName,headRepositoryOwner"],
+            branch, head.split(":", 1)[0])
+    if existing:
+        print(f"→ gh pr edit {existing} … (PR already open for {branch})")
+        r = subprocess.run(["gh", "pr", "edit", existing, "--repo", repo_spec,
+                            "--base", pr_base, "--title", summary_line,
+                            "--body-file", str((d / PR_BODY).resolve())],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            print(r.stderr, file=sys.stderr)
+            print(f"\n!!! publish: branch pushed to {existing}, but `gh pr edit` FAILED — "
+                  "its title/body may be stale. Update it by hand.\n", file=sys.stderr)
+        pr_url = existing
+    elif open_pr:
         print("→ gh pr create --draft …")
         r = subprocess.run(pr_cmd, capture_output=True, text=True)
         out = (r.stdout or "").strip()
