@@ -415,11 +415,10 @@ def _publish_impl(
     # (STOP discipline). Publish never changes a PR's draft or auto-merge state itself; a
     # failed or ambiguous lookup refuses as well. Someone with write access acting on the
     # PR during the push itself is outside what this check can see.
-    found = _open_pr_lookup(
-        ["gh", "pr", "list", "--repo", repo_spec, "--head", branch, "--state", "open",
-         "--limit", str(PR_LOOKUP_LIMIT),
-         "--json", "url,number,headRefName,headRepositoryOwner"],
-        branch, head.split(":", 1)[0])
+    pr_lookup = ["gh", "pr", "list", "--repo", repo_spec, "--head", branch, "--state", "open",
+                 "--limit", str(PR_LOOKUP_LIMIT),
+                 "--json", "url,number,headRefName,headRepositoryOwner"]
+    found = _open_pr_lookup(pr_lookup, branch, head.split(":", 1)[0])
     if found is None:
         print(f"publish: could not tell whether {branch} already has an open PR on "
               f"{repo_spec}. Nothing was pushed. STOP.", file=sys.stderr)
@@ -435,9 +434,17 @@ def _publish_impl(
     stashed = _stash_worktree(repo)
     try:
         for c in steps:
-            if "push" in c[3:4] and existing:
-                # Again right before the push, after the local fetch/checkout/apply/commit.
-                refusal = _reuse_refusal(d, branch, existing, repo_spec)
+            if "push" in c[3:4]:
+                # Again right before the push, after the local fetch/checkout/apply/commit:
+                # the same sole PR (or still none), and it still passes the reuse check.
+                now = _open_pr_lookup(pr_lookup, branch, head.split(":", 1)[0])
+                refusal = ("" if now == existing else
+                           f"publish: the open PR for {branch} changed while the commit was "
+                           f"built ({existing or 'none'} before, "
+                           f"{'unknown' if now is None else now or 'none'} now). Nothing "
+                           "was pushed. STOP.")
+                if not refusal and existing:
+                    refusal = _reuse_refusal(d, branch, existing, repo_spec)
                 if refusal:
                     print(refusal, file=sys.stderr)
                     return 1
@@ -462,6 +469,10 @@ def _publish_impl(
                                "--json", "baseRefName", "--jq", ".baseRefName"],
                               capture_output=True, text=True)
         recorded_base = (view.stdout or "").strip() if view.returncode == 0 else ""
+        if not recorded_base:
+            pr_failed = True  # an unknown base is not a finished publish
+            print(f"\n!!! publish: pushed to {existing}, but its base could not be read. "
+                  "This is NOT done.\n", file=sys.stderr)
         if isinstance(prev_rec, dict) and prev_rec.get("pr_edit_failed"):
             edit_failed = True
             pr_base = str(prev_rec.get("requested_base") or pr_base)
@@ -628,11 +639,14 @@ def _publish_stacked(
     stashed = _stash_worktree(repo)
     try:
         for c in steps:
-            if "push" in c[3:4] and _pr_draft_state(pr_url, repo_spec) != (True, False):
-                # Again right before the push, after the local fetch/checkout/apply/commit.
-                print(f"publish: {pr_url} is not an open draft with auto-merge off (or its "
-                      "state cannot be read). Make it a draft and turn auto-merge off, then "
-                      "re-run. Nothing was pushed. STOP.", file=sys.stderr)
+            if "push" in c[3:4] and (_open_pr_lookup(pr_list, branch, owner) != pr_url
+                                     or _pr_draft_state(pr_url, repo_spec) != (True, False)):
+                # Again right before the push, after the local fetch/checkout/apply/commit:
+                # still the same sole PR, an open draft with auto-merge off.
+                print(f"publish: {pr_url} is no longer the only open PR on {branch}, or not "
+                      "an open draft with auto-merge off (or its state cannot be read). Make "
+                      "it a draft and turn auto-merge off, then re-run. Nothing was pushed. "
+                      "STOP.", file=sys.stderr)
                 return 1
             print("→ " + " ".join(c[3:]))  # drop the `git -C <repo>` prefix in the echo
             if subprocess.run(c).returncode != 0:
@@ -737,7 +751,7 @@ def _open_pr_lookup(pr_list_cmd: list[str], branch: str, owner: str) -> str | No
         return None
     if not isinstance(prs, list) or len(prs) >= PR_LOOKUP_LIMIT:
         return None
-    matches = []
+    matches, others = [], 0
     for pr in prs:
         if not isinstance(pr, dict):
             return None
@@ -747,6 +761,15 @@ def _open_pr_lookup(pr_list_cmd: list[str], branch: str, owner: str) -> str | No
             return None  # an entry we cannot judge: never read it as "not this PR"
         if pr["headRefName"] == branch and login.casefold() == owner.casefold():
             matches.append(pr.get("url"))
+        elif pr["headRefName"] == branch:
+            others += 1
+    if not matches and others:
+        # Only other owners' PRs on this branch name: a fork's, or this very branch after
+        # its repository was renamed or transferred (the remote URL keeps the old owner).
+        # Those cannot be told apart here, so refuse rather than read it as "no PR".
+        print(f"publish: {others} open PR(s) use the branch {branch} under another owner "
+              f"than {owner}; check the remote URL and those PRs.", file=sys.stderr)
+        return None
     if not matches:
         return ""
     if len(matches) > 1:

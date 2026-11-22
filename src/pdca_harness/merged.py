@@ -167,7 +167,11 @@ def pr_state(pr_url: str) -> tuple[str, str] | None:
 
 
 def _publish_record(d: Path) -> dict | None:
-    """The bundle's ``publish.json`` (the recorded PR), or ``None`` if absent/unreadable."""
+    """The bundle's ``publish.json`` (the recorded PR), or ``None`` if absent/unreadable or
+    while its last publish has not finished with success (``publish.incomplete``, see
+    publish.INCOMPLETE; not imported, to keep this module free of publish's imports)."""
+    if (d / "publish.incomplete").exists():
+        return None
     pj = d / "publish.json"
     if not pj.exists():
         return None

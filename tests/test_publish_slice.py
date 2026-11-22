@@ -529,6 +529,62 @@ class PublishSlice(unittest.TestCase):
         self.assertFalse(self._pushed(calls))
         self.assertTrue(any(c[:1] == ["git"] and "commit" in c for c in calls))
 
+    def test_a_pr_opened_while_the_commit_is_built_stops_the_push(self) -> None:
+        d = _bundle(self.cfg, "NEWPR", brief_body=_FIX_BRIEF, accepted=True)
+        calls: list[list[str]] = []
+        lists = [[], [{"url": "https://x/pr/5", "number": 5, "headRefName": "fix/NEWPR-my-fix",
+                       "headRepositoryOwner": {"login": "example-org"}}]]
+
+        def fake_run(cmd, *a, **k):
+            calls.append(cmd)
+            if cmd[:3] == ["gh", "pr", "list"]:
+                return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(lists.pop(0)))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        buf = io.StringIO()
+        with mock.patch.object(publish, "_check_repo", return_value=0), \
+             mock.patch.object(publish, "_fork_owner", return_value=""), \
+             mock.patch.object(publish.subprocess, "run", side_effect=fake_run), \
+             redirect_stdout(buf), redirect_stderr(buf):
+            rc = publish.publish(self.cfg, "NEWPR", by="Tester", today="2026-06-05")
+        self.assertEqual(rc, 1, buf.getvalue())
+        self.assertIn("changed while the commit was built", buf.getvalue())
+        self.assertFalse(self._pushed(calls))
+        self.assertTrue((d / publish.INCOMPLETE).exists())
+
+    def test_other_owner_prs_on_the_branch_are_ambiguous(self) -> None:
+        pr = {"url": "u", "headRefName": "b", "headRepositoryOwner": {"login": "new-owner"}}
+        with mock.patch.object(publish.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=json.dumps([pr]), stderr="")), \
+             redirect_stderr(io.StringIO()):
+            self.assertIsNone(publish._open_pr_lookup(["gh"], "b", "old-owner"))
+
+    def test_no_pr_republish_with_an_unreadable_base_is_not_done(self) -> None:
+        d = _bundle(self.cfg, "NOBASE", brief_body=_FIX_BRIEF, accepted=True)
+        url = "https://github.com/example-org/example-repo/pull/6"
+        _prior(d, "fix/NOBASE-my-fix", url)
+
+        def fake_run(cmd, *a, **k):
+            if cmd[:3] == ["gh", "pr", "list"]:
+                return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps([{
+                    "url": url, "number": 6, "headRefName": "fix/NOBASE-my-fix",
+                    "headRepositoryOwner": {"login": "example-org"}}]))
+            if cmd[:3] == ["gh", "pr", "view"] and "--jq" in cmd:
+                return SimpleNamespace(returncode=1, stdout="", stderr="HTTP 502")
+            if cmd[:3] == ["gh", "pr", "view"]:
+                return _DRAFT
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        buf = io.StringIO()
+        with mock.patch.object(publish, "_check_repo", return_value=0), \
+             mock.patch.object(publish, "_fork_owner", return_value=""), \
+             mock.patch.object(publish.subprocess, "run", side_effect=fake_run), \
+             redirect_stdout(buf), redirect_stderr(buf):
+            rc = publish.publish(self.cfg, "NOBASE", by="Tester", today="2026-06-05",
+                                 open_pr=False)
+        self.assertEqual(rc, 1, buf.getvalue())
+        self.assertTrue((d / publish.INCOMPLETE).exists())
+
     def test_an_incomplete_publish_hides_its_record(self) -> None:
         d = _bundle(self.cfg, "HIDE", brief_body=_FIX_BRIEF, accepted=True)
         _prior(d, "fix/HIDE-my-fix", "https://x/pr/1")
