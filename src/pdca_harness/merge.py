@@ -373,8 +373,9 @@ def _merge_one(cfg: Config, d: Path, *, dry_run: bool, method: str,
         return 0  # close / no-fix disposition — no contribution to merge
     if (d / publish.INCOMPLETE).exists():
         print(f"merge: {d.name}'s last publish did not finish with success, so its "
-              "publish.json may describe an earlier attempt. Re-run publish first. STOP.",
-              file=sys.stderr)
+              "publish.json may describe an earlier attempt. Re-run publish, or, once you "
+              "have checked the PR by hand and accept it, delete publish.incomplete (and "
+              "any `pr_edit_failed` flag in publish.json). STOP.", file=sys.stderr)
         return 1
     rec = publish._publish_record(d)
     pr_url = rec.get("pr_url") if rec else None
@@ -388,8 +389,8 @@ def _merge_one(cfg: Config, d: Path, *, dry_run: bool, method: str,
         # are unconfirmed, and a hand merge may have skipped the check rollup below.
         print(f"merge: {d.name}'s last publish could not update {pr_url} (`gh pr edit` "
               "failed), so its base and text are unconfirmed. Re-run publish while it is "
-              "open, or remove `pr_edit_failed` from publish.json once you accept what "
-              "merged. STOP.", file=sys.stderr)
+              "open, or remove `pr_edit_failed` from publish.json (and delete any "
+              "publish.incomplete) once you accept what merged. STOP.", file=sys.stderr)
         return 1
 
     cmd = ["gh", "pr", "merge", str(pr_url), f"--{method}"]

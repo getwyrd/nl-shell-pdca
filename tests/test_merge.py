@@ -181,6 +181,7 @@ class MergeWave(unittest.TestCase):
             self.assertEqual(merge.merge_wave(self.cfg, [b]), 1)
         run.assert_not_called()
         self.assertIn("did not finish", err.getvalue())
+        self.assertIn("delete publish.incomplete", err.getvalue())
 
     def test_failed_republish_edit_stops_merge(self) -> None:
         """Also in a dry run, and also when the PR has merged meanwhile."""

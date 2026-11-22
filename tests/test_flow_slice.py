@@ -1265,6 +1265,13 @@ class WaveModel(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("unschedulable", err.getvalue())
 
+    def test_publish_flag_shows_an_incomplete_publish(self) -> None:
+        d = self.cfg.bundle("PFI")
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "publish.json").write_text('{"pr_url": "https://x/pull/1"}', encoding="utf-8")
+        (d / "publish.incomplete").write_text("x\n", encoding="utf-8")
+        self.assertEqual(cli._publish_flag(d), "  [publish incomplete]")
+
     def test_publish_flag_marks_stacked_pr(self) -> None:
         # A stacked PR's status flag shows ↑<base> so the human merges the stack bottom-up.
         # A wave stack's PRs all target the real base (#593), so the cue reads ↑main; an
