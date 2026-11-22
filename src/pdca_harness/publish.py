@@ -435,6 +435,12 @@ def _publish_impl(
     stashed = _stash_worktree(repo)
     try:
         for c in steps:
+            if "push" in c[3:4] and existing:
+                # Again right before the push, after the local fetch/checkout/apply/commit.
+                refusal = _reuse_refusal(d, branch, existing, repo_spec)
+                if refusal:
+                    print(refusal, file=sys.stderr)
+                    return 1
             print("→ " + " ".join(c[3:]))  # drop the `git -C <repo>` prefix in the echo
             if subprocess.run(c).returncode != 0:
                 hint = " (patch may not apply against %s/%s — rebase the fix)" % (base_remote, base) \
@@ -448,13 +454,17 @@ def _publish_impl(
     pr_failed = False
     recorded_base = pr_base
     edit_failed = False
-    prev_rec = _publish_record(d)
-    if (existing and not open_pr and isinstance(prev_rec, dict)
-            and prev_rec.get("pr_edit_failed")):
-        # --no-pr skips the edit, so an earlier failed edit is still unresolved: keep it.
-        edit_failed = True
-        recorded_base = str(prev_rec.get("base") or "")
-        pr_base = str(prev_rec.get("requested_base") or pr_base)
+    prev_rec = _publish_record_raw(d)
+    if existing and not open_pr:
+        # --no-pr skips the edit: record the base the PR actually has (read back, "" when
+        # unreadable), and keep an earlier, still unresolved edit failure.
+        view = subprocess.run(["gh", "pr", "view", existing, "--repo", repo_spec,
+                               "--json", "baseRefName", "--jq", ".baseRefName"],
+                              capture_output=True, text=True)
+        recorded_base = (view.stdout or "").strip() if view.returncode == 0 else ""
+        if isinstance(prev_rec, dict) and prev_rec.get("pr_edit_failed"):
+            edit_failed = True
+            pr_base = str(prev_rec.get("requested_base") or pr_base)
     # The bundle's own open PR, checked before the push: `gh pr create` would fail "a pull
     # request … already exists", so update that PR's title/body/base instead and keep its
     # URL (also with --no-pr, which skips only the edit).
@@ -618,6 +628,12 @@ def _publish_stacked(
     stashed = _stash_worktree(repo)
     try:
         for c in steps:
+            if "push" in c[3:4] and _pr_draft_state(pr_url, repo_spec) != (True, False):
+                # Again right before the push, after the local fetch/checkout/apply/commit.
+                print(f"publish: {pr_url} is not an open draft with auto-merge off (or its "
+                      "state cannot be read). Make it a draft and turn auto-merge off, then "
+                      "re-run. Nothing was pushed. STOP.", file=sys.stderr)
+                return 1
             print("→ " + " ".join(c[3:]))  # drop the `git -C <repo>` prefix in the echo
             if subprocess.run(c).returncode != 0:
                 hint = ""
@@ -662,7 +678,7 @@ def _reuse_refusal(d: Path, branch: str, pr_url: str, repo_spec: str) -> str:
     It must be this bundle's own PR, named exactly in its publish.json (a record with no
     PR proves nothing: anyone can open a PR from a pushed branch), and an open draft with
     auto-merge off, so the pushed commit waits for a fresh human ready-mark."""
-    prev = _publish_record(d)
+    prev = _publish_record_raw(d)
     if not (isinstance(prev, dict) and prev.get("branch") == branch
             and prev.get("pr_url") == pr_url):
         return (f"publish: {pr_url} is open for {branch}, but this bundle's publish.json "
@@ -689,7 +705,7 @@ def _pr_draft_state(pr_url: str, repo_spec: str) -> tuple[bool, bool] | None:
     except json.JSONDecodeError:
         return None
     if (not isinstance(data, dict) or not isinstance(data.get("isDraft"), bool)
-            or data.get("state") != "OPEN"):
+            or data.get("state") != "OPEN" or "autoMergeRequest" not in data):
         return None
     return data["isDraft"], data.get("autoMergeRequest") is not None
 
@@ -725,9 +741,11 @@ def _open_pr_lookup(pr_list_cmd: list[str], branch: str, owner: str) -> str | No
     for pr in prs:
         if not isinstance(pr, dict):
             return None
-        login = (pr.get("headRepositoryOwner") or {}).get("login")
-        if (pr.get("headRefName") == branch and isinstance(login, str)
-                and login.casefold() == owner.casefold()):
+        owner_obj = pr.get("headRepositoryOwner")
+        login = owner_obj.get("login") if isinstance(owner_obj, dict) else None
+        if not (isinstance(login, str) and isinstance(pr.get("headRefName"), str)):
+            return None  # an entry we cannot judge: never read it as "not this PR"
+        if pr["headRefName"] == branch and login.casefold() == owner.casefold():
             matches.append(pr.get("url"))
     if not matches:
         return ""
@@ -781,7 +799,17 @@ def _checkout_path(cfg: Config, repo_spec: str) -> Path:
 
 
 def _publish_record(d: Path) -> dict | None:
-    """The bundle's ``publish.json`` (the recorded PR/branch), or None if absent/unreadable."""
+    """The bundle's ``publish.json`` (the recorded PR/branch), or None if absent/unreadable,
+    or while its last publish has not finished with success (`INCOMPLETE`): the record
+    may then describe an earlier attempt, so no consumer may act on it."""
+    if (d / INCOMPLETE).exists():
+        return None
+    return _publish_record_raw(d)
+
+
+def _publish_record_raw(d: Path) -> dict | None:
+    """``publish.json`` as written, even mid-publish (publish's own reads of its last
+    record)."""
     pj = d / "publish.json"
     if not pj.exists():
         return None

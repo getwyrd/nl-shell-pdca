@@ -437,8 +437,8 @@ class PublishSlice(unittest.TestCase):
         url = f"https://github.com/example-org/example-repo/pull/{len(iid)}"
         if prior is not None and not (d / "publish.json").exists():
             _prior(d, f"fix/{iid}-my-fix", url if prior == "same" else prior)
-        st = state if state is not None else {"state": "OPEN", "isDraft": True,
-                                              "autoMergeRequest": None}
+        draft = {"state": "OPEN", "isDraft": True, "autoMergeRequest": None}
+        states = list(state) if isinstance(state, list) else [state or draft]
         calls: list[list[str]] = []
 
         def fake_run(cmd, *a, **k):
@@ -450,6 +450,7 @@ class PublishSlice(unittest.TestCase):
             if cmd[:3] == ["gh", "pr", "view"] and "--jq" in cmd:
                 return SimpleNamespace(returncode=0, stdout="old-base\n", stderr="")
             if cmd[:3] == ["gh", "pr", "view"]:
+                st = states.pop(0) if len(states) > 1 else states[0]
                 return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(st))
             if cmd[:3] == ["gh", "pr", "edit"]:
                 return SimpleNamespace(returncode=edit_rc, stdout="", stderr="edit failed")
@@ -518,6 +519,33 @@ class PublishSlice(unittest.TestCase):
         pj = json.loads((d / "publish.json").read_text(encoding="utf-8"))
         self.assertTrue(pj["pr_url"].endswith("/pull/8"))
 
+    def test_republish_rechecks_right_before_the_push(self) -> None:
+        """A draft at the first check but ready by the time the commit is built: refused
+        before the push."""
+        rc, calls, out, _ = self._republish("LATEREADY", state=[
+            {"state": "OPEN", "isDraft": True, "autoMergeRequest": None},
+            {"state": "OPEN", "isDraft": False, "autoMergeRequest": None}])
+        self.assertEqual(rc, 1, out)
+        self.assertFalse(self._pushed(calls))
+        self.assertTrue(any(c[:1] == ["git"] and "commit" in c for c in calls))
+
+    def test_an_incomplete_publish_hides_its_record(self) -> None:
+        d = _bundle(self.cfg, "HIDE", brief_body=_FIX_BRIEF, accepted=True)
+        _prior(d, "fix/HIDE-my-fix", "https://x/pr/1")
+        self.assertIsNotNone(publish._publish_record(d))
+        (d / publish.INCOMPLETE).write_text("x\n", encoding="utf-8")
+        self.assertIsNone(publish._publish_record(d))           # every consumer sees none
+        self.assertIsNotNone(publish._publish_record_raw(d))
+
+    def test_unreadable_pr_answers_fail_closed(self) -> None:
+        def ans(obj):
+            return mock.patch.object(publish.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=json.dumps(obj), stderr=""))
+        with ans([{"url": "u", "headRefName": "b"}]):            # no owner
+            self.assertIsNone(publish._open_pr_lookup(["gh"], "b", "o"))
+        with ans({"state": "OPEN", "isDraft": True}):            # no autoMergeRequest key
+            self.assertIsNone(publish._pr_draft_state("u", "o/r"))
+
     def test_unfinished_publish_leaves_the_incomplete_marker(self) -> None:
         """A refused (or otherwise failed) real publish marks the bundle incomplete, so
         merge cannot act on its older publish.json; a successful one clears the mark."""
@@ -538,7 +566,7 @@ class PublishSlice(unittest.TestCase):
         rc, calls, out, _ = self._republish("KEEPFLAG", prior=url, open_pr=False)
         pj = json.loads((d / "publish.json").read_text(encoding="utf-8"))
         self.assertTrue(pj["pr_edit_failed"], out)
-        self.assertEqual(pj["base"], "old-base")
+        self.assertEqual(pj["base"], "old-base")                 # read back from the PR
         self.assertEqual(pj["requested_base"], "main")
 
     def test_open_pr_lookup_fails_closed(self) -> None:
