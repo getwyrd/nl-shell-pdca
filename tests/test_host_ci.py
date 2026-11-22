@@ -177,9 +177,9 @@ class HostCiPublishGate(unittest.TestCase):
             st.enter_context(mock.patch.object(publish.worktree, "for_publish", fp))
             st.enter_context(mock.patch.object(publish.worktree, "overflow_remove",
                                                mock.MagicMock()))
-            if existing_pr is not None:
-                st.enter_context(mock.patch.object(publish, "_existing_pr",
-                                                   return_value=existing_pr))
+            # No open PR unless the test names one; never a real `gh pr list`.
+            st.enter_context(mock.patch.object(publish, "_open_pr_lookup",
+                                               return_value=existing_pr or ""))
             st.enter_context(redirect_stdout(buf))
             st.enter_context(redirect_stderr(err))
             rc = publish.publish(self.cfg, issue_id, by="Tester", today="2026-07-31")
@@ -437,6 +437,7 @@ class HostCiPatchedTree(unittest.TestCase):
         self.assertEqual(record["base"], advanced)                # judged the FETCHED base
         self.assertIn(self.MARKER, json.dumps(record))
 
+    @mock.patch("pdca_harness.publish._open_pr_lookup", new=lambda *a, **k: "")  # no open PR
     def test_push_builds_on_the_certified_commit_not_a_later_base(self) -> None:
         # The PIN: the base advances BETWEEN the gate's certification and the push's
         # own fetch. Without the pin, `checkout -B` re-resolves origin/main at push
@@ -469,6 +470,7 @@ class HostCiPatchedTree(unittest.TestCase):
         pj = json.loads((self.d / "publish.json").read_text(encoding="utf-8"))
         self.assertEqual(pj["host_ci_base"], seen["sha"])
 
+    @mock.patch("pdca_harness.publish._open_pr_lookup", new=lambda *a, **k: "")  # no open PR
     def test_clean_patch_passes_and_publishes(self) -> None:
         # Criterion (b) with the real mechanics: a green host CI leaves the push
         # intact, and the pushed commit's parent IS the certified base commit.

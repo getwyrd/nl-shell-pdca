@@ -97,6 +97,16 @@ _PR_42 = {"url": "https://github.com/example-org/example-repo/pull/42", "number"
           "headRefName": "feature/x", "headRepositoryOwner": {"login": "example-org"}}
 
 
+_DRAFT = SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(
+    {"state": "OPEN", "isDraft": True, "autoMergeRequest": None}))
+
+
+def _prior(d: Path, branch: str, pr_url: str) -> None:
+    """Record that an earlier publish of bundle ``d`` opened ``pr_url`` on ``branch``."""
+    (d / "publish.json").write_text(json.dumps(
+        {"mode": "new-pr", "branch": branch, "pr_url": pr_url}), encoding="utf-8")
+
+
 def _gh_pr_list(cmd: list[str], prs: list[dict]) -> SimpleNamespace:
     """Reproduce `gh pr list --head` filtering faithfully (#58): it matches the **bare**
     headRefName only — the `owner:branch` form is "not supported" and matches nothing."""
@@ -249,6 +259,7 @@ class PublishSlice(unittest.TestCase):
         self.assertIn("checkout -B fix/OWN-my-fix origin/main", out)
         self.assertNotIn("upstream", out)  # no upstream remote assumed
 
+    @mock.patch("pdca_harness.publish._open_pr_lookup", new=lambda *a, **k: "")  # no open PR
     def test_publish_succeeds_with_dirty_target_tree(self) -> None:
         # Own-repo, dirty tree (#83): Do/Check edit the target in place, so publish must
         # stash → publish off a clean checkout → restore, not abort on the dirty tree.
@@ -290,6 +301,7 @@ class PublishSlice(unittest.TestCase):
                       capture_output=True, text=True).stdout
         self.assertIn("fix/DIRTY-my-fix", refs)
 
+    @mock.patch("pdca_harness.publish._open_pr_lookup", new=lambda *a, **k: "")  # no open PR
     def test_republish_force_updates_existing_pr_branch(self) -> None:
         # iterate-do (#108): re-publishing a rebuilt bundle commits a FRESH branch off the
         # current base and pushes it to the EXISTING PR branch — not a fast-forward of the
@@ -366,6 +378,8 @@ class PublishSlice(unittest.TestCase):
         def fake_run(cmd, *a, **k):  # every git step succeeds; `gh pr create` fails
             if cmd[:3] == ["gh", "pr", "create"]:
                 return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+            if cmd[:3] == ["gh", "pr", "list"]:                  # no open PR yet
+                return SimpleNamespace(returncode=0, stdout="[]", stderr="")
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         buf = io.StringIO()
@@ -384,6 +398,7 @@ class PublishSlice(unittest.TestCase):
         URL — never `gh pr create` (which fails "already exists" and left pr_url empty)."""
         d = _bundle(self.cfg, "REPUB", brief_body=_FIX_BRIEF, accepted=True)
         url = "https://github.com/example-org/example-repo/pull/7"
+        _prior(d, "fix/REPUB-my-fix", url)
         calls: list[list[str]] = []
 
         def fake_run(cmd, *a, **k):
@@ -394,6 +409,8 @@ class PublishSlice(unittest.TestCase):
                     "headRepositoryOwner": {"login": "example-org"}}]))
             if cmd[:3] == ["gh", "pr", "create"]:
                 return SimpleNamespace(returncode=1, stdout="", stderr="already exists")
+            if cmd[:3] == ["gh", "pr", "view"]:
+                return _DRAFT
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         buf = io.StringIO()
@@ -409,6 +426,138 @@ class PublishSlice(unittest.TestCase):
         self.assertEqual(edit[0][3], url)
         pj = json.loads((d / "publish.json").read_text(encoding="utf-8"))
         self.assertEqual(pj["pr_url"], url)
+
+    def _republish(self, iid: str, *, prior: str | None = "same", state: dict | None = None,
+                   list_rc: int = 0, edit_rc: int = 0, **kw) -> tuple[int, list, str, Path]:
+        """Re-publish ``iid`` onto one open PR. ``prior``: the URL the bundle's publish.json
+        records ("same" = this PR, None = no record); ``state``: its draft-state answer."""
+        d = _bundle(self.cfg, iid, brief_body=_FIX_BRIEF, accepted=True)
+        url = f"https://github.com/example-org/example-repo/pull/{len(iid)}"
+        if prior is not None:
+            _prior(d, f"fix/{iid}-my-fix", url if prior == "same" else prior)
+        st = state if state is not None else {"state": "OPEN", "isDraft": True,
+                                              "autoMergeRequest": None}
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, *a, **k):
+            calls.append(cmd)
+            if cmd[:3] == ["gh", "pr", "list"]:
+                return SimpleNamespace(returncode=list_rc, stderr="", stdout=json.dumps([{
+                    "url": url, "number": 1, "headRefName": f"fix/{iid}-my-fix",
+                    "headRepositoryOwner": {"login": "example-org"}}]))
+            if cmd[:3] == ["gh", "pr", "view"] and "--jq" in cmd:
+                return SimpleNamespace(returncode=0, stdout="old-base\n", stderr="")
+            if cmd[:3] == ["gh", "pr", "view"]:
+                return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(st))
+            if cmd[:3] == ["gh", "pr", "edit"]:
+                return SimpleNamespace(returncode=edit_rc, stdout="", stderr="edit failed")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        buf = io.StringIO()
+        with mock.patch.object(publish, "_check_repo", return_value=0), \
+             mock.patch.object(publish, "_fork_owner", return_value=""), \
+             mock.patch.object(publish.subprocess, "run", side_effect=fake_run), \
+             redirect_stdout(buf), redirect_stderr(buf):
+            rc = publish.publish(self.cfg, iid, by="Tester", today="2026-06-05", **kw)
+        return rc, calls, buf.getvalue(), d
+
+    @staticmethod
+    def _pushed(calls: list) -> bool:
+        return any(c[:1] == ["git"] and "push" in c for c in calls)
+
+    def test_republish_edit_failure_flags_the_record(self) -> None:
+        """A failed `gh pr edit` is a partial run: exit 1, keep the PR URL, record the base
+        GitHub reports (not the requested one) and flag the record for `merge`."""
+        rc, _, out, d = self._republish("EDITFAIL", edit_rc=1)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("NOT done", out)
+        pj = json.loads((d / "publish.json").read_text(encoding="utf-8"))
+        self.assertTrue(pj["pr_url"].endswith("/pull/8"))
+        self.assertEqual(pj["base"], "old-base")
+        self.assertTrue(pj["pr_edit_failed"])
+        self.assertEqual(pj["requested_base"], "main")
+
+    def test_republish_refuses_a_ready_or_auto_merge_pr(self) -> None:
+        """Rebuilt code is never pushed onto a PR that is ready, set to auto-merge, closed,
+        or whose state cannot be read; publish does not change that state itself."""
+        for i, st in enumerate([
+                {"state": "OPEN", "isDraft": False, "autoMergeRequest": None},
+                {"state": "OPEN", "isDraft": True, "autoMergeRequest": {"mergeMethod": "SQUASH"}},
+                {"state": "CLOSED", "isDraft": True, "autoMergeRequest": None},
+                {"isDraft": True}]):
+            rc, calls, out, _ = self._republish("NOTDRAFT" + "x" * i, state=st)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("not an open draft", out)
+            self.assertFalse(self._pushed(calls))
+            self.assertFalse([c for c in calls if c[:3] in (["gh", "pr", "ready"],
+                                                           ["gh", "pr", "merge"])])
+
+    def test_republish_refuses_a_pr_the_bundle_did_not_record(self) -> None:
+        """No record, or a record with no PR: anyone may have opened that PR."""
+        for iid, prior in (("FOREIGNA", None), ("FOREIGNBB", "")):
+            rc, calls, out, _ = self._republish(iid, prior=prior)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("not this bundle's PR", out)
+            self.assertFalse(self._pushed(calls))
+
+    def test_publish_refuses_when_the_pr_lookup_fails(self) -> None:
+        for iid, kw in (("LOOKUPF", {}), ("LOOKUPFN", {"open_pr": False})):
+            rc, calls, out, _ = self._republish(iid, list_rc=1, **kw)
+            self.assertEqual(rc, 1, out)
+            self.assertFalse(self._pushed(calls))
+
+    def test_no_pr_publish_keeps_the_recorded_pr(self) -> None:
+        """--no-pr still checks the open PR before pushing and keeps its URL, without
+        editing it."""
+        rc, calls, out, d = self._republish("NOPRKEEP", open_pr=False)
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(self._pushed(calls))
+        self.assertFalse([c for c in calls if c[:3] == ["gh", "pr", "edit"]])
+        pj = json.loads((d / "publish.json").read_text(encoding="utf-8"))
+        self.assertTrue(pj["pr_url"].endswith("/pull/8"))
+
+    def test_open_pr_lookup_fails_closed(self) -> None:
+        def ans(stdout: str, rc: int = 0):
+            return mock.patch.object(publish.subprocess, "run", return_value=SimpleNamespace(
+                returncode=rc, stdout=stdout, stderr=""))
+        pr = {"url": "u1", "headRefName": "b", "headRepositoryOwner": {"login": "Example-Org"}}
+        cmd = ["gh", "pr", "list"]
+        with ans(json.dumps([pr])):                              # owner without case
+            self.assertEqual(publish._open_pr_lookup(cmd, "b", "example-org"), "u1")
+        with ans("[]"):
+            self.assertEqual(publish._open_pr_lookup(cmd, "b", "example-org"), "")
+        with ans(""), redirect_stderr(io.StringIO()):            # no JSON at all
+            self.assertIsNone(publish._open_pr_lookup(cmd, "b", "example-org"))
+        with ans("[]", rc=1), redirect_stderr(io.StringIO()):
+            self.assertIsNone(publish._open_pr_lookup(cmd, "b", "example-org"))
+        other = {"url": "x", "headRefName": "b", "headRepositoryOwner": {"login": "fork"}}
+        with ans(json.dumps([other] * publish.PR_LOOKUP_LIMIT)):  # may be cut off
+            self.assertIsNone(publish._open_pr_lookup(cmd, "b", "example-org"))
+        with ans(json.dumps([pr, dict(pr, url="u2")])), redirect_stderr(io.StringIO()):
+            self.assertIsNone(publish._open_pr_lookup(cmd, "b", "example-org"))
+
+    def test_stack_refuses_a_ready_pr_before_pushing(self) -> None:
+        _bundle(self.cfg, "STKREADY", brief_body=_STACK_BRIEF, accepted=True)
+        calls: list[list[str]] = []
+        ready = SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(
+            {"state": "OPEN", "isDraft": False, "autoMergeRequest": None}))
+
+        def fake_run(cmd, *a, **k):
+            calls.append(cmd)
+            if cmd[:3] == ["gh", "pr", "list"]:
+                return _gh_pr_list(cmd, [_PR_42])
+            if cmd[:3] == ["gh", "pr", "view"]:
+                return ready
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        err = io.StringIO()
+        with mock.patch.object(publish, "_check_repo", return_value=0), \
+             mock.patch.object(publish.subprocess, "run", side_effect=fake_run), \
+             redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = publish.publish(self.cfg, "STKREADY", by="Tester", today="2026-06-05")
+        self.assertEqual(rc, 1)
+        self.assertIn("not an open draft", err.getvalue())
+        self.assertFalse(self._pushed(calls))
 
     def _publish(self, iid: str, **kw) -> tuple[int, str]:
         """Dry-run publish; return (rc, stderr text)."""
@@ -691,6 +840,8 @@ class PublishSlice(unittest.TestCase):
         def fake_run(cmd, *a, **k):  # gh-faithful PR lookup; every git step ok
             if cmd[:3] == ["gh", "pr", "list"]:
                 return _gh_pr_list(cmd, [_PR_42])
+            if cmd[:3] == ["gh", "pr", "view"]:  # an open draft, auto-merge off
+                return _DRAFT
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         with mock.patch.object(publish, "_check_repo", return_value=0), \
@@ -714,6 +865,8 @@ class PublishSlice(unittest.TestCase):
             calls.append(cmd)
             if cmd[:3] == ["gh", "pr", "list"]:
                 return _gh_pr_list(cmd, [_PR_42])
+            if cmd[:3] == ["gh", "pr", "view"]:  # an open draft, auto-merge off
+                return _DRAFT
             if cmd[3:5] == ["apply", "--check"]:
                 return SimpleNamespace(returncode=1, stdout="", stderr="does not apply")
             return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -737,6 +890,8 @@ class PublishSlice(unittest.TestCase):
             calls.append(cmd)
             if cmd[:3] == ["gh", "pr", "list"]:
                 return _gh_pr_list(cmd, [])   # nothing open for this head
+            if cmd[:3] == ["gh", "pr", "view"]:  # an open draft, auto-merge off
+                return _DRAFT
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         err = io.StringIO()
@@ -762,6 +917,8 @@ class PublishSlice(unittest.TestCase):
             calls.append(cmd)
             if cmd[:3] == ["gh", "pr", "list"]:        # both forks share the branch name
                 return _gh_pr_list(cmd, [other_fork, _PR_42])
+            if cmd[:3] == ["gh", "pr", "view"]:  # an open draft, auto-merge off
+                return _DRAFT
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         with mock.patch.object(publish, "_check_repo", return_value=0), \

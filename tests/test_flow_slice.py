@@ -1716,6 +1716,7 @@ class StackModeFlow(unittest.TestCase):
         self.assertTrue(self._in_line(new), "this run's pushed branch was not folded")
         self.assertFalse(self._in_line(old), "the old, rejected branch was folded")
 
+    @mock.patch("pdca_harness.publish._open_pr_lookup", new=lambda *a, **k: "")  # no open PR
     def test_a_held_bundle_published_later_is_cut_from_the_line_it_was_built_on(
             self) -> None:
         # Waves {LA} → {LU, LJ} → {LK} → {LL}. LU's publish fails, so it is held while the

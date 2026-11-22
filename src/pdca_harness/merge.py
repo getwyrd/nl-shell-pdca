@@ -378,6 +378,14 @@ def _merge_one(cfg: Config, d: Path, *, dry_run: bool, method: str,
         print(f"merge: {d.name} is COMPLETE but has no recorded PR — cannot merge a wave "
               "whose member wasn't published. STOP.", file=sys.stderr)
         return 1
+    if rec.get("pr_edit_failed"):
+        # Also in a dry run, and also when the PR has merged meanwhile: its base and text
+        # are unconfirmed, and a hand merge may have skipped the check rollup below.
+        print(f"merge: {d.name}'s last publish could not update {pr_url} (`gh pr edit` "
+              "failed), so its base and text are unconfirmed. Re-run publish while it is "
+              "open, or remove `pr_edit_failed` from publish.json once you accept what "
+              "merged. STOP.", file=sys.stderr)
+        return 1
 
     cmd = ["gh", "pr", "merge", str(pr_url), f"--{method}"]
     if dry_run:

@@ -773,6 +773,7 @@ class StackFoldGit(unittest.TestCase):
 
     # -- (i) the PR a wave>0 bundle opens ---------------------------------------------------
 
+    @mock.patch("pdca_harness.publish._open_pr_lookup", new=lambda *a, **k: "")  # no open PR
     def test_a_wave_bundle_publishes_against_the_real_base(self) -> None:
         # Case 14.
         a = self._publish("A", {"a.txt": "a\n"})
@@ -802,6 +803,7 @@ class StackFoldGit(unittest.TestCase):
         self.assertTrue(self._ancestor(self._tip("fix/K"), LINE))   # the line grew past U
         return u, t1
 
+    @mock.patch("pdca_harness.publish._open_pr_lookup", new=lambda *a, **k: "")  # no open PR
     def test_a_late_publish_is_cut_from_the_recorded_line_tip(self) -> None:
         # Case 14: published after the line grew, U's PR branch is cut from T1, so its PR
         # against main carries none of J's or K's work.
@@ -815,6 +817,7 @@ class StackFoldGit(unittest.TestCase):
         self.assertFalse(self._ancestor(self._tip("fix/J"), rec["branch"]))
         self.assertEqual(self._diff_files("main", rec["branch"]), ["a.txt", "u.txt"])
 
+    @mock.patch("pdca_harness.publish._open_pr_lookup", new=lambda *a, **k: "")  # no open PR
     def test_a_late_publish_through_host_ci_pins_the_recorded_line_tip(self) -> None:
         # Case 14b: with `[gates] host_ci` declared, publish fetches and PINS the commit it
         # certifies, then rebuilds its `checkout -B` on that pinned commit. The recorded tip
