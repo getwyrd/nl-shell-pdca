@@ -117,7 +117,29 @@ def draft_texts(cfg: Config, d: Path, *, run_t4: bool = True, draft: bool = True
     return True
 
 
-def publish(
+
+# A real publish that has not finished with success leaves this marker next to
+# publish.json, which may still describe an earlier attempt; merge refuses the bundle
+# while it is there (a separate file, since flow reads a changed publish.json as a push).
+INCOMPLETE = "publish.incomplete"
+
+
+def publish(cfg: Config, issue_id: str, *, dry_run: bool = False, **kw) -> int:
+    """Contribute an accepted bundle's fix as a draft PR (see `_publish_impl`). Return a
+    process code. A real run marks the bundle `INCOMPLETE` until it succeeds."""
+    if dry_run:
+        return _publish_impl(cfg, issue_id, dry_run=True, **kw)
+    marker = cfg.bundle(issue_id) / INCOMPLETE
+    if marker.parent.is_dir():
+        marker.write_text("publish started and has not finished with success\n",
+                          encoding="utf-8")
+    rc = _publish_impl(cfg, issue_id, dry_run=False, **kw)
+    if rc == 0:
+        marker.unlink(missing_ok=True)
+    return rc
+
+
+def _publish_impl(
     cfg: Config,
     issue_id: str,
     *,
@@ -426,6 +448,13 @@ def publish(
     pr_failed = False
     recorded_base = pr_base
     edit_failed = False
+    prev_rec = _publish_record(d)
+    if (existing and not open_pr and isinstance(prev_rec, dict)
+            and prev_rec.get("pr_edit_failed")):
+        # --no-pr skips the edit, so an earlier failed edit is still unresolved: keep it.
+        edit_failed = True
+        recorded_base = str(prev_rec.get("base") or "")
+        pr_base = str(prev_rec.get("requested_base") or pr_base)
     # The bundle's own open PR, checked before the push: `gh pr create` would fail "a pull
     # request … already exists", so update that PR's title/body/base instead and keep its
     # URL (also with --no-pr, which skips only the edit).

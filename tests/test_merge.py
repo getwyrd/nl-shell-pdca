@@ -172,6 +172,16 @@ class MergeWave(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("no recorded PR", err.getvalue())
 
+    def test_incomplete_publish_stops_merge(self) -> None:
+        b = self._bundle("M4I")
+        (b / "publish.incomplete").write_text("x\n", encoding="utf-8")
+        with mock.patch("pdca_harness.merge.subprocess.run") as run, \
+                mock.patch.object(merge.state, "state", return_value=state.COMPLETE), \
+                redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(merge.merge_wave(self.cfg, [b]), 1)
+        run.assert_not_called()
+        self.assertIn("did not finish", err.getvalue())
+
     def test_failed_republish_edit_stops_merge(self) -> None:
         """Also in a dry run, and also when the PR has merged meanwhile."""
         b = self._bundle("M4E")

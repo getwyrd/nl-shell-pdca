@@ -371,6 +371,11 @@ def _merge_one(cfg: Config, d: Path, *, dry_run: bool, method: str,
     patch = d / "patch.diff"
     if not patch.is_file() or not patch.read_text(encoding="utf-8").strip():
         return 0  # close / no-fix disposition — no contribution to merge
+    if (d / publish.INCOMPLETE).exists():
+        print(f"merge: {d.name}'s last publish did not finish with success, so its "
+              "publish.json may describe an earlier attempt. Re-run publish first. STOP.",
+              file=sys.stderr)
+        return 1
     rec = publish._publish_record(d)
     pr_url = rec.get("pr_url") if rec else None
     repo_spec = rec.get("repo") if rec else None

@@ -431,9 +431,11 @@ class PublishSlice(unittest.TestCase):
                    list_rc: int = 0, edit_rc: int = 0, **kw) -> tuple[int, list, str, Path]:
         """Re-publish ``iid`` onto one open PR. ``prior``: the URL the bundle's publish.json
         records ("same" = this PR, None = no record); ``state``: its draft-state answer."""
-        d = _bundle(self.cfg, iid, brief_body=_FIX_BRIEF, accepted=True)
+        d = self.cfg.bundle(iid)
+        if not d.is_dir():
+            d = _bundle(self.cfg, iid, brief_body=_FIX_BRIEF, accepted=True)
         url = f"https://github.com/example-org/example-repo/pull/{len(iid)}"
-        if prior is not None:
+        if prior is not None and not (d / "publish.json").exists():
             _prior(d, f"fix/{iid}-my-fix", url if prior == "same" else prior)
         st = state if state is not None else {"state": "OPEN", "isDraft": True,
                                               "autoMergeRequest": None}
@@ -515,6 +517,29 @@ class PublishSlice(unittest.TestCase):
         self.assertFalse([c for c in calls if c[:3] == ["gh", "pr", "edit"]])
         pj = json.loads((d / "publish.json").read_text(encoding="utf-8"))
         self.assertTrue(pj["pr_url"].endswith("/pull/8"))
+
+    def test_unfinished_publish_leaves_the_incomplete_marker(self) -> None:
+        """A refused (or otherwise failed) real publish marks the bundle incomplete, so
+        merge cannot act on its older publish.json; a successful one clears the mark."""
+        rc, _, out, d = self._republish("MARKREF", prior=None)      # refused
+        self.assertEqual(rc, 1, out)
+        self.assertTrue((d / publish.INCOMPLETE).exists())
+        rc, _, out, d = self._republish("MARKOK")                   # succeeds
+        self.assertEqual(rc, 0, out)
+        self.assertFalse((d / publish.INCOMPLETE).exists())
+
+    def test_no_pr_republish_keeps_an_earlier_edit_failure(self) -> None:
+        d = _bundle(self.cfg, "KEEPFLAG", brief_body=_FIX_BRIEF, accepted=True)
+        url = "https://github.com/example-org/example-repo/pull/8"
+        (d / "publish.json").write_text(json.dumps(
+            {"mode": "new-pr", "branch": "fix/KEEPFLAG-my-fix", "pr_url": url,
+             "base": "old-base", "pr_edit_failed": True, "requested_base": "main"}),
+            encoding="utf-8")
+        rc, calls, out, _ = self._republish("KEEPFLAG", prior=url, open_pr=False)
+        pj = json.loads((d / "publish.json").read_text(encoding="utf-8"))
+        self.assertTrue(pj["pr_edit_failed"], out)
+        self.assertEqual(pj["base"], "old-base")
+        self.assertEqual(pj["requested_base"], "main")
 
     def test_open_pr_lookup_fails_closed(self) -> None:
         def ans(stdout: str, rc: int = 0):
