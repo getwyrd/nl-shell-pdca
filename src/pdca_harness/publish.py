@@ -472,10 +472,11 @@ def _publish_impl(
                                "--json", "baseRefName", "--jq", ".baseRefName"],
                               capture_output=True, text=True)
         recorded_base = (view.stdout or "").strip() if view.returncode == 0 else ""
-        if not recorded_base:
-            pr_failed = True  # an unknown base is not a finished publish
-            print(f"\n!!! publish: pushed to {existing}, but its base could not be read. "
-                  "This is NOT done.\n", file=sys.stderr)
+        if recorded_base != pr_base:
+            pr_failed = True  # an unknown or different base is not a finished publish
+            print(f"\n!!! publish: pushed to {existing}, but it targets "
+                  f"`{recorded_base or 'an unreadable base'}`, not `{pr_base}`. Retarget it "
+                  "(or re-run without --no-pr). This is NOT done.\n", file=sys.stderr)
         if isinstance(prev_rec, dict) and prev_rec.get("pr_edit_failed"):
             edit_failed = True
             pr_base = str(prev_rec.get("requested_base") or pr_base)

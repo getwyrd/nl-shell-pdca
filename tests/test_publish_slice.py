@@ -428,7 +428,8 @@ class PublishSlice(unittest.TestCase):
         self.assertEqual(pj["pr_url"], url)
 
     def _republish(self, iid: str, *, prior: str | None = "same", state: dict | None = None,
-                   list_rc: int = 0, edit_rc: int = 0, **kw) -> tuple[int, list, str, Path]:
+                   list_rc: int = 0, edit_rc: int = 0, pr_base: str = "main",
+                   **kw) -> tuple[int, list, str, Path]:
         """Re-publish ``iid`` onto one open PR. ``prior``: the URL the bundle's publish.json
         records ("same" = this PR, None = no record); ``state``: its draft-state answer."""
         d = self.cfg.bundle(iid)
@@ -448,7 +449,7 @@ class PublishSlice(unittest.TestCase):
                     "url": url, "number": len(iid), "headRefName": f"fix/{iid}-my-fix",
                     "headRepositoryOwner": {"login": "example-org"}}]))
             if cmd[:3] == ["gh", "pr", "view"] and "--jq" in cmd:
-                return SimpleNamespace(returncode=0, stdout="old-base\n", stderr="")
+                return SimpleNamespace(returncode=0, stdout=pr_base + "\n", stderr="")
             if cmd[:3] == ["gh", "pr", "view"]:
                 st = states.pop(0) if len(states) > 1 else states[0]
                 return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(st))
@@ -471,7 +472,7 @@ class PublishSlice(unittest.TestCase):
     def test_republish_edit_failure_flags_the_record(self) -> None:
         """A failed `gh pr edit` is a partial run: exit 1, keep the PR URL, record the base
         GitHub reports (not the requested one) and flag the record for `merge`."""
-        rc, _, out, d = self._republish("EDITFAIL", edit_rc=1)
+        rc, _, out, d = self._republish("EDITFAIL", edit_rc=1, pr_base="old-base")
         self.assertEqual(rc, 1, out)
         self.assertIn("NOT done", out)
         pj = json.loads((d / "publish.json").read_text(encoding="utf-8"))
@@ -559,6 +560,12 @@ class PublishSlice(unittest.TestCase):
              redirect_stderr(io.StringIO()):
             self.assertIsNone(publish._open_pr_lookup(["gh"], "b", "old-owner"))
 
+    def test_no_pr_republish_onto_a_different_base_is_not_done(self) -> None:
+        rc, _, out, d = self._republish("NOPRBASE", open_pr=False, pr_base="old-base")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("not `main`", out)
+        self.assertTrue((d / publish.INCOMPLETE).exists())
+
     def test_no_pr_republish_with_an_unreadable_base_is_not_done(self) -> None:
         d = _bundle(self.cfg, "NOBASE", brief_body=_FIX_BRIEF, accepted=True)
         url = "https://github.com/example-org/example-repo/pull/6"
@@ -638,7 +645,8 @@ class PublishSlice(unittest.TestCase):
             {"mode": "new-pr", "branch": "fix/KEEPFLAG-my-fix", "pr_url": url,
              "base": "old-base", "pr_edit_failed": True, "requested_base": "main"}),
             encoding="utf-8")
-        rc, calls, out, _ = self._republish("KEEPFLAG", prior=url, open_pr=False)
+        rc, calls, out, _ = self._republish("KEEPFLAG", prior=url, open_pr=False,
+                                            pr_base="old-base")
         pj = json.loads((d / "publish.json").read_text(encoding="utf-8"))
         self.assertTrue(pj["pr_edit_failed"], out)
         self.assertEqual(pj["base"], "old-base")                 # read back from the PR
