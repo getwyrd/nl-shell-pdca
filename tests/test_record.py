@@ -308,6 +308,7 @@ class RecordPublishCallIn(unittest.TestCase):
             rc = publish.publish(cfg, iid, by="T", today="2026-08-02")
         return rc, d, calls, seen, hook
 
+    @mock.patch("pdca_harness.publish._open_pr_lookup", new=lambda *a, **k: "")  # no open PR
     def test_publish_triggers_recording_only_after_publish_json(self) -> None:
         cfg = _cfg(self.tmp, mode="commit")
         rc, d, _calls, seen, hook = self._publish(cfg, "PUB")
@@ -316,6 +317,7 @@ class RecordPublishCallIn(unittest.TestCase):
         self.assertTrue((d / "publish.json").exists())
         self.assertTrue(seen["publish_json_written"])  # the write PRECEDED the call-in
 
+    @mock.patch("pdca_harness.publish._open_pr_lookup", new=lambda *a, **k: "")  # no open PR
     def test_publish_under_default_off_never_touches_the_instance_repo(self) -> None:
         # Criterion (d) on the publish path: with the default config the call-in
         # no-ops — no git command ever targets the instance root (cfg.root).

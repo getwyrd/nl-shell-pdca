@@ -1051,6 +1051,8 @@ def _publish_flag(d: Path) -> str:
     PR url; absent ⇒ accepted-but-unpublished (dry-run / no-target / failed / not-yet-run),
     so it's visible instead of looking published. A close/no-fix bundle has no patch to ship."""
     pj = d / "publish.json"
+    if (d / "publish.incomplete").exists():
+        return "  [publish incomplete]"  # unfinished: its publish.json is not to be trusted
     if not pj.exists():
         if not (d / "patch.diff").is_file() or not (d / "patch.diff").read_text(encoding="utf-8").strip():
             return "  [close: no PR]"

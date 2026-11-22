@@ -167,8 +167,15 @@ def pr_state(pr_url: str) -> tuple[str, str] | None:
 
 
 def _publish_record(d: Path) -> dict | None:
-    """The bundle's ``publish.json`` (the recorded PR), or ``None`` if absent/unreadable."""
+    """The bundle's ``publish.json`` (the recorded PR), or ``None`` if absent/unreadable or
+    older than an unfinished publish (``publish.incomplete``, see publish.INCOMPLETE and
+    publish._publish_record; not imported, to keep this module free of publish's imports)."""
     pj = d / "publish.json"
+    try:   # a record older than an unfinished publish describes an earlier attempt
+        if pj.stat().st_mtime_ns <= (d / "publish.incomplete").stat().st_mtime_ns:
+            return None
+    except OSError:
+        pass
     if not pj.exists():
         return None
     try:

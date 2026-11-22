@@ -117,7 +117,32 @@ def draft_texts(cfg: Config, d: Path, *, run_t4: bool = True, draft: bool = True
     return True
 
 
-def publish(
+
+# A real publish that has not finished with success leaves this marker next to
+# publish.json, which may still describe an earlier attempt; merge refuses the bundle
+# while it is there (a separate file, since flow reads a changed publish.json as a push).
+INCOMPLETE = "publish.incomplete"
+
+
+def publish(cfg: Config, issue_id: str, *, dry_run: bool = False, **kw) -> int:
+    """Contribute an accepted bundle's fix as a draft PR (see `_publish_impl`). Return a
+    process code. A real run marks the bundle `INCOMPLETE` until it succeeds."""
+    if dry_run:
+        return _publish_impl(cfg, issue_id, dry_run=True, **kw)
+    marker = cfg.bundle(issue_id) / INCOMPLETE
+    if marker.parent.is_dir():
+        marker.write_text("publish started and has not finished with success\n",
+                          encoding="utf-8")
+    rc = _publish_impl(cfg, issue_id, dry_run=False, **kw)
+    # A finished publish removes the marker itself, before results recording stages the
+    # bundle. A successful run that wrote no record (no target to contribute to) clears it
+    # only while no older publish.json is left for consumers to mistake for this attempt.
+    if rc == 0 and not (marker.parent / "publish.json").exists():
+        marker.unlink(missing_ok=True)
+    return rc
+
+
+def _publish_impl(
     cfg: Config,
     issue_id: str,
     *,
@@ -386,10 +411,46 @@ def publish(
     if ci_base:
         steps = _pin_checkout(steps, git, branch, ci_base)
 
+    # Re-publish (#108 force-pushes the rebuilt branch): the branch may already have an
+    # open PR. Look it up BEFORE pushing (with --no-pr too, since the push happens either
+    # way) and push onto it only when it is this bundle's recorded PR and an open draft
+    # with auto-merge off, so the rebuilt commit always waits for a fresh human ready-mark
+    # (STOP discipline). Publish never changes a PR's draft or auto-merge state itself; a
+    # failed or ambiguous lookup refuses as well. Someone with write access acting on the
+    # PR during the push itself is outside what this check can see.
+    pr_lookup = ["gh", "pr", "list", "--repo", repo_spec, "--head", branch, "--state", "open",
+                 "--limit", str(PR_LOOKUP_LIMIT),
+                 "--json", "url,number,headRefName,headRepositoryOwner"]
+    found = _open_pr_lookup(pr_lookup, branch, head.split(":", 1)[0])
+    if found is None:
+        print(f"publish: could not tell whether {branch} already has an open PR on "
+              f"{repo_spec}. Nothing was pushed. STOP.", file=sys.stderr)
+        return 1
+    existing = found
+    if existing:
+        refusal = _reuse_refusal(d, branch, existing, repo_spec)
+        if refusal:
+            print(refusal, file=sys.stderr)
+            return 1
+
     orig_ref = _current_ref(repo)
     stashed = _stash_worktree(repo)
     try:
         for c in steps:
+            if "push" in c[3:4]:
+                # Again right before the push, after the local fetch/checkout/apply/commit:
+                # the same sole PR (or still none), and it still passes the reuse check.
+                now = _open_pr_lookup(pr_lookup, branch, head.split(":", 1)[0])
+                refusal = ("" if now == existing else
+                           f"publish: the open PR for {branch} changed while the commit was "
+                           f"built ({existing or 'none'} before, "
+                           f"{'unknown' if now is None else now or 'none'} now). Nothing "
+                           "was pushed. STOP.")
+                if not refusal and existing:
+                    refusal = _reuse_refusal(d, branch, existing, repo_spec)
+                if refusal:
+                    print(refusal, file=sys.stderr)
+                    return 1
             print("→ " + " ".join(c[3:]))  # drop the `git -C <repo>` prefix in the echo
             if subprocess.run(c).returncode != 0:
                 hint = " (patch may not apply against %s/%s — rebase the fix)" % (base_remote, base) \
@@ -401,7 +462,52 @@ def publish(
 
     pr_url = ""
     pr_failed = False
-    if open_pr:
+    recorded_base = pr_base
+    edit_failed = False
+    prev_rec = _publish_record_raw(d)
+    if existing and not open_pr:
+        # --no-pr skips the edit: record the base the PR actually has (read back, "" when
+        # unreadable), and keep an earlier, still unresolved edit failure.
+        view = subprocess.run(["gh", "pr", "view", existing, "--repo", repo_spec,
+                               "--json", "baseRefName", "--jq", ".baseRefName"],
+                              capture_output=True, text=True)
+        recorded_base = (view.stdout or "").strip() if view.returncode == 0 else ""
+        if recorded_base != pr_base:
+            pr_failed = True  # an unknown or different base is not a finished publish
+            print(f"\n!!! publish: pushed to {existing}, but it targets "
+                  f"`{recorded_base or 'an unreadable base'}`, not `{pr_base}`. Retarget it "
+                  "(or re-run without --no-pr). This is NOT done.\n", file=sys.stderr)
+        if isinstance(prev_rec, dict) and prev_rec.get("pr_edit_failed"):
+            edit_failed = pr_failed = True  # still unresolved, so still not done
+            pr_base = str(prev_rec.get("requested_base") or pr_base)
+    # The bundle's own open PR, checked before the push: `gh pr create` would fail "a pull
+    # request … already exists", so update that PR's title/body/base instead and keep its
+    # URL (also with --no-pr, which skips only the edit).
+    if existing and open_pr:
+        print(f"→ gh pr edit {existing} … (PR already open for {branch})")
+        r = subprocess.run(["gh", "pr", "edit", existing, "--repo", repo_spec,
+                            "--base", pr_base, "--title", summary_line,
+                            "--body-file", str((d / PR_BODY).resolve())],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            # The PR keeps its old title, body and possibly its old base. Keep its URL so
+            # it is not orphaned, record the base it actually has (read back, "" when
+            # unreadable) rather than the requested one, and flag the record: merge
+            # refuses it until a human has looked.
+            pr_failed = edit_failed = True
+            print(r.stderr, file=sys.stderr)
+            view = subprocess.run(["gh", "pr", "view", existing, "--repo", repo_spec,
+                                   "--json", "baseRefName", "--jq", ".baseRefName"],
+                                  capture_output=True, text=True)
+            recorded_base = (view.stdout or "").strip() if view.returncode == 0 else ""
+            print(f"\n!!! publish: branch pushed to {existing}, but `gh pr edit` FAILED — "
+                  f"its title/body may be stale and its base is "
+                  f"`{recorded_base or 'unknown'}`, not `{pr_base}`.\n"
+                  "    Fix the PR by hand or re-run publish. This is NOT done.\n",
+                  file=sys.stderr)
+    if existing:
+        pr_url = existing
+    elif open_pr:
         print("→ gh pr create --draft …")
         r = subprocess.run(pr_cmd, capture_output=True, text=True)
         out = (r.stdout or "").strip()
@@ -418,7 +524,7 @@ def publish(
 
     record = {
         "mode": "stacked-pr" if stack_branch else "new-pr",
-        "branch": branch, "pr_url": pr_url, "base": pr_base, "repo": repo_spec,
+        "branch": branch, "pr_url": pr_url, "base": recorded_base, "repo": repo_spec,
         "by": by or _signoff_by(d) or cfg.author or "unknown", "date": today,
         "id_pending": pending_id,
     }
@@ -426,6 +532,9 @@ def publish(
         # The base commit the host-CI gate certified — and, via _pin_checkout, the exact
         # parent the pushed branch was built on (#311): auditable certified == pushed.
         record["host_ci_base"] = ci_base
+    if edit_failed:
+        record["pr_edit_failed"] = True  # merge refuses this record (see merge.py)
+        record["requested_base"] = pr_base
     if stack_branch:
         record["stacks_on"] = brief.stacks_on(d / "brief.md")
     (d / "publish.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
@@ -445,6 +554,7 @@ def publish(
     print("  STOP: review CI, then mark it ready / merge yourself — the human's step.")
     # Recording call-in (#317): strictly AFTER the publish.json write above — never
     # mid-publish — and best-effort ([records] mode "off", the default, is a no-op).
+    (d / INCOMPLETE).unlink(missing_ok=True)  # finished: before recording stages the bundle
     record_mod.after_publish(cfg)
     return 0
 
@@ -472,7 +582,8 @@ def _publish_stacked(
     # (correct for `gh pr create --head`, #23b) is "not supported" here and never matches
     # (#58). Filter by bare branch; the fork owner is re-checked in code (_existing_pr).
     pr_list = ["gh", "pr", "list", "--repo", repo_spec, "--head", branch,
-               "--state", "open", "--json", "url,number,headRefName,headRepositoryOwner"]
+               "--state", "open", "--limit", str(PR_LOOKUP_LIMIT),
+               "--json", "url,number,headRefName,headRepositoryOwner"]
     steps = [
         git("fetch", remote),
         git("checkout", "-B", branch, base_ref),
@@ -520,11 +631,28 @@ def _publish_stacked(
     if ci_base:
         steps = _pin_checkout(steps, git, branch, ci_base)
 
+    # The new commit needs a fresh human ready-mark, as on the new-PR path: push only onto
+    # an open draft with auto-merge off (checked after host CI, right before the push).
+    if _pr_draft_state(pr_url, repo_spec) != (True, False):
+        print(f"publish: {pr_url} is not an open draft with auto-merge off (or its state "
+              "cannot be read). Make it a draft and turn auto-merge off, then re-run. "
+              "Nothing was pushed. STOP.", file=sys.stderr)
+        return 1
+
     # Stash the (Do/Check-dirtied) tree so checkout -B + apply run clean; restore after (#83).
     orig_ref = _current_ref(repo)
     stashed = _stash_worktree(repo)
     try:
         for c in steps:
+            if "push" in c[3:4] and (_open_pr_lookup(pr_list, branch, owner) != pr_url
+                                     or _pr_draft_state(pr_url, repo_spec) != (True, False)):
+                # Again right before the push, after the local fetch/checkout/apply/commit:
+                # still the same sole PR, an open draft with auto-merge off.
+                print(f"publish: {pr_url} is no longer the only open PR on {branch}, or not "
+                      "an open draft with auto-merge off (or its state cannot be read). Make "
+                      "it a draft and turn auto-merge off, then re-run. Nothing was pushed. "
+                      "STOP.", file=sys.stderr)
+                return 1
             print("→ " + " ".join(c[3:]))  # drop the `git -C <repo>` prefix in the echo
             if subprocess.run(c).returncode != 0:
                 hint = ""
@@ -554,32 +682,113 @@ def _publish_stacked(
     print("  STOP: review CI, then mark it ready / merge yourself — the human's step.")
     # Recording call-in (#317): same contract as the new-PR path — strictly after
     # this path's publish.json write, best-effort, no-op under mode "off".
+    (d / INCOMPLETE).unlink(missing_ok=True)  # finished: before recording stages the bundle
     record_mod.after_publish(cfg)
     return 0
 
 
+# `gh pr list` returns 30 PRs unless told otherwise, and same-named branches on other forks
+# count towards that. Ask for this many; a full page may be cut off, so the lookup fails.
+PR_LOOKUP_LIMIT = 100
+
+
+def _reuse_refusal(d: Path, branch: str, pr_url: str, repo_spec: str) -> str:
+    """Why ``pr_url`` (open on ``branch``) must not get a re-published commit, or "".
+
+    It must be this bundle's own PR, named exactly in its publish.json (a record with no
+    PR proves nothing: anyone can open a PR from a pushed branch), and an open draft with
+    auto-merge off, so the pushed commit waits for a fresh human ready-mark."""
+    prev = _publish_record_raw(d)
+    if not (isinstance(prev, dict) and prev.get("branch") == branch
+            and prev.get("pr_url") == pr_url):
+        return (f"publish: {pr_url} is open for {branch}, but this bundle's publish.json "
+                "does not record it, so it is not this bundle's PR to push to. Close it or "
+                "record it by hand. Nothing was pushed. STOP.")
+    if _pr_draft_state(pr_url, repo_spec) != (True, False):
+        return (f"publish: {pr_url} is not an open draft with auto-merge off (or its state "
+                "cannot be read). Make it a draft and turn auto-merge off, then re-run. "
+                "Nothing was pushed. STOP.")
+    return ""
+
+
+def _pr_draft_state(pr_url: str, repo_spec: str) -> tuple[bool, bool] | None:
+    """``(is_draft, auto_merge_on)`` for the open PR ``pr_url``, or ``None`` when gh fails,
+    answers something unreadable, or the PR is not open (callers fail closed)."""
+    r = subprocess.run(["gh", "pr", "view", pr_url, "--repo", repo_spec,
+                        "--json", "state,isDraft,autoMergeRequest"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(r.stderr, file=sys.stderr)
+        return None
+    try:
+        data = json.loads(r.stdout or "")
+    except json.JSONDecodeError:
+        return None
+    if (not isinstance(data, dict) or not isinstance(data.get("isDraft"), bool)
+            or data.get("state") != "OPEN" or "autoMergeRequest" not in data):
+        return None
+    return data["isDraft"], data.get("autoMergeRequest") is not None
+
+
 def _existing_pr(pr_list_cmd: list[str], branch: str, owner: str) -> str:
-    """The URL of the open PR whose head is ``owner:branch`` (via ``gh pr list``), or ``""``.
+    """Like `_open_pr_lookup`, with a failed lookup also reported as ``""`` (for callers
+    that refuse on "no PR" anyway)."""
+    return _open_pr_lookup(pr_list_cmd, branch, owner) or ""
+
+
+def _open_pr_lookup(pr_list_cmd: list[str], branch: str, owner: str) -> str | None:
+    """The URL of the open PR whose head is ``owner:branch`` (via ``gh pr list``), ``""``
+    when there is none, or ``None`` when the answer cannot be trusted: gh failed, printed
+    no JSON (it prints ``[]`` for none), a full page of ``PR_LOOKUP_LIMIT`` results (maybe
+    cut off), or more than one match (a push would update them all).
 
     The command filters by the bare ``--head <branch> --state open`` (gh does not support
     the ``owner:branch`` form there, #58), so the fork owner is disambiguated HERE: match
-    both ``headRefName == branch`` and ``headRepositoryOwner.login == owner`` so a
-    same-named branch on a different fork can't loose-match. ``""`` on no PR / gh error /
-    unparseable output — the caller fails loudly rather than pushing."""
+    both ``headRefName == branch`` and ``headRepositoryOwner.login == owner`` (without
+    case, as GitHub treats logins) so a same-named branch on a different fork can't
+    loose-match."""
     r = subprocess.run(pr_list_cmd, capture_output=True, text=True)
     if r.returncode != 0:
         print(r.stderr, file=sys.stderr)
-        return ""
+        return None
     try:
-        prs = json.loads(r.stdout or "[]")
+        prs = json.loads(r.stdout or "")
     except json.JSONDecodeError:
-        return ""
+        return None
+    if not isinstance(prs, list) or len(prs) >= PR_LOOKUP_LIMIT:
+        return None
+    matches, others = [], 0
     for pr in prs:
-        if (pr.get("headRefName") == branch
-                and (pr.get("headRepositoryOwner") or {}).get("login") == owner):
-            return pr.get("url", "")
-    return ""
-
+        # Each entry's URL must be its own number's PR, or the entry is not trustworthy.
+        if isinstance(pr, dict) and "url" in pr and not (
+                isinstance(pr.get("number"), int) and isinstance(pr["url"], str)
+                and pr["url"].endswith(f"/pull/{pr['number']}")):
+            return None
+    for pr in prs:
+        if not isinstance(pr, dict):
+            return None
+        owner_obj = pr.get("headRepositoryOwner")
+        login = owner_obj.get("login") if isinstance(owner_obj, dict) else None
+        if not (isinstance(login, str) and isinstance(pr.get("headRefName"), str)):
+            return None  # an entry we cannot judge: never read it as "not this PR"
+        if pr["headRefName"] == branch and login.casefold() == owner.casefold():
+            matches.append(pr.get("url"))
+        elif pr["headRefName"] == branch:
+            others += 1
+    if not matches and others:
+        # Only other owners' PRs on this branch name: a fork's, or this very branch after
+        # its repository was renamed or transferred (the remote URL keeps the old owner).
+        # Those cannot be told apart here, so refuse rather than read it as "no PR".
+        print(f"publish: {others} open PR(s) use the branch {branch} under another owner "
+              f"than {owner}; check the remote URL and those PRs.", file=sys.stderr)
+        return None
+    if not matches:
+        return ""
+    if len(matches) > 1:
+        print(f"publish: {len(matches)} open PRs share the head {owner}:{branch}; "
+              "close all but one first.", file=sys.stderr)
+        return None
+    return matches[0] if isinstance(matches[0], str) and matches[0] else None
 
 # ----------------------------------------------------------------------------
 def _resolve_target(d: Path) -> tuple[str, str, str]:
@@ -625,7 +834,32 @@ def _checkout_path(cfg: Config, repo_spec: str) -> Path:
 
 
 def _publish_record(d: Path) -> dict | None:
-    """The bundle's ``publish.json`` (the recorded PR/branch), or None if absent/unreadable."""
+    """The bundle's ``publish.json`` (the recorded PR/branch), or None if absent/unreadable,
+    or when it predates an unfinished publish (`INCOMPLETE` newer than it): it then
+    describes an earlier attempt, so no consumer may act on it. A record the unfinished
+    run wrote itself (e.g. the branch pushed, then `gh pr create` failed) is this attempt
+    and stays readable; merge refuses the bundle on the marker alone."""
+    if _stale_record(d):
+        return None
+    return _publish_record_raw(d)
+
+
+def _stale_record(d: Path, marker: str = INCOMPLETE) -> bool:
+    """Whether ``d/publish.json`` was written before the unfinished publish began. Equal
+    timestamps count as stale (coarse clocks fail closed)."""
+    try:
+        started = (d / marker).stat().st_mtime_ns
+    except OSError:
+        return False
+    try:
+        return (d / "publish.json").stat().st_mtime_ns <= started
+    except OSError:
+        return False
+
+
+def _publish_record_raw(d: Path) -> dict | None:
+    """``publish.json`` as written, even mid-publish (publish's own reads of its last
+    record)."""
     pj = d / "publish.json"
     if not pj.exists():
         return None

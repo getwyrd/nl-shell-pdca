@@ -92,6 +92,14 @@ class IsMerged(unittest.TestCase):
             self.assertFalse(merged.is_merged(self.cfg, "NOPR"))
             run.assert_not_called()  # short-circuits before gh
 
+    def test_an_incomplete_publish_hides_its_record(self) -> None:
+        d = self.cfg.bundle("INC")
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "publish.json").write_text('{"pr_url": "https://gh/pr/1"}', encoding="utf-8")
+        self.assertIsNotNone(merged._publish_record(d))
+        (d / "publish.incomplete").write_text("x\n", encoding="utf-8")
+        self.assertIsNone(merged._publish_record(d))
+
     def test_gh_failure_is_fail_closed(self) -> None:
         _complete_bundle(self.cfg, "ERR", pr_url="https://x/pr/3")
         with mock.patch("pdca_harness.merged.subprocess.run",
