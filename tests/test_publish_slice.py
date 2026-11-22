@@ -618,6 +618,10 @@ class PublishSlice(unittest.TestCase):
         (d / publish.INCOMPLETE).write_text("x\n", encoding="utf-8")
         self.assertIsNone(publish._publish_record(d))           # every consumer sees none
         self.assertIsNotNone(publish._publish_record_raw(d))
+        import os, time
+        later = time.time_ns() + 10**9                          # this run's own record
+        os.utime(d / "publish.json", ns=(later, later))
+        self.assertIsNotNone(publish._publish_record(d))
 
     def test_unreadable_pr_answers_fail_closed(self) -> None:
         def ans(obj):
@@ -650,6 +654,10 @@ class PublishSlice(unittest.TestCase):
         pj = json.loads((d / "publish.json").read_text(encoding="utf-8"))
         self.assertTrue(pj["pr_edit_failed"], out)
         self.assertEqual(pj["base"], "old-base")                 # read back from the PR
+        self.assertEqual(rc, 1)
+        rc, _, out, _ = self._republish("KEEPFLAG", prior=url, open_pr=False)  # base is main
+        self.assertEqual(rc, 1, out)                             # flag still unresolved
+        self.assertTrue((d / publish.INCOMPLETE).exists())
         self.assertEqual(pj["requested_base"], "main")
 
     def test_open_pr_lookup_fails_closed(self) -> None:

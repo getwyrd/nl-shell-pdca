@@ -478,7 +478,7 @@ def _publish_impl(
                   f"`{recorded_base or 'an unreadable base'}`, not `{pr_base}`. Retarget it "
                   "(or re-run without --no-pr). This is NOT done.\n", file=sys.stderr)
         if isinstance(prev_rec, dict) and prev_rec.get("pr_edit_failed"):
-            edit_failed = True
+            edit_failed = pr_failed = True  # still unresolved, so still not done
             pr_base = str(prev_rec.get("requested_base") or pr_base)
     # The bundle's own open PR, checked before the push: `gh pr create` would fail "a pull
     # request … already exists", so update that PR's title/body/base instead and keep its
@@ -835,11 +835,26 @@ def _checkout_path(cfg: Config, repo_spec: str) -> Path:
 
 def _publish_record(d: Path) -> dict | None:
     """The bundle's ``publish.json`` (the recorded PR/branch), or None if absent/unreadable,
-    or while its last publish has not finished with success (`INCOMPLETE`): the record
-    may then describe an earlier attempt, so no consumer may act on it."""
-    if (d / INCOMPLETE).exists():
+    or when it predates an unfinished publish (`INCOMPLETE` newer than it): it then
+    describes an earlier attempt, so no consumer may act on it. A record the unfinished
+    run wrote itself (e.g. the branch pushed, then `gh pr create` failed) is this attempt
+    and stays readable; merge refuses the bundle on the marker alone."""
+    if _stale_record(d):
         return None
     return _publish_record_raw(d)
+
+
+def _stale_record(d: Path, marker: str = INCOMPLETE) -> bool:
+    """Whether ``d/publish.json`` was written before the unfinished publish began. Equal
+    timestamps count as stale (coarse clocks fail closed)."""
+    try:
+        started = (d / marker).stat().st_mtime_ns
+    except OSError:
+        return False
+    try:
+        return (d / "publish.json").stat().st_mtime_ns <= started
+    except OSError:
+        return False
 
 
 def _publish_record_raw(d: Path) -> dict | None:
