@@ -134,7 +134,10 @@ def publish(cfg: Config, issue_id: str, *, dry_run: bool = False, **kw) -> int:
         marker.write_text("publish started and has not finished with success\n",
                           encoding="utf-8")
     rc = _publish_impl(cfg, issue_id, dry_run=False, **kw)
-    if rc == 0:
+    # A finished publish removes the marker itself, before results recording stages the
+    # bundle. A successful run that wrote no record (no target to contribute to) clears it
+    # only while no older publish.json is left for consumers to mistake for this attempt.
+    if rc == 0 and not (marker.parent / "publish.json").exists():
         marker.unlink(missing_ok=True)
     return rc
 
@@ -550,6 +553,7 @@ def _publish_impl(
     print("  STOP: review CI, then mark it ready / merge yourself — the human's step.")
     # Recording call-in (#317): strictly AFTER the publish.json write above — never
     # mid-publish — and best-effort ([records] mode "off", the default, is a no-op).
+    (d / INCOMPLETE).unlink(missing_ok=True)  # finished: before recording stages the bundle
     record_mod.after_publish(cfg)
     return 0
 
@@ -677,6 +681,7 @@ def _publish_stacked(
     print("  STOP: review CI, then mark it ready / merge yourself — the human's step.")
     # Recording call-in (#317): same contract as the new-PR path — strictly after
     # this path's publish.json write, best-effort, no-op under mode "off".
+    (d / INCOMPLETE).unlink(missing_ok=True)  # finished: before recording stages the bundle
     record_mod.after_publish(cfg)
     return 0
 
@@ -752,6 +757,12 @@ def _open_pr_lookup(pr_list_cmd: list[str], branch: str, owner: str) -> str | No
     if not isinstance(prs, list) or len(prs) >= PR_LOOKUP_LIMIT:
         return None
     matches, others = [], 0
+    for pr in prs:
+        # Each entry's URL must be its own number's PR, or the entry is not trustworthy.
+        if isinstance(pr, dict) and "url" in pr and not (
+                isinstance(pr.get("number"), int) and isinstance(pr["url"], str)
+                and pr["url"].endswith(f"/pull/{pr['number']}")):
+            return None
     for pr in prs:
         if not isinstance(pr, dict):
             return None

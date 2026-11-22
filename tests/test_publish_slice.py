@@ -445,7 +445,7 @@ class PublishSlice(unittest.TestCase):
             calls.append(cmd)
             if cmd[:3] == ["gh", "pr", "list"]:
                 return SimpleNamespace(returncode=list_rc, stderr="", stdout=json.dumps([{
-                    "url": url, "number": 1, "headRefName": f"fix/{iid}-my-fix",
+                    "url": url, "number": len(iid), "headRefName": f"fix/{iid}-my-fix",
                     "headRepositoryOwner": {"login": "example-org"}}]))
             if cmd[:3] == ["gh", "pr", "view"] and "--jq" in cmd:
                 return SimpleNamespace(returncode=0, stdout="old-base\n", stderr="")
@@ -585,6 +585,25 @@ class PublishSlice(unittest.TestCase):
         self.assertEqual(rc, 1, buf.getvalue())
         self.assertTrue((d / publish.INCOMPLETE).exists())
 
+    def test_marker_is_gone_before_results_recording_runs(self) -> None:
+        seen = {}
+
+        def spy(_cfg):
+            seen["marker"] = (self.cfg.bundle("RECSPY") / publish.INCOMPLETE).exists()
+
+        with mock.patch.object(publish.record_mod, "after_publish", side_effect=spy):
+            rc, _, out, _ = self._republish("RECSPY")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(seen, {"marker": False})
+
+    def test_a_successful_run_that_writes_no_record_keeps_an_old_record_hidden(self) -> None:
+        d = _bundle(self.cfg, "SKIPOLD", brief_body=_FIX_BRIEF, accepted=True)
+        _prior(d, "fix/SKIPOLD-my-fix", "https://x/pull/1")
+        with mock.patch.object(publish, "_publish_impl", return_value=0):   # e.g. no target
+            self.assertEqual(publish.publish(self.cfg, "SKIPOLD"), 0)
+        self.assertTrue((d / publish.INCOMPLETE).exists())
+        self.assertIsNone(publish._publish_record(d))
+
     def test_an_incomplete_publish_hides_its_record(self) -> None:
         d = _bundle(self.cfg, "HIDE", brief_body=_FIX_BRIEF, accepted=True)
         _prior(d, "fix/HIDE-my-fix", "https://x/pr/1")
@@ -629,20 +648,26 @@ class PublishSlice(unittest.TestCase):
         def ans(stdout: str, rc: int = 0):
             return mock.patch.object(publish.subprocess, "run", return_value=SimpleNamespace(
                 returncode=rc, stdout=stdout, stderr=""))
-        pr = {"url": "u1", "headRefName": "b", "headRepositoryOwner": {"login": "Example-Org"}}
+        pr = {"url": "https://x/pull/1", "number": 1, "headRefName": "b",
+              "headRepositoryOwner": {"login": "Example-Org"}}
         cmd = ["gh", "pr", "list"]
         with ans(json.dumps([pr])):                              # owner without case
-            self.assertEqual(publish._open_pr_lookup(cmd, "b", "example-org"), "u1")
+            self.assertEqual(publish._open_pr_lookup(cmd, "b", "example-org"),
+                             "https://x/pull/1")
+        with ans(json.dumps([dict(pr, number=2)])):              # URL is not its number's
+            self.assertIsNone(publish._open_pr_lookup(cmd, "b", "example-org"))
         with ans("[]"):
             self.assertEqual(publish._open_pr_lookup(cmd, "b", "example-org"), "")
         with ans(""), redirect_stderr(io.StringIO()):            # no JSON at all
             self.assertIsNone(publish._open_pr_lookup(cmd, "b", "example-org"))
         with ans("[]", rc=1), redirect_stderr(io.StringIO()):
             self.assertIsNone(publish._open_pr_lookup(cmd, "b", "example-org"))
-        other = {"url": "x", "headRefName": "b", "headRepositoryOwner": {"login": "fork"}}
+        other = {"url": "https://x/pull/3", "number": 3, "headRefName": "b",
+                 "headRepositoryOwner": {"login": "fork"}}
         with ans(json.dumps([other] * publish.PR_LOOKUP_LIMIT)):  # may be cut off
             self.assertIsNone(publish._open_pr_lookup(cmd, "b", "example-org"))
-        with ans(json.dumps([pr, dict(pr, url="u2")])), redirect_stderr(io.StringIO()):
+        with ans(json.dumps([pr, dict(pr, url="https://x/pull/2", number=2)])), \
+             redirect_stderr(io.StringIO()):
             self.assertIsNone(publish._open_pr_lookup(cmd, "b", "example-org"))
 
     def test_stack_refuses_a_ready_pr_before_pushing(self) -> None:
