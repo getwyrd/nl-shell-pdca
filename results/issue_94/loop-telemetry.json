@@ -1,0 +1,40 @@
+{
+  "attempts": [
+    {
+      "n": 1,
+      "builder": "codex",
+      "family": "codex",
+      "model": "",
+      "effort": ""
+    },
+    {
+      "n": 2,
+      "builder": "codex",
+      "family": "codex",
+      "model": "",
+      "effort": ""
+    },
+    {
+      "n": 3,
+      "builder": "codex",
+      "family": "codex",
+      "model": "",
+      "effort": ""
+    },
+    {
+      "n": 4,
+      "builder": "codex",
+      "family": "codex",
+      "model": "",
+      "effort": ""
+    },
+    {
+      "n": 5,
+      "builder": "codex",
+      "family": "codex",
+      "model": "",
+      "effort": ""
+    }
+  ],
+  "iterations_to_pass": 5
+}

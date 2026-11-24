@@ -1,0 +1,31 @@
+Give the running command the real terminal (keys, Ctrl-C, resize)
+
+While a command ran in the persistent bash session, the user's real terminal
+was not connected to it. Interactive programs got no keyboard input, Ctrl-C did
+not interrupt the command, a window resize did not reach it, and keys typed
+during a command had no defined fate.
+
+From sending a command until bash reports it done, nl-shell now puts the real
+terminal in raw mode and forwards every key to the command unchanged. Forwarded
+keys are never logged, captured or kept. The command's output is copied to the
+real terminal; it is also captured, except while a full-screen program uses the
+alternate screen, and capture stops for the rest of a command once the user has
+typed into it (the result says so). Window size changes are copied to the
+session, and the terminal's settings are put back on every way out, including
+an exception mid-command.
+
+Keys typed during a command that the command did not read never become part of
+the next confirmed command: the prompt hook drains them as its last step before
+the end record. A narrow race remains and is listed in the threat model's Known
+gaps, as are the unfiltered output copy and a Ctrl-C typed just as a command
+ends. The spec (pty-protocol v1 section 6) and ADR-0014 Decision 4 are updated
+to match.
+
+The code lives in a new module, nl_shell.session_terminal, and is reached
+through an optional terminal argument to Session.run(). Nothing calls it with
+the real terminal yet; the REPL wiring is #78.
+
+Builds on 7d657847d4a701d5f676429807ca2b3e40640024 (#140) and
+3e30813047f3a5bb6beb2d9d28c21be352a4dc12 (#141).
+
+Fixes #102

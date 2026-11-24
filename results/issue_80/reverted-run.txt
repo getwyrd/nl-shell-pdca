@@ -1,0 +1,51 @@
+== C4 green leg: bundle test(s) with the fix applied: tests/test_tldr_snapshot.py
+FFF                                                                      [100%]
+=================================== FAILURES ===================================
+___________________________ test_pinned_full_export ____________________________
+
+    def test_pinned_full_export():
+        first, attempts = child()
+>       assert first.returncode == 0, first.stderr.decode()
+E       AssertionError: AUDIT:[]
+E         Traceback (most recent call last):
+E           File "<string>", line 21, in <module>
+E             runpy.run_path(sys.argv[0], run_name="__main__")
+E             ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           File "<frozen runpy>", line 286, in run_path
+E           File "<frozen runpy>", line 254, in _get_code_from_file
+E         FileNotFoundError: [Errno 2] No such file or directory: '/home/eddie/nl-shell/nl-shell.pdca-wt-l0/scripts/tldr_snapshot.py'
+E         
+E       assert 1 == 0
+E        +  where 1 = CompletedProcess(args=['/home/eddie/nl-shell/nl-shell-pdca/.venv/bin/python3', '-c', '\nimport json, os, runpy, socket...ndError: [Errno 2] No such file or directory: \'/home/eddie/nl-shell/nl-shell.pdca-wt-l0/scripts/tldr_snapshot.py\'\n').returncode
+
+tests/test_tldr_snapshot.py:61: AssertionError
+_________________________ test_audit_positive_controls _________________________
+
+    def test_audit_positive_controls():
+        for mode, event in (("network", "socket.connect"), ("process", "subprocess.Popen")):
+            result, attempts = child(mode)
+>           assert result.returncode == 91
+E           AssertionError: assert 1 == 91
+E            +  where 1 = CompletedProcess(args=['/home/eddie/nl-shell/nl-shell-pdca/.venv/bin/python3', '-c', '\nimport json, os, runpy, socket...n    ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nPermissionError: [Errno 1] Operation not permitted\n').returncode
+
+tests/test_tldr_snapshot.py:99: AssertionError
+____________________ test_corruption_rejected_before_export ____________________
+
+tmp_path = PosixPath('/tmp/pytest-of-eddie/pytest-19/test_corruption_rejected_befor0')
+
+    def test_corruption_rejected_before_export(tmp_path):
+        source = ROOT / "data/tldr"
+>       assert (source / "pages.jsonl").is_file(), "real pinned corpus must be shipped"
+E       AssertionError: real pinned corpus must be shipped
+E       assert False
+E        +  where False = is_file()
+E        +    where is_file = (PosixPath('/home/eddie/nl-shell/nl-shell.pdca-wt-l0/data/tldr') / 'pages.jsonl').is_file
+
+tests/test_tldr_snapshot.py:105: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_tldr_snapshot.py::test_pinned_full_export - AssertionError:...
+FAILED tests/test_tldr_snapshot.py::test_audit_positive_controls - AssertionE...
+FAILED tests/test_tldr_snapshot.py::test_corruption_rejected_before_export - ...
+3 failed in 0.09s
+   (pytest exit 1; ran 3, failed 3, setup errors 0, import/collection errors 0)
+PDCA-EVIDENCE: C4 FAIL — bundle test red (or not importable) WITH the fix applied

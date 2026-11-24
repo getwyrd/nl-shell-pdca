@@ -1,0 +1,2997 @@
+diff --git a/.oss-scanner/threat_model.md b/.oss-scanner/threat_model.md
+index 717c371..c6ec45d 100644
+--- a/.oss-scanner/threat_model.md
++++ b/.oss-scanner/threat_model.md
+@@ -89,7 +89,12 @@ Treat all of the following as attacker-controlled:
+     detect.
+ 11. **The dev teacher endpoint** (development only, behind `--dev-teacher`, ADR-0020):
+     plaintext and unauthenticated on the LAN unless tunnelled. Its answers are model
+-    output (item 5), and the state block is sent to it.
++    output (item 5), and the state block is sent to it. The client
++    (`src/nl_shell/teacher_client.py`, #77) uses any URL only with the flag, warns on a
++    non-loopback `http://` URL, sends no credentials, uses no proxy, follows no redirect,
++    checks TLS certificates, caps a response at 64 KiB within one total deadline
++    (`model.timeout_s`), and escapes any server text it reports (status reason, error
++    body, exception text). Its answer goes to the strict proposal parser unchanged.
+ 
+ Trusted:
+ - what the user types and their confirm and edit decisions;
+@@ -126,7 +131,8 @@ Trusted:
+   the reader, never logged, never retrieved as history (ADR-0025).
+ - **What the user confirms is exactly what runs**, byte for byte: bracketed paste, no
+   history expansion (ADR-0014). The confirm UI renders from the parsed command with hidden
+-  characters escaped; proposals with bidi or control characters are rejected (#74).
++  characters escaped (#74); proposals with bidi or control characters are rejected by
++  the proposal parser (M0.8, #143).
+ - **Completion and exit codes can't be forged by output** (control channel, ADR-0014).
+ - **Output rendering is filtered everywhere**: the mirrored PTY output, `:context` and
+   `:history` must not let printed text write the clipboard (OSC 52) or spoof nl-shell's
+@@ -195,8 +201,13 @@ the throwaway reference VM (`NL_SHELL_TEST_VM=1`, never on your own machine). Th
+ contract and its test vectors are in `docs/design/specs/policy-gate/v1.md`; the PTY
+ protocol's in `docs/design/specs/pty-protocol/v1.md`. The session tests
+ (`tests/test_session.py`) need only bash (5.1 or later): they start a real bash on a PTY,
+-with no VM and no sudo. Once #16 lands, a stub model backend
+-returns fixed proposals, so the gate can be tested without a GPU.
++with no VM and no sudo. The recording stub backend (`RecordingStub` in
++`src/nl_shell/backend.py`) returns fixed model responses and records every model input it
++was sent, so the prompts, the proposal parser and the REPL are tested without a model or a
++GPU (`tests/test_backend.py`), and the gate can be tested the same way.
++The model client and the `--dev-teacher` rules are tested against an in-process fake
++OpenAI-compatible server on loopback and on a Unix socket (`tests/test_teacher_client.py`),
++including a check that the default configuration opens no TCP connection.
+ 
+ ## How we rate severity
+ 
+diff --git a/pyproject.toml b/pyproject.toml
+index 7f95606..a120eee 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -13,6 +13,7 @@ requires-python = ">=3.12"
+ dependencies = [
+     "prompt_toolkit>=3.0",
+     "ptyprocess>=0.7",
++    "PyYAML>=6",
+ ]
+ 
+ [project.optional-dependencies]
+diff --git a/src/nl_shell/backend.py b/src/nl_shell/backend.py
+new file mode 100644
+index 0000000..56b190c
+--- /dev/null
++++ b/src/nl_shell/backend.py
+@@ -0,0 +1,59 @@
++"""Model backends: what takes the model input and returns the model's raw answer.
++
++A backend gets the model input (the ordered message list ``nl_shell.prompts.build``
++makes) and returns the response text, unparsed; the REPL parses it
++(``nl_shell.proposal``). #77 adds the HTTP client to the local model server. Until then
++the only backend is ``RecordingStub``, for tests (#13, #78): it returns the responses the
++test gives it, in order, and records every model input it was sent.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Iterable, Sequence
++from typing import Protocol
++
++from nl_shell.prompts import Message
++
++
++class Backend(Protocol):
++    def complete(self, messages: Sequence[Message]) -> str:
++        """The raw response text for one model input."""
++        ...
++
++
++class BackendError(Exception):
++    """A backend could not produce a response; the REPL shows a fixed reply and goes on.
++
++    ``reason`` is safe to print: any server-supplied text in it is already escaped.
++    ``not_running_at`` is set, to the socket or address that gave no answer, when the
++    model server is simply not there (absent or refused socket); the REPL then says the
++    server isn't running instead of showing ``reason``.
++    """
++
++    def __init__(self, reason: str, *, not_running_at: str | None = None) -> None:
++        super().__init__(reason)
++        self.reason = reason
++        self.not_running_at = not_running_at
++
++
++class StubExhausted(Exception):
++    """The stub was sent more requests than it was given responses."""
++
++
++class RecordingStub:
++    """A backend that returns fixed responses and records every input, in order."""
++
++    def __init__(self, responses: Iterable[str] = ()) -> None:
++        self._responses = list(responses)
++        # One entry per request, in order: the message tuple the backend was handed.
++        self.inputs: list[tuple[Message, ...]] = []
++
++    def respond(self, *responses: str) -> None:
++        """Queue more responses."""
++        self._responses.extend(responses)
++
++    def complete(self, messages: Sequence[Message]) -> str:
++        self.inputs.append(tuple(messages))
++        if not self._responses:
++            raise StubExhausted(f"no response queued for request {len(self.inputs)}")
++        return self._responses.pop(0)
+diff --git a/src/nl_shell/cli.py b/src/nl_shell/cli.py
+index 934e350..c9ffbd5 100644
+--- a/src/nl_shell/cli.py
++++ b/src/nl_shell/cli.py
+@@ -3,11 +3,20 @@
+ from __future__ import annotations
+ 
+ import argparse
++import os
+ import sys
+ from collections.abc import Sequence
+ from pathlib import Path
+ 
+-from nl_shell import __version__, config, os_release, targets
++from nl_shell import (
++    __version__,
++    config,
++    os_release,
++    prompts,
++    render,
++    targets,
++    teacher_client,
++)
+ from nl_shell.input_modes import StatusLine
+ from nl_shell.repl import Repl
+ 
+@@ -30,6 +39,17 @@ def main(
+         metavar="ID",
+         help="use this OS target even if it does not match this OS",
+     )
++    parser.add_argument(
++        "--dev-teacher",
++        nargs="?",
++        const=True,
++        default=None,
++        metavar="URL",
++        help=(
++            "development only: send model requests to URL (or to teacher_url from "
++            "config.toml) for this session instead of the local model socket"
++        ),
++    )
+     args = parser.parse_args(argv)
+ 
+     root = targets.TARGETS_ROOT if targets_root is None else targets_root
+@@ -41,27 +61,55 @@ def main(
+         settings = config.load(config_file)
+         named = args.target if args.target is not None else settings.target
+         selection = targets.select(named, root, paths)
++        loaded = prompts.load(selection.target.folder, prompts.user_path())
++        endpoint, notices = teacher_client.select_endpoint(
++            args.dev_teacher,
++            settings.teacher_url,
++            os.environ.get("XDG_RUNTIME_DIR"),
++            config_file=str(config_file),
++        )
+     except targets.NoMatchingTarget as exc:
+         names = ", ".join(exc.available) or "none"
+-        print(
++        _error(
+             f"nl-shell: {exc}.\n"
+             f"Available targets: {names}.\n"
+-            f"Name one with --target <id>, or with target = \"<id>\" in {config_file}.",
+-            file=sys.stderr,
++            f"Name one with --target <id>, or with target = \"<id>\" in {config_file}."
+         )
+         return 1
+-    except (config.ConfigError, targets.TargetError) as exc:
+-        print(f"nl-shell: {exc}", file=sys.stderr)
++    except (
++        config.ConfigError,
++        targets.TargetError,
++        prompts.PromptsError,
++        teacher_client.EndpointError,
++    ) as exc:
++        _error(f"nl-shell: {exc}")
+         return 1
+ 
+     if not selection.matches:
+-        print(
++        _error(
+             f"nl-shell: warning: target {selection.target.id} does not match this OS "
+-            f"(detected: {selection.detected_id} {selection.detected_version_id}).",
+-            file=sys.stderr,
++            f"(detected: {selection.detected_id} {selection.detected_version_id})."
+         )
+-    status_lines = tuple(_constant(line) for line in selection.status_lines())
+-    return Repl.interactive(status_lines=status_lines).run()
++    for notice in notices:
++        _error(notice)
++    client = teacher_client.TeacherClient(
++        endpoint, model=settings.teacher_model, timeout_s=settings.model_timeout_s
++    )
++    lines = (
++        *selection.status_lines(),
++        *loaded.status_lines(),
++        f"model endpoint: {endpoint.describe()}",
++        f"model backend: {client.kind}",
++    )
++    status_lines = tuple(_constant(line) for line in lines)
++    return Repl.interactive(
++        status_lines=status_lines, backend=client, prompts=loaded
++    ).run()
++
++
++def _error(text: str) -> None:
++    """Print a start-up message. File text and paths in it are untrusted: escape them."""
++    print(render.escape(text), file=sys.stderr)
+ 
+ 
+ def _constant(text: str) -> StatusLine:
+diff --git a/src/nl_shell/config.py b/src/nl_shell/config.py
+index a3a9301..c779c86 100644
+--- a/src/nl_shell/config.py
++++ b/src/nl_shell/config.py
+@@ -6,12 +6,15 @@ It lives at ``$XDG_CONFIG_HOME/nl-shell/config.toml``. Per the XDG Base Director
+ ignored; a known key with the wrong type, or a file that is not valid TOML, is an error
+ that names the file.
+ 
+-Today the only key is ``target`` (ADR-0023 "Choosing the target"). Later issues (#77)
+-add their keys to ``Config`` and ``load``.
++The keys: ``target`` (ADR-0023 "Choosing the target"); ``teacher_url`` and
++``teacher_model``, the development teacher endpoint (#77; the URL is used only with
++``--dev-teacher``, ADR-0020 §3); and ``[model] timeout_s``, the total deadline of one
++model request in seconds (ADR-0020 §5, default 10).
+ """
+ 
+ from __future__ import annotations
+ 
++import math
+ import os
+ import tomllib
+ from collections.abc import Mapping
+@@ -19,6 +22,7 @@ from dataclasses import dataclass
+ from pathlib import Path
+ 
+ CONFIG_NAME = "config.toml"
++DEFAULT_MODEL_TIMEOUT_S = 10.0
+ 
+ 
+ class ConfigError(Exception):
+@@ -28,6 +32,12 @@ class ConfigError(Exception):
+ @dataclass(frozen=True)
+ class Config:
+     target: str | None = None
++    # A non-default model endpoint. Used only with `--dev-teacher` (ADR-0020 §3).
++    teacher_url: str | None = None
++    # The `model` name sent to the endpoint, if set (vLLM needs one).
++    teacher_model: str | None = None
++    # `[model] timeout_s`: the total deadline of one model request (ADR-0020 §5).
++    model_timeout_s: float = DEFAULT_MODEL_TIMEOUT_S
+ 
+ 
+ def config_path(env: Mapping[str, str] | None = None) -> Path:
+@@ -57,7 +67,30 @@ def load(path: Path | None = None) -> Config:
+         raise ConfigError(f"{path}: not valid TOML: not valid UTF-8") from None
+     except tomllib.TOMLDecodeError as exc:
+         raise ConfigError(f"{path}: not valid TOML: {exc}") from None
+-    target = doc.get("target")
+-    if target is not None and not isinstance(target, str):
+-        raise ConfigError(f"{path}: `target` must be a string")
+-    return Config(target=target)
++    target = _string(doc, "target", path)
++    teacher_url = _string(doc, "teacher_url", path)
++    teacher_model = _string(doc, "teacher_model", path)
++    model = doc.get("model", {})
++    if not isinstance(model, dict):
++        raise ConfigError(f"{path}: `model` must be a table")
++    timeout_s = model.get("timeout_s", DEFAULT_MODEL_TIMEOUT_S)
++    if (
++        isinstance(timeout_s, bool)
++        or not isinstance(timeout_s, (int, float))
++        or not math.isfinite(timeout_s)
++        or timeout_s <= 0
++    ):
++        raise ConfigError(f"{path}: `model.timeout_s` must be a number of seconds > 0")
++    return Config(
++        target=target,
++        teacher_url=teacher_url,
++        teacher_model=teacher_model,
++        model_timeout_s=float(timeout_s),
++    )
++
++
++def _string(doc: Mapping[str, object], key: str, path: Path) -> str | None:
++    value = doc.get(key)
++    if value is not None and not isinstance(value, str):
++        raise ConfigError(f"{path}: `{key}` must be a string")
++    return value
+diff --git a/src/nl_shell/input_modes.py b/src/nl_shell/input_modes.py
+index 765a28b..805eb93 100644
+--- a/src/nl_shell/input_modes.py
++++ b/src/nl_shell/input_modes.py
+@@ -6,9 +6,9 @@ when the line is also valid bash (``?x`` is a glob, ``\\ls`` is valid bash):
+     prefix   mode                     today
+     \\cmd     shell command            the command route (the router is skipped)
+     ?q       ask mode                 placeholder reply (M0.8)
+-    @req     one-command proposal     placeholder reply (M0.8)
++    @req     one-command proposal     the model's proposal, shown (nl_shell.repl)
+     @@goal   agent loop               reserved reply; #76 owns the grammar (M0.6b)
+-    :name    meta-command             :status works; :context (#16), :history (#17)
++    :name    meta-command             :status and :context work; :history (#17)
+ 
+ This stays a unit of its own, apart from ``nl_shell.router``: the router is the
+ plain-input heuristic the M3 classifier (#40) replaces, and prefixes are not heuristics.
+@@ -83,8 +83,8 @@ StatusLine = Callable[[], str]
+ # them to `reply`, and `reply` to `status`. So a line never leaks into another Repl or a
+ # later run in the same process, and a Repl built with no lines shows only the version.
+ # A later issue adds a line by adding its callable to the tuple `nl_shell.cli.main` builds
+-# for the session, after the active-target lines (#16 prompt files loaded, #77 endpoint
+-# and backend); nothing here changes.
++# for the session, after the active-target and loaded-prompt-file lines (#77 endpoint and
++# backend); nothing here changes.
+ def version_line() -> str:
+     return f"nl-shell {nl_shell.__version__}"
+ 
+@@ -97,21 +97,27 @@ ASK_NOT_YET = (
+     "That is an ask-mode question (?), but nl-shell can't answer it yet: "
+     "ask mode arrives in M0.8."
+ )
+-PROPOSE_NOT_YET = (
+-    "That is a one-command request (@), but nl-shell can't propose a command yet: "
+-    "command proposals arrive in M0.8."
+-)
+ AGENT_RESERVED = "@@ is reserved for the agent loop, which arrives with M0.6b (#76)."
+-CONTEXT_NOT_YET = ":context is not available yet: it arrives with M0.8 (#16)."
++NO_MODEL_INPUT_YET = (
++    "No model input yet: :context shows the model input of the last request."
++)
+ HISTORY_NOT_YET = ":history is not available yet: it arrives with M0.9 (#17)."
+ 
++
++def context(model_input: str | None) -> str:
++    """``:context``: the last request's model input, in the text form
++    ``nl_shell.prompts.render_input`` makes (already escaped), or a fixed reply."""
++    return NO_MODEL_INPUT_YET if model_input is None else model_input
++
++
+ # Meta-commands by exact, case-sensitive name. Each takes the session's `:status` lines
+-# (only `:status` uses them). The exit commands (EXIT_NAMES) are handled by the REPL loop
++# (only `:status` uses them) and the `:context` text of the last model input, or None
++# (only `:context` uses it). The exit commands (EXIT_NAMES) are handled by the REPL loop
+ # before dispatch (`is_exit`), so they are listed as known but not looked up here.
+-META_COMMANDS: dict[str, Callable[[Sequence[StatusLine]], str]] = {
+-    "context": lambda _status_lines: CONTEXT_NOT_YET,
+-    "history": lambda _status_lines: HISTORY_NOT_YET,
+-    "status": status,
++META_COMMANDS: dict[str, Callable[[Sequence[StatusLine], str | None], str]] = {
++    "context": lambda _status_lines, model_input: context(model_input),
++    "history": lambda _status_lines, _model_input: HISTORY_NOT_YET,
++    "status": lambda status_lines, _model_input: status(status_lines),
+ }
+ 
+ 
+@@ -130,16 +136,21 @@ USAGE = {
+ 
+ REPLIES = {
+     Mode.ASK: ASK_NOT_YET,
+-    Mode.PROPOSE: PROPOSE_NOT_YET,
+     Mode.AGENT: AGENT_RESERVED,
+ }
+ 
+ 
+-def reply(prefixed: Prefixed, status_lines: Sequence[StatusLine] = ()) -> str:
+-    """The reply for a prefixed line in any mode but a non-empty ``\\`` command.
++def reply(
++    prefixed: Prefixed,
++    status_lines: Sequence[StatusLine] = (),
++    model_input: str | None = None,
++) -> str:
++    """The reply for a prefixed line in any mode but a non-empty ``\\`` or ``@`` line.
+ 
+-    A ``\\`` command with a payload belongs to the command route, which the REPL owns.
+-    ``status_lines`` are the session's own ``:status`` lines, after the version line.
++    A ``\\`` command or an ``@`` request with a payload belongs to the REPL, which owns the
++    command route and the model backend. ``status_lines`` are the session's own
++    ``:status`` lines, after the version line; ``model_input`` is the ``:context`` text of
++    the session's last model input, or None before any request.
+     """
+     mode, payload = prefixed
+     if mode is Mode.META:
+@@ -148,7 +159,7 @@ def reply(prefixed: Prefixed, status_lines: Sequence[StatusLine] = ()) -> str:
+         command = META_COMMANDS.get(payload)
+         if command is None:
+             return f"Unknown meta-command :{payload}. Known: {known_meta_commands()}."
+-        return command(status_lines)
++        return command(status_lines, model_input)
+     if not payload:
+         return USAGE[mode]
+     return REPLIES[mode]
+diff --git a/src/nl_shell/prompts.py b/src/nl_shell/prompts.py
+new file mode 100644
+index 0000000..b1509fc
+--- /dev/null
++++ b/src/nl_shell/prompts.py
+@@ -0,0 +1,221 @@
++"""The prompts YAML and the model input built from it.
++
++Two layers, read with PyYAML's safe loader only (ADR-0020 §1-§2, ADR-0023):
++
++1. the active target's default, ``<target folder>/prompts/prompts.yaml`` (required);
++2. the user's ``$XDG_CONFIG_HOME/nl-shell/prompts.yaml`` (optional), which overrides the
++   default key by key: a key it sets replaces the default's value whole.
++
++The keys, all three required once the layers are merged:
++
++    system            the system prompt: a non-empty string
++    examples          the few-shot examples: a list of mappings, each with exactly
++                      `request` (a non-empty string) and `response` (a string that is a
++                      valid proposal/v1 answer)
++    request_template  the volatile part: a string holding `{state}` once and ending in
++                      `{request}`, its only other placeholder
++
++Any other key, a key with the wrong type, YAML that does not parse, or a top level that is
++not a mapping is a ``PromptsError`` naming the file; ``nl_shell.cli`` refuses to start on
++it, as it does for a malformed ``target.toml``.
++
++The model input (``build``) is an ordered message list, stable part first (ADR-0018 §4):
++the system prompt, then each example as a user and an assistant message in file order,
++then the request as the last user message. ``render_input`` is its text form, the one
++``:context`` prints: each message as ``--- <role> ---`` and its content (escaped,
++backslashes too), joined with LF, with no trailing LF.
++"""
++
++from __future__ import annotations
++
++import os
++from collections.abc import Mapping, Sequence
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any, NamedTuple
++
++import yaml
++
++from nl_shell import config, proposal, render
++
++PROMPTS_NAME = "prompts.yaml"
++PROMPTS_DIR = "prompts"
++KEYS = ("system", "examples", "request_template")
++EXAMPLE_KEYS = ("request", "response")
++STATE = "{state}"
++REQUEST = "{request}"
++# The state block (#11) fills this slot; until then it is empty.
++EMPTY_STATE = ""
++
++
++class PromptsError(Exception):
++    """A prompts file could not be used; the message names the file and the problem."""
++
++
++class Message(NamedTuple):
++    role: str  # "system", "user" or "assistant"
++    content: str
++
++
++@dataclass(frozen=True)
++class Example:
++    request: str
++    response: str
++
++
++@dataclass(frozen=True)
++class Prompts:
++    """The merged prompts, and the files they came from, in load order."""
++
++    system: str
++    examples: tuple[Example, ...]
++    request_template: str
++    files: tuple[Path, ...]
++
++    def status_lines(self) -> tuple[str, ...]:
++        """The ``:status`` lines: one per loaded file."""
++        return tuple(f"prompts: {path}" for path in self.files)
++
++
++def default_path(target_folder: Path) -> Path:
++    return target_folder / PROMPTS_DIR / PROMPTS_NAME
++
++
++def user_path(env: Mapping[str, str] | None = None) -> Path:
++    """The user's prompts.yaml: next to config.toml (ADR-0020 §1)."""
++    return config.config_path(env).parent / PROMPTS_NAME
++
++
++def load(target_folder: Path, user_file: Path | None = None) -> Prompts:
++    """Load the target's default prompts, overridden by ``user_file`` if it exists."""
++    default = Path(os.path.abspath(default_path(target_folder)))
++    merged = dict(_read(default, required=True))
++    files = [default]
++    if user_file is not None:
++        user = Path(os.path.abspath(user_file))
++        layer = _read(user, required=False)
++        if layer is not None:
++            merged.update(layer)
++            files.append(user)
++    missing = [key for key in KEYS if key not in merged]
++    if missing:
++        names = ", ".join(f"`{key}`" for key in missing)
++        raise PromptsError(f"{files[-1]}: missing required key(s) {names}")
++    return Prompts(
++        system=merged["system"][0],
++        examples=merged["examples"][0],
++        request_template=merged["request_template"][0],
++        files=tuple(files),
++    )
++
++
++def _read(path: Path, *, required: bool) -> dict[str, tuple[Any, Path]] | None:
++    """One layer: each known key's validated value and the file it came from."""
++    try:
++        data = path.read_bytes()
++    except FileNotFoundError:
++        if required:
++            raise PromptsError(f"{path}: missing") from None
++        return None
++    except OSError as exc:
++        raise PromptsError(f"{path}: cannot read: {exc.strerror or exc}") from None
++    try:
++        text = data.decode("utf-8")
++    except UnicodeDecodeError:
++        raise PromptsError(f"{path}: not valid YAML: not valid UTF-8") from None
++    try:
++        doc = yaml.safe_load(text)
++    except yaml.YAMLError as exc:
++        raise PromptsError(f"{path}: not valid YAML: {exc}") from None
++    except (ValueError, RecursionError) as exc:
++        # The safe loader also raises these: int() over Python's digit limit or a bad
++        # timestamp gives ValueError, and deep nesting overflows its recursive composer.
++        raise PromptsError(
++            f"{path}: not valid YAML: {type(exc).__name__}: {exc}"
++        ) from None
++    if doc is None:
++        doc = {}  # an empty file overrides nothing
++    if not isinstance(doc, dict):
++        raise PromptsError(f"{path}: the top level must be a mapping of keys")
++    layer: dict[str, tuple[Any, Path]] = {}
++    for key, value in doc.items():
++        if key not in KEYS:
++            known = ", ".join(KEYS)
++            raise PromptsError(f"{path}: unknown key {key!r} (known: {known})")
++        layer[key] = (_VALIDATORS[key](path, value), path)
++    return layer
++
++
++def _system(path: Path, value: Any) -> str:
++    if not isinstance(value, str) or not value.strip():
++        raise PromptsError(f"{path}: `system` must be a non-empty string")
++    return value
++
++
++def _examples(path: Path, value: Any) -> tuple[Example, ...]:
++    if not isinstance(value, list):
++        raise PromptsError(f"{path}: `examples` must be a list")
++    examples = []
++    for number, item in enumerate(value, start=1):
++        where = f"{path}: `examples` item {number}"
++        if not isinstance(item, dict) or sorted(item, key=str) != sorted(EXAMPLE_KEYS):
++            raise PromptsError(
++                f"{where} must be a mapping with exactly `request` and `response`"
++            )
++        request, response = item["request"], item["response"]
++        if not isinstance(request, str) or not request.strip():
++            raise PromptsError(f"{where}: `request` must be a non-empty string")
++        if not isinstance(response, str):
++            raise PromptsError(f"{where}: `response` must be a string")
++        if isinstance(proposal.parse(response), proposal.Rejected):
++            raise PromptsError(f"{where}: `response` is not a valid proposal/v1 answer")
++        examples.append(Example(request=request, response=response))
++    return tuple(examples)
++
++
++def _request_template(path: Path, value: Any) -> str:
++    # Ending in the only {request} also puts the one {state} before it.
++    if (
++        not isinstance(value, str)
++        or value.count(STATE) != 1
++        or value.count(REQUEST) != 1
++        or not value.endswith(REQUEST)
++    ):
++        raise PromptsError(
++            f"{path}: `request_template` must be a string holding {STATE} once "
++            f"and ending in {REQUEST} (the request goes last, ADR-0018 §4)"
++        )
++    return value
++
++
++_VALIDATORS = {
++    "system": _system,
++    "examples": _examples,
++    "request_template": _request_template,
++}
++
++
++def volatile(template: str, request: str, state: str = EMPTY_STATE) -> str:
++    """Fill the template. Plain splicing, so braces in the request stay as typed."""
++    head, _, rest = template.partition(STATE)
++    middle = rest[: -len(REQUEST)]
++    return head + state + middle + request
++
++
++def build(prompts: Prompts, request: str) -> tuple[Message, ...]:
++    """The model input for one request, stable part first (ADR-0018 §4)."""
++    messages = [Message("system", prompts.system)]
++    for example in prompts.examples:
++        example_input = volatile(prompts.request_template, example.request)
++        messages.append(Message("user", example_input))
++        messages.append(Message("assistant", example.response))
++    messages.append(Message("user", volatile(prompts.request_template, request)))
++    return tuple(messages)
++
++
++def render_input(messages: Sequence[Message]) -> str:
++    """The text form ``:context`` prints: exactly the message list, escaped."""
++    return "\n".join(
++        f"--- {role} ---\n" + render.escape(content, backslash=True)
++        for role, content in messages
++    )
+diff --git a/src/nl_shell/proposal.py b/src/nl_shell/proposal.py
+new file mode 100644
+index 0000000..5c8082b
+--- /dev/null
++++ b/src/nl_shell/proposal.py
+@@ -0,0 +1,151 @@
++"""The strict ``proposal/v1`` parser (spec ``docs/design/specs/proposal/v1.md``).
++
++ADR-0018 §3 and spec rule 5: a response that fails to parse, fails the schema or breaks
++rule 2 is rejected, never repaired. A ``command`` holding a hidden character
++(``nl_shell.render.is_hidden``) is rejected too, so the REPL never shows or runs text the
++user cannot see. ``SCHEMA`` is the spec's schema, kept here once: the parser reads its
++enums and lengths from it, and #77 sends the same object for constrained decoding.
++"""
++
++from __future__ import annotations
++
++import json
++from dataclasses import dataclass
++from typing import Any
++
++from nl_shell import render
++
++SCHEMA: dict[str, Any] = {
++    "type": "object",
++    "additionalProperties": False,
++    "required": ["kind"],
++    "properties": {
++        "kind": {"enum": ["command", "clarify", "refuse"]},
++        "command": {"type": "string", "minLength": 1, "maxLength": 2000},
++        "risk": {
++            "enum": [
++                "read-only",
++                "mutating",
++                "session-altering",
++                "destructive",
++                "privileged",
++            ]
++        },
++        "reason": {
++            "enum": [
++                "unclear-request",
++                "not-a-shell-task",
++                "unsafe-request",
++                "missing-information",
++            ]
++        },
++    },
++}
++
++_PROPERTIES = SCHEMA["properties"]
++KINDS = tuple(_PROPERTIES["kind"]["enum"])
++RISKS = tuple(_PROPERTIES["risk"]["enum"])
++REASONS = tuple(_PROPERTIES["reason"]["enum"])
++COMMAND_MIN = _PROPERTIES["command"]["minLength"]
++COMMAND_MAX = _PROPERTIES["command"]["maxLength"]
++
++
++@dataclass(frozen=True)
++class Command:
++    """``kind = "command"``: one bash command line (may hold LF) and its stated risk."""
++
++    command: str
++    risk: str
++
++
++@dataclass(frozen=True)
++class Answer:
++    """``kind = "clarify"`` or ``"refuse"``, with its reason."""
++
++    kind: str
++    reason: str
++
++
++@dataclass(frozen=True)
++class Rejected:
++    """The response was not a usable proposal. ``why`` is for the log, never repaired."""
++
++    why: str
++
++
++Proposal = Command | Answer
++
++
++class _Reject(Exception):
++    pass
++
++
++def _no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
++    keys = [key for key, _ in pairs]
++    if len(set(keys)) != len(keys):
++        raise _Reject("duplicate key")
++    return dict(pairs)
++
++
++def _no_constant(name: str) -> Any:
++    raise _Reject(f"non-JSON number {name}")
++
++
++def parse(raw: str) -> Proposal | Rejected:
++    """Parse one model response strictly: a ``Proposal`` or a ``Rejected``."""
++    try:
++        return _parse(raw)
++    except _Reject as exc:
++        return Rejected(str(exc))
++
++
++def _parse(raw: str) -> Proposal:
++    if not isinstance(raw, str):
++        raise _Reject("response is not text")
++    try:
++        doc = json.loads(
++            raw, object_pairs_hook=_no_duplicates, parse_constant=_no_constant
++        )
++    except (ValueError, RecursionError) as exc:
++        # ValueError covers invalid JSON and an integer over Python's digit limit.
++        raise _Reject(f"not valid JSON: {type(exc).__name__}") from None
++    if not isinstance(doc, dict):
++        raise _Reject("not a JSON object")
++    extra = sorted(set(doc) - set(_PROPERTIES))
++    if extra:
++        raise _Reject(f"extra properties: {len(extra)}")
++    for key in SCHEMA["required"]:
++        if key not in doc:
++            raise _Reject(f"missing {key}")
++    kind = _enum(doc, "kind", KINDS)
++    if "risk" in doc:
++        _enum(doc, "risk", RISKS)
++    if "reason" in doc:
++        _enum(doc, "reason", REASONS)
++    if "command" in doc:
++        command = doc["command"]
++        if not isinstance(command, str):
++            raise _Reject("command is not a string")
++        if not COMMAND_MIN <= len(command) <= COMMAND_MAX:
++            raise _Reject(f"command length {len(command)} is out of range")
++        if render.has_hidden(command):
++            raise _Reject("command holds a hidden character")
++    # Rule 2.
++    if kind == "command":
++        if "command" not in doc or "risk" not in doc:
++            raise _Reject("command without command or risk")
++        if "reason" in doc:
++            raise _Reject("command with reason")
++        return Command(command=doc["command"], risk=doc["risk"])
++    if "reason" not in doc:
++        raise _Reject(f"{kind} without reason")
++    if "command" in doc:
++        raise _Reject(f"{kind} with command")
++    return Answer(kind=kind, reason=doc["reason"])
++
++
++def _enum(doc: dict[str, Any], key: str, allowed: tuple[str, ...]) -> str:
++    value = doc[key]
++    if not isinstance(value, str) or value not in allowed:
++        raise _Reject(f"unknown {key}")
++    return value
+diff --git a/src/nl_shell/render.py b/src/nl_shell/render.py
+new file mode 100644
+index 0000000..10feb61
+--- /dev/null
++++ b/src/nl_shell/render.py
+@@ -0,0 +1,74 @@
++"""Hidden characters: the one predicate and the one escape function for printed text.
++
++Every text nl-shell prints from a proposal, from ``:context`` or from a start-up error goes
++through ``escape`` (threat model, "Output rendering is filtered everywhere"), and the
++proposal parser (``nl_shell.proposal``) rejects a ``command`` holding any character
++``is_hidden`` flags ("What the user confirms is exactly what runs"). Both use the same
++predicate, so the character policy lives here and nowhere else (#144 refines it).
++
++Hidden here means: C0 controls except LF and TAB, DEL, C1 controls, the bidi controls,
++every Unicode format character (category Cf), U+2028 and U+2029, the tag block
++U+E0000-U+E007F, and lone surrogates.
++
++``escape`` writes a hidden character as ``\\xHH`` (up to U+00FF), ``\\uHHHH`` (up to
++U+FFFF) or ``\\UHHHHHHHH``, in lowercase hex; everything else is unchanged, LF and TAB
++included. With ``backslash=True`` (``:context``) a backslash is written as ``\\\\`` too,
++so a real ESC (``\\x1b``) and the typed text ``\\x1b`` (``\\\\x1b``) print differently.
++"""
++
++from __future__ import annotations
++
++import unicodedata
++
++# The bidi controls: ALM, LRM, RLM, LRE..RLO, LRI..PDI. All are Cf today; listed so the
++# set does not depend on the Unicode version Python ships.
++BIDI_CONTROLS = frozenset(
++    (0x061C, 0x200E, 0x200F, *range(0x202A, 0x202F), *range(0x2066, 0x206A))
++)
++LINE_AND_PARAGRAPH_SEPARATORS = frozenset((0x2028, 0x2029))
++TAG_BLOCK = range(0xE0000, 0xE0080)
++SURROGATES = range(0xD800, 0xE000)
++VISIBLE_CONTROLS = frozenset("\n\t")
++
++
++def is_hidden(char: str) -> bool:
++    """True when ``char`` (one code point) must not reach the screen as it is."""
++    if char in VISIBLE_CONTROLS:
++        return False
++    code = ord(char)
++    return (
++        code < 0x20
++        or 0x7F <= code <= 0x9F
++        or code in BIDI_CONTROLS
++        or code in LINE_AND_PARAGRAPH_SEPARATORS
++        or code in TAG_BLOCK
++        or code in SURROGATES
++        or unicodedata.category(char) == "Cf"
++    )
++
++
++def has_hidden(text: str) -> bool:
++    """True when any character of ``text`` is hidden."""
++    return any(is_hidden(char) for char in text)
++
++
++def escape_char(char: str) -> str:
++    code = ord(char)
++    if code <= 0xFF:
++        return f"\\x{code:02x}"
++    if code <= 0xFFFF:
++        return f"\\u{code:04x}"
++    return f"\\U{code:08x}"
++
++
++def escape(text: str, *, backslash: bool = False) -> str:
++    """``text`` with every hidden character escaped (and backslashes, if asked)."""
++    out = []
++    for char in text:
++        if backslash and char == "\\":
++            out.append("\\\\")
++        elif is_hidden(char):
++            out.append(escape_char(char))
++        else:
++            out.append(char)
++    return "".join(out)
+diff --git a/src/nl_shell/repl.py b/src/nl_shell/repl.py
+index 6ced10c..21b3106 100644
+--- a/src/nl_shell/repl.py
++++ b/src/nl_shell/repl.py
+@@ -2,34 +2,70 @@
+ 
+ Reads lines, handles the exit commands, then the input-mode prefixes
+ (``nl_shell.input_modes``), and routes everything else as a shell command or natural
+-language (``nl_shell.router``). Nothing runs yet: the policy gate, the PTY session
+-and the model backend arrive in later M0 issues (see
++language (``nl_shell.router``). Natural language and ``@request`` go through the prompts
++(``nl_shell.prompts``), the model backend (``nl_shell.backend``) and the strict
++``proposal/v1`` parser (``nl_shell.proposal``); the proposal is shown, never run. Nothing
++runs yet: the policy gate and the PTY session arrive in later M0 issues (see
+ docs/design/architecture/05-building-block-view.md).
++
++Every reply is printed through ``nl_shell.render.escape``, so no text from the model, a
++file or the user reaches the screen with a hidden character in it.
+ """
+ 
+ from __future__ import annotations
+ 
+ from collections.abc import Callable, Sequence
+-from typing import TextIO
++from typing import TYPE_CHECKING, TextIO
+ import sys
+ 
+-from nl_shell import input_modes
++from nl_shell import input_modes, render
+ from nl_shell.input_modes import Mode, StatusLine
+ from nl_shell.router import Route, route
+ 
++if TYPE_CHECKING:
++    from nl_shell.backend import Backend
++    from nl_shell.prompts import Message, Prompts
++
+ PROMPT = "nl> "
+ COMMAND_NOT_YET = (
+     "That looks like a shell command, but nl-shell can't run anything yet: "
+     "the bash session arrives in M0.2."
+ )
+-NATURAL_LANGUAGE_NOT_YET = (
+-    "That looks like a natural-language request, but nl-shell can't answer it yet: "
+-    "the model backend arrives in M0.8."
++NO_BACKEND = (
++    "No model backend is configured, so nl-shell can't answer this yet: "
++    "the model client arrives with #77."
++)
++NO_USABLE_PROPOSAL = "No usable proposal came back from the model."
++MODEL_NOT_RUNNING = "The model server isn't running (no answer at {address})."
++MODEL_UNUSABLE = "The model server could not be used: {reason}."
++NOTHING_RUNS_YET = (
++    "Nothing runs yet: running a proposal arrives with the policy gate (#12, #78)."
+ )
+-REPLIES = {
+-    Route.COMMAND: COMMAND_NOT_YET,
+-    Route.NATURAL_LANGUAGE: NATURAL_LANGUAGE_NOT_YET,
++REASON_TEXT = {
++    "unclear-request": "the request is unclear",
++    "not-a-shell-task": "this is not a shell task",
++    "unsafe-request": "the request looks unsafe",
++    "missing-information": "some information is missing",
+ }
++CLARIFY = "The model needs more from you before it can propose a command: {reason}."
++REFUSE = "The model will not propose a command for this: {reason}."
++
++
++def show_proposal(result: object) -> str:
++    """The reply for one parsed model answer (``nl_shell.proposal.parse``)."""
++    from nl_shell import proposal
++
++    if isinstance(result, proposal.Command):
++        lines = result.command.split("\n")
++        count = f"{len(lines)} line" + ("" if len(lines) == 1 else "s")
++        framed = [f"Proposed command (risk: {result.risk}, {count}):"]
++        framed += [f"  | {line}" for line in lines]
++        framed.append(NOTHING_RUNS_YET)
++        return "\n".join(framed)
++    if isinstance(result, proposal.Answer):
++        template = CLARIFY if result.kind == "clarify" else REFUSE
++        return template.format(reason=REASON_TEXT[result.reason])
++    return NO_USABLE_PROPOSAL
+ 
+ 
+ class Repl:
+@@ -40,19 +76,37 @@ class Repl:
+         read: Callable[[str], str],
+         out: TextIO,
+         status_lines: Sequence[StatusLine] = (),
++        *,
++        backend: Backend | None = None,
++        prompts: Prompts | None = None,
+     ) -> None:
++        if backend is not None and prompts is None:
++            raise ValueError("a Repl with a backend needs the prompts to build its input")
+         self._read = read
+         self._out = out
+         # This session's own `:status` lines, after the version line
+         # (see the `StatusLine` comment in nl_shell.input_modes).
+         self._status_lines = tuple(status_lines)
++        # No backend: every request gets NO_BACKEND. `cli.main` passes the model client.
++        self._backend = backend
++        self._prompts = prompts
++        # The model input of the last request, for `:context`.
++        self._last_input: tuple[Message, ...] | None = None
+ 
+     @classmethod
+-    def interactive(cls, status_lines: Sequence[StatusLine] = ()) -> "Repl":
++    def interactive(
++        cls,
++        status_lines: Sequence[StatusLine] = (),
++        *,
++        backend: Backend | None = None,
++        prompts: Prompts | None = None,
++    ) -> "Repl":
+         from prompt_toolkit import PromptSession
+ 
+         session: PromptSession[str] = PromptSession()
+-        return cls(session.prompt, sys.stdout, status_lines)
++        return cls(
++            session.prompt, sys.stdout, status_lines, backend=backend, prompts=prompts
++        )
+ 
+     def run(self) -> int:
+         """Loop until an exit command or end of input. Returns the exit status."""
+@@ -69,16 +123,47 @@ class Repl:
+                 continue
+             if input_modes.is_exit(text):
+                 return 0
+-            print(self._reply(text), file=self._out)
++            print(render.escape(self._reply(text)), file=self._out)
+ 
+     def _reply(self, text: str) -> str:
+         """The reply for one stripped, non-blank, non-exit line."""
+         prefixed = input_modes.parse(text)
+         if prefixed is None:
+-            return REPLIES[route(text)]
++            if route(text) is Route.COMMAND:
++                return COMMAND_NOT_YET
++            return self._propose(text)
+         if prefixed.mode is Mode.COMMAND and prefixed.payload:
+             # `\cmd` skips only the intent classifier (here, the router); it never skips
+             # the policy gate. ADR-0013 §7 (Proposed; #64 closed on it). The gate is wired
+             # in by #78, so `prefixed.payload` is the command text the gate will receive.
+-            return REPLIES[Route.COMMAND]
+-        return input_modes.reply(prefixed, self._status_lines)
++            return COMMAND_NOT_YET
++        if prefixed.mode is Mode.PROPOSE and prefixed.payload:
++            return self._propose(prefixed.payload)
++        return input_modes.reply(prefixed, self._status_lines, self._model_input_text())
++
++    def _propose(self, request: str) -> str:
++        """Prompt, backend and strict parser for one request. Shows; runs nothing."""
++        if self._backend is None or self._prompts is None:
++            return NO_BACKEND
++        from nl_shell import prompts, proposal
++
++        from nl_shell.backend import BackendError
++
++        messages = prompts.build(self._prompts, request)
++        self._last_input = messages
++        try:
++            raw = self._backend.complete(messages)
++        except BackendError as exc:
++            # A failed request gets a fixed reply; the REPL keeps reading (ADR-0018 §7).
++            if exc.not_running_at is not None:
++                return MODEL_NOT_RUNNING.format(address=exc.not_running_at)
++            return MODEL_UNUSABLE.format(reason=exc.reason)
++        return show_proposal(proposal.parse(raw))
++
++    def _model_input_text(self) -> str | None:
++        """The ``:context`` text of the last model input, or None before any request."""
++        if self._last_input is None:
++            return None
++        from nl_shell import prompts
++
++        return prompts.render_input(self._last_input)
+diff --git a/src/nl_shell/teacher_client.py b/src/nl_shell/teacher_client.py
+new file mode 100644
+index 0000000..912f8c3
+--- /dev/null
++++ b/src/nl_shell/teacher_client.py
+@@ -0,0 +1,377 @@
++"""The model client: OpenAI-compatible chat completions over HTTP (ADR-0018 §1, §2, §5).
++
++``TeacherClient`` is a backend (``nl_shell.backend.Backend``): it sends the model input
++to a ``llama-server`` or vLLM endpoint and returns the raw ``message.content`` text. It
++never parses, repairs or retries it; the REPL hands it to the one strict ``proposal/v1``
++parser (ADR-0018 §3). Each request asks for constrained decoding against
++``nl_shell.proposal.SCHEMA``.
++
++Which endpoint (``select_endpoint``, ADR-0020 §3): by default only the local model
++socket ``$XDG_RUNTIME_DIR/nl-shell/model.sock``. Any URL, including a loopback TCP port,
++is used only when the user passes ``--dev-teacher`` for the session; a ``teacher_url``
++in ``config.toml`` alone is refused with a message. So without the flag nl-shell opens
++no TCP connection (ADR-0003).
++
++Transport rules: the stdlib ``http.client`` (it ignores ``HTTP(S)_PROXY`` and never
++follows a redirect); certificate and host-name checks on for ``https``, no plain-HTTP
++fallback; no credentials; any non-2xx status, a body over ``MAX_RESPONSE_BYTES``, a body
++that is not JSON or has no string ``choices[0].message.content`` is an error. One
++timeout, ``timeout_s``: a total deadline for the whole request (connect, send, read).
++Errors are ``TeacherError`` (a ``BackendError``); any text the server supplied is
++escaped in the error's reason before it is built.
++"""
++
++from __future__ import annotations
++
++import http.client
++import ipaddress
++import json
++import os
++import socket
++import ssl
++import threading
++import time
++from collections.abc import Sequence
++from dataclasses import dataclass
++from typing import TYPE_CHECKING, Any
++from urllib.parse import urlsplit
++
++from nl_shell import render
++from nl_shell.backend import BackendError
++
++if TYPE_CHECKING:
++    from nl_shell.prompts import Message
++
++SOCKET_DIR = "nl-shell"
++SOCKET_NAME = "model.sock"
++DEFAULT_SOCKET_TEXT = f"$XDG_RUNTIME_DIR/{SOCKET_DIR}/{SOCKET_NAME}"
++CHAT_PATH = "/v1/chat/completions"
++# A maximal proposal/v1 answer (a 2000-code-point command, up to 4 UTF-8 bytes each,
++# JSON-escaped) plus the chat-completions envelope fits well inside this.
++MAX_RESPONSE_BYTES = 64 * 1024
++DEFAULT_TIMEOUT_S = 10.0
++_CHUNK = 4096
++_EXCERPT = 200
++
++REFUSED_CONFIG_URL = (
++    "nl-shell: teacher_url in {config} is ignored without --dev-teacher; "
++    "using the local model socket. Pass --dev-teacher to use it for this session."
++)
++NO_DEV_URL = (
++    "nl-shell: --dev-teacher was given without a URL and config.toml has no "
++    "teacher_url; using the local model socket."
++)
++CLEAR_TEXT_WARNING = (
++    "nl-shell: warning: {url} is plain http:// to a host that is not this machine; "
++    "the state block goes over the network in clear text. "
++    "Use an SSH tunnel to a loopback port, or https://."
++)
++
++
++class EndpointError(ValueError):
++    """A teacher URL nl-shell will not use (bad scheme, credentials, no host)."""
++
++
++class TeacherError(BackendError):
++    """One model request failed. ``reason`` holds no unescaped server text."""
++
++
++@dataclass(frozen=True)
++class Endpoint:
++    """Where model requests go.
++
++    ``kind`` is ``"unix"`` (the local socket), ``"http"`` or ``"https"``. ``address`` is
++    the socket path or the URL; it is ``None`` for ``"unix"`` when there is no default
++    socket (``XDG_RUNTIME_DIR`` unset, empty or relative).
++    """
++
++    kind: str
++    address: str | None
++
++    def describe(self) -> str:
++        if self.address is not None:
++            return self.address
++        return f"{DEFAULT_SOCKET_TEXT} (XDG_RUNTIME_DIR is not set)"
++
++
++def default_socket(runtime_dir: str | None) -> str | None:
++    """``$XDG_RUNTIME_DIR/nl-shell/model.sock``, or None without a usable runtime dir."""
++    if not runtime_dir or not os.path.isabs(runtime_dir):
++        return None
++    return os.path.join(runtime_dir, SOCKET_DIR, SOCKET_NAME)
++
++
++def select_endpoint(
++    dev_teacher: str | bool | None,
++    teacher_url: str | None,
++    runtime_dir: str | None,
++    *,
++    config_file: str = "config.toml",
++) -> tuple[Endpoint, list[str]]:
++    """The endpoint for this session, and the messages to show on stderr.
++
++    ``dev_teacher`` is None without ``--dev-teacher``, True for the bare flag, or the URL
++    given with it. Opens no connection and does no DNS lookup. Raises ``EndpointError``
++    for a URL nl-shell will not use.
++    """
++    default = Endpoint("unix", default_socket(runtime_dir))
++    messages: list[str] = []
++    if dev_teacher is None:
++        if teacher_url:
++            messages.append(REFUSED_CONFIG_URL.format(config=config_file))
++        return default, messages
++    url = dev_teacher if isinstance(dev_teacher, str) else teacher_url
++    if not url:
++        messages.append(NO_DEV_URL)
++        return default, messages
++    scheme, host = _check_url(url)
++    if scheme == "http" and not _is_loopback(host):
++        messages.append(CLEAR_TEXT_WARNING.format(url=url))
++    return Endpoint(scheme, url), messages
++
++
++def _check_url(url: str) -> tuple[str, str]:
++    try:
++        parts = urlsplit(url)
++        parts.port  # raises ValueError for a bad port
++    except ValueError as exc:
++        raise EndpointError(f"teacher URL {url}: {exc}") from None
++    scheme = parts.scheme.lower()
++    if scheme not in ("http", "https"):
++        raise EndpointError(f"teacher URL {url}: must start with http:// or https://")
++    if parts.username is not None or parts.password is not None or "@" in parts.netloc:
++        raise EndpointError(f"teacher URL {url}: credentials in the URL are refused")
++    if not parts.hostname:
++        raise EndpointError(f"teacher URL {url}: no host")
++    if parts.query or parts.fragment:
++        raise EndpointError(f"teacher URL {url}: no query or fragment allowed")
++    return scheme, parts.hostname
++
++
++def _is_loopback(host: str) -> bool:
++    """``localhost``, 127.0.0.0/8 or ::1. Any other name counts as remote; no DNS."""
++    if host.lower() == "localhost":
++        return True
++    try:
++        return ipaddress.ip_address(host).is_loopback
++    except ValueError:
++        return False
++
++
++class _UnixHTTPConnection(http.client.HTTPConnection):
++    """HTTP over the local model socket. The ``Host`` header is ``localhost``."""
++
++    def __init__(self, path: str, timeout: float) -> None:
++        super().__init__("localhost", timeout=timeout)
++        self._path = path
++
++    def connect(self) -> None:
++        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++        try:
++            sock.settimeout(self.timeout)
++            sock.connect(self._path)
++        except BaseException:
++            sock.close()
++            raise
++        self.sock = sock
++
++
++class TeacherClient:
++    """A ``Backend`` that asks an OpenAI-compatible chat endpoint for a proposal."""
++
++    kind = "openai-chat (constrained decoding, proposal/v1)"
++
++    def __init__(
++        self,
++        endpoint: Endpoint,
++        *,
++        model: str | None = None,
++        timeout_s: float = DEFAULT_TIMEOUT_S,
++        max_response_bytes: int = MAX_RESPONSE_BYTES,
++    ) -> None:
++        self.endpoint = endpoint
++        self._model = model
++        self._timeout_s = timeout_s
++        self._max = max_response_bytes
++
++    def complete(self, messages: Sequence[Message]) -> str:
++        """The raw ``message.content`` of the answer to one model input."""
++        body = json.dumps(self._request(messages)).encode("utf-8")
++        deadline = time.monotonic() + self._timeout_s
++        conn, path = self._connection()
++        timer = threading.Timer(self._timeout_s, _cut, (conn,))
++        timer.daemon = True
++        timer.start()
++        try:
++            return self._exchange(conn, path, body, deadline)
++        finally:
++            timer.cancel()
++            conn.close()
++
++    def _request(self, messages: Sequence[Message]) -> dict[str, Any]:
++        from nl_shell import proposal
++
++        request: dict[str, Any] = {
++            "messages": [{"role": m.role, "content": m.content} for m in messages],
++            "response_format": {
++                "type": "json_schema",
++                "json_schema": {
++                    "name": "proposal_v1",
++                    "strict": True,
++                    "schema": proposal.SCHEMA,
++                },
++            },
++        }
++        if self._model is not None:
++            request["model"] = self._model
++        return request
++
++    def _connection(self) -> tuple[http.client.HTTPConnection, str]:
++        endpoint = self.endpoint
++        if endpoint.kind == "unix":
++            if endpoint.address is None:
++                raise TeacherError(
++                    "no model socket", not_running_at=endpoint.describe()
++                )
++            return _UnixHTTPConnection(endpoint.address, self._timeout_s), CHAT_PATH
++        assert endpoint.address is not None
++        parts = urlsplit(endpoint.address)
++        path = parts.path.rstrip("/") + CHAT_PATH
++        assert parts.hostname is not None
++        if endpoint.kind == "https":
++            return (
++                http.client.HTTPSConnection(
++                    parts.hostname,
++                    parts.port,
++                    timeout=self._timeout_s,
++                    context=ssl.create_default_context(),
++                ),
++                path,
++            )
++        return (
++            http.client.HTTPConnection(
++                parts.hostname, parts.port, timeout=self._timeout_s
++            ),
++            path,
++        )
++
++    def _exchange(
++        self,
++        conn: http.client.HTTPConnection,
++        path: str,
++        body: bytes,
++        deadline: float,
++    ) -> str:
++        endpoint = self.endpoint
++        try:
++            conn.connect()
++            _tick(conn, deadline)
++            conn.request(
++                "POST",
++                path,
++                body=body,
++                headers={
++                    "Content-Type": "application/json",
++                    "Accept": "application/json",
++                },
++            )
++            _tick(conn, deadline)
++            response = conn.getresponse()
++            status = response.status
++            if 300 <= status < 400:
++                raise TeacherError(
++                    f"the server answered with a redirect ({status}), not followed"
++                )
++            if not 200 <= status < 300:
++                excerpt = _read(response, conn, deadline, _EXCERPT, truncate=True)
++                text = excerpt.decode("utf-8", "replace").strip()
++                reason = f"HTTP status {status} {response.reason}".strip()
++                if text:
++                    reason += f" ({text})"
++                raise TeacherError(_escape(reason))
++            data = _read(response, conn, deadline, self._max, truncate=False)
++        except TeacherError:
++            raise
++        except ssl.SSLError as exc:
++            raise TeacherError(_escape(f"TLS error: {exc}")) from None
++        except (FileNotFoundError, ConnectionRefusedError) as exc:
++            if endpoint.kind == "unix":
++                raise TeacherError(
++                    _escape(str(exc)), not_running_at=endpoint.describe()
++                ) from None
++            raise TeacherError(_escape(f"cannot connect: {exc}")) from None
++        except (OSError, http.client.HTTPException, ValueError) as exc:
++            if time.monotonic() >= deadline or isinstance(exc, TimeoutError):
++                raise TeacherError(_timed_out(self._timeout_s)) from None
++            raise TeacherError(_escape(f"{type(exc).__name__}: {exc}")) from None
++        return _content(data)
++
++
++def _cut(conn: http.client.HTTPConnection) -> None:
++    """At the deadline: shut the socket so a read blocked in any phase returns."""
++    sock = conn.sock
++    if sock is not None:
++        try:
++            # The base-class method: an SSLSocket's own shutdown would drop its TLS state
++            # under the reading thread.
++            socket.socket.shutdown(sock, socket.SHUT_RDWR)
++        except OSError:
++            pass
++
++
++def _tick(conn: http.client.HTTPConnection, deadline: float) -> None:
++    """Give the next socket operation only what is left of the deadline."""
++    left = deadline - time.monotonic()
++    if left <= 0:
++        raise TimeoutError
++    if conn.sock is not None:
++        conn.sock.settimeout(left)
++
++
++def _read(
++    response: http.client.HTTPResponse,
++    conn: http.client.HTTPConnection,
++    deadline: float,
++    limit: int,
++    *,
++    truncate: bool,
++) -> bytes:
++    """Read the body in chunks, checking the deadline before each; stop past ``limit``."""
++    chunks: list[bytes] = []
++    size = 0
++    while True:
++        _tick(conn, deadline)
++        chunk = response.read1(min(_CHUNK, limit + 1 - size))
++        if not chunk:
++            break
++        chunks.append(chunk)
++        size += len(chunk)
++        if size > limit:
++            if truncate:
++                return b"".join(chunks)[:limit]
++            raise TeacherError(f"the response is larger than {limit} bytes")
++    if time.monotonic() >= deadline:
++        raise TimeoutError
++    return b"".join(chunks)
++
++
++def _content(data: bytes) -> str:
++    try:
++        doc = json.loads(data.decode("utf-8"))
++    except (UnicodeDecodeError, ValueError, RecursionError):
++        raise TeacherError("the response is not JSON") from None
++    try:
++        content = doc["choices"][0]["message"]["content"]
++    except (KeyError, IndexError, TypeError):
++        content = None
++    if not isinstance(content, str):
++        raise TeacherError("the response has no string choices[0].message.content")
++    return content
++
++
++def _timed_out(timeout_s: float) -> str:
++    return f"no complete answer within {timeout_s:g} s (model.timeout_s)"
++
++
++def _escape(text: str) -> str:
++    return render.escape(text)
+diff --git a/targets/ubuntu-26.04/prompts/prompts.yaml b/targets/ubuntu-26.04/prompts/prompts.yaml
+new file mode 100644
+index 0000000..97f9e1d
+--- /dev/null
++++ b/targets/ubuntu-26.04/prompts/prompts.yaml
+@@ -0,0 +1,33 @@
++# Default prompts for the ubuntu-26.04 target (ADR-0020, ADR-0023). nl-shell reads this
++# file at start-up (src/nl_shell/prompts.py); ~/.config/nl-shell/prompts.yaml overrides it
++# key by key (a key set there replaces this file's value whole). Unknown keys are refused.
++#
++#   system            the system prompt
++#   examples          few-shot examples, in order: `request` is what the user typed,
++#                     `response` the proposal/v1 JSON answer (docs/design/specs/proposal/v1.md)
++#   request_template  the volatile part, sent last: `{state}` is the state block (empty
++#                     until #11), `{request}` the user's request; it must end in `{request}`
++
++system: |-
++  You turn one request from the user into one bash command for Ubuntu 26.04 LTS.
++  Answer with exactly one JSON object and nothing else:
++  - {"kind": "command", "command": "<bash>", "risk": "<risk>"} when one command line
++    (lists, pipelines and newlines allowed) does what was asked. risk is one of
++    read-only, mutating, session-altering, destructive, privileged.
++  - {"kind": "clarify", "reason": "<reason>"} when you need more from the user.
++  - {"kind": "refuse", "reason": "<reason>"} when you will not propose a command.
++  reason is one of unclear-request, not-a-shell-task, unsafe-request, missing-information.
++  Never add an explanation. Nothing runs until the user confirms it.
++
++examples:
++  - request: show disk usage
++    response: '{"kind": "command", "command": "df -h", "risk": "read-only"}'
++  - request: delete the old logs
++    response: '{"kind": "clarify", "reason": "missing-information"}'
++  - request: write me a poem
++    response: '{"kind": "refuse", "reason": "not-a-shell-task"}'
++
++request_template: |-
++  State:
++  {state}
++  Request: {request}
+diff --git a/tests/test_backend.py b/tests/test_backend.py
+new file mode 100644
+index 0000000..198f998
+--- /dev/null
++++ b/tests/test_backend.py
+@@ -0,0 +1,592 @@
++"""Prompts YAML, `:context`, the strict proposal/v1 parser and the recording stub (#143).
++
++Natural-language input and `@request` are driven through the real ``Repl`` with the
++recording stub backend; start-up is driven through the real ``cli.main``. The modules this
++issue adds are imported inside the tests, never at module level, so the file still loads
++(and fails) on a tree without them. Reply texts are pinned as literals.
++
++The `:context` text form is rebuilt here, independently of the module's serializer, from
++the brief's Design: each message is ``"--- " + role + " ---\\n" + escape(content)``, joined
++with LF, no trailing LF; ``escape`` writes hidden characters as ``\\xHH`` / ``\\uHHHH`` /
++``\\UHHHHHHHH`` (lowercase) and a backslash as ``\\\\``.
++"""
++
++import io
++import json
++import os
++import unicodedata
++from pathlib import Path
++
++import pytest
++
++from nl_shell.repl import Repl
++
++REPO = Path(__file__).resolve().parents[1]
++DEFAULT_PROMPTS = REPO / "targets" / "ubuntu-26.04" / "prompts" / "prompts.yaml"
++UBUNTU_RELEASE = 'NAME="Ubuntu"\nID=ubuntu\nVERSION_ID="26.04"\n'
++
++NO_BACKEND = (
++    "No model backend is configured, so nl-shell can't answer this yet: "
++    "the model client arrives with #77."
++)
++NO_USABLE = "No usable proposal came back from the model."
++NO_MODEL_INPUT_YET = (
++    "No model input yet: :context shows the model input of the last request."
++)
++NOTHING_RUNS_YET = (
++    "Nothing runs yet: running a proposal arrives with the policy gate (#12, #78)."
++)
++CLARIFY = (
++    "The model needs more from you before it can propose a command: "
++    "some information is missing."
++)
++REFUSE = "The model will not propose a command for this: this is not a shell task."
++
++DF = '{"kind": "command", "command": "df -h", "risk": "read-only"}'
++DF_SHOWN = (
++    "Proposed command (risk: read-only, 1 line):\n"
++    "  | df -h\n"
++    f"{NOTHING_RUNS_YET}"
++)
++
++
++# The test's own oracle for the `:context` text form (see the module docstring).
++BIDI = {0x061C, 0x200E, 0x200F, *range(0x202A, 0x202F), *range(0x2066, 0x206A)}
++
++
++def oracle_hidden(char):
++    code = ord(char)
++    if char in "\n\t":
++        return False
++    return (
++        code < 0x20
++        or 0x7F <= code <= 0x9F
++        or code in BIDI
++        or code in (0x2028, 0x2029)
++        or 0xE0000 <= code <= 0xE007F
++        or 0xD800 <= code <= 0xDFFF
++        or unicodedata.category(char) == "Cf"
++    )
++
++
++def oracle_escape(text):
++    out = []
++    for char in text:
++        code = ord(char)
++        if char == "\\":
++            out.append("\\\\")
++        elif not oracle_hidden(char):
++            out.append(char)
++        elif code <= 0xFF:
++            out.append("\\x%02x" % code)
++        elif code <= 0xFFFF:
++            out.append("\\u%04x" % code)
++        else:
++            out.append("\\U%08x" % code)
++    return "".join(out)
++
++
++def expected_context(recorded):
++    return "\n".join(
++        "--- " + role + " ---\n" + oracle_escape(content) for role, content in recorded
++    )
++
++
++def scripted(*lines):
++    """A read function that returns ``lines`` in order, then signals end of input."""
++    it = iter(lines)
++
++    def read(_prompt):
++        try:
++            return next(it)
++        except StopIteration:
++            raise EOFError from None
++
++    return read
++
++
++@pytest.fixture(autouse=True)
++def no_commands_on_path(tmp_path, monkeypatch):
++    """An empty ``$PATH``, so `show ...` routes as natural language on any host."""
++    empty = tmp_path / "empty-bin"
++    empty.mkdir()
++    monkeypatch.setenv("PATH", str(empty))
++
++
++def user_prompts_file():
++    """The user's prompts.yaml under the suite's temporary XDG_CONFIG_HOME (conftest)."""
++    path = Path(os.environ["XDG_CONFIG_HOME"]) / "nl-shell" / "prompts.yaml"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    return path
++
++
++def loaded_prompts():
++    """The real target's prompts, found through the target loader, plus any user file."""
++    from nl_shell import prompts, targets
++
++    target = targets.load("ubuntu-26.04")
++    return prompts.load(target.folder, prompts.user_path())
++
++
++def session(*lines, responses=(), out=None):
++    """Run a Repl with the recording stub; returns (stub, printed text)."""
++    from nl_shell.backend import RecordingStub
++
++    stub = RecordingStub(responses)
++    out = io.StringIO() if out is None else out
++    repl = Repl(scripted(*lines), out, backend=stub, prompts=loaded_prompts())
++    assert repl.run() == 0
++    return stub, out.getvalue()
++
++
++def file_examples():
++    """The default file's few-shot examples, read by the test itself."""
++    import yaml
++
++    return yaml.safe_load(DEFAULT_PROMPTS.read_text(encoding="utf-8"))
++
++
++# (a) the model input and `:context` -----------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    ("line", "typed"),
++    [("show disk usage", "show disk usage"), ("@show disk usage", "show disk usage")],
++    ids=["natural-language", "at-request"],
++)
++def test_context_prints_exactly_the_recorded_model_input(line, typed):
++    stub, out = session(line, ":context", responses=[DF])
++    assert len(stub.inputs) == 1
++    recorded = stub.inputs[0]
++    doc = file_examples()
++    # Stable part first: the system prompt, then each example in file order.
++    assert recorded[0] == ("system", doc["system"])
++    examples = doc["examples"]
++    assert examples, "the default prompts need few-shot examples for this test"
++    pairs = recorded[1:-1]
++    assert len(pairs) == 2 * len(examples)
++    for index, example in enumerate(examples):
++        user, assistant = pairs[2 * index], pairs[2 * index + 1]
++        assert user[0] == "user" and user[1].endswith(example["request"])
++        assert assistant == ("assistant", example["response"])
++    # Volatile part last: the user message, ending with the request.
++    assert recorded[-1][0] == "user"
++    assert recorded[-1][1].endswith(typed)
++    assert out == DF_SHOWN + "\n" + expected_context(recorded) + "\n"
++
++
++def test_context_before_any_request_has_a_fixed_reply():
++    stub, out = session(":context")
++    assert stub.inputs == []
++    assert out == NO_MODEL_INPUT_YET + "\n"
++
++
++# (b) the stub records every input; ESC and a typed backslash in `:context` --------------
++
++
++def test_stub_records_one_input_per_request_in_order():
++    stub, _ = session("show disk usage", "@list my files", responses=[DF, DF])
++    assert len(stub.inputs) == 2
++    assert stub.inputs[0][-1][1].endswith("show disk usage")
++    assert stub.inputs[1][-1][1].endswith("list my files")
++
++
++def test_real_esc_and_typed_backslash_text_print_differently():
++    esc = "show \x1b[2J disk"
++    typed = "show \\x1b disk"  # five characters: backslash, x, 1, b
++    stub, out = session(esc, ":context", typed, ":context", responses=[DF, DF])
++    first, second = stub.inputs
++    assert first[-1][1].endswith(esc)  # the backend got the raw ESC
++    assert second[-1][1].endswith(typed)
++    assert out == (
++        DF_SHOWN + "\n" + expected_context(first) + "\n"
++        + DF_SHOWN + "\n" + expected_context(second) + "\n"
++    )
++    assert "\x1b" not in out
++    lines = out.splitlines()
++    # The real ESC prints as the four characters \x1b; the typed text as \\x1b.
++    assert any(line.endswith("show \\x1b[2J disk") for line in lines)
++    assert any(line.endswith("show \\\\x1b disk") for line in lines)
++    assert not any(line.endswith("show \\x1b disk") for line in lines)
++
++
++# (c) the user's prompts.yaml, and malformed files at start-up ---------------------------
++
++
++class Started:
++    def __init__(self):
++        self.repl = False
++        self.reads = 0
++
++
++def start(monkeypatch, capsys, *lines, responses=(), targets_root=None, release=None):
++    """Run the real ``cli.main`` with a matching os-release; the REPL it builds gets the
++    recording stub and reads ``lines``. Returns (exit code, stdout of the REPL, stderr,
++    Started, stub)."""
++    from nl_shell import cli
++    from nl_shell.backend import RecordingStub
++
++    stub = RecordingStub(responses)
++    out = io.StringIO()
++    started = Started()
++
++    def read(prompt):
++        started.reads += 1
++        return scripted_lines(prompt)
++
++    scripted_lines = scripted(*lines)
++
++    def interactive(cls, status_lines=(), *, backend=None, prompts=None):
++        started.repl = True
++        return Repl(read, out, status_lines, backend=stub, prompts=prompts)
++
++    monkeypatch.setattr(cli.Repl, "interactive", classmethod(interactive))
++    kwargs = {"os_release_paths": [release]}
++    if targets_root is not None:
++        kwargs["targets_root"] = targets_root
++    code = cli.main([], **kwargs)
++    err = capsys.readouterr().err
++    return code, out.getvalue(), err, started, stub
++
++
++@pytest.fixture
++def ubuntu_release(tmp_path):
++    path = tmp_path / "os-release"
++    path.write_text(UBUNTU_RELEASE, encoding="utf-8")
++    return path
++
++
++def test_user_prompts_file_overrides_the_system_prompt(
++    monkeypatch, capsys, ubuntu_release
++):
++    user_prompts_file().write_text(
++        "system: |-\n  The user's own system prompt.\n", encoding="utf-8"
++    )
++    code, out, err, started, stub = start(
++        monkeypatch, capsys, "show disk usage", ":context",
++        responses=[DF], release=ubuntu_release,
++    )
++    assert (code, err) == (0, "")
++    recorded = stub.inputs[0]
++    assert recorded[0] == ("system", "The user's own system prompt.")
++    # The keys the user did not set come from the default.
++    assert recorded[-1][1].endswith("show disk usage")
++    assert len(recorded) == 2 + 2 * len(file_examples()["examples"])
++    assert out == DF_SHOWN + "\n" + expected_context(recorded) + "\n"
++    assert "--- system ---\nThe user's own system prompt.\n" in out
++
++
++MALFORMED = {
++    "invalid-yaml": "system: [unclosed\n",
++    "not-a-mapping": "- system\n- examples\n",
++    "wrong-type": "system: 5\n",
++    "unknown-key": "colour: blue\n",
++    "sequence-key": "? [system, examples]\n: x\n",
++    # Each few-shot `response` must itself be a valid proposal/v1 answer.
++    "invalid-example-response": (
++        "examples:\n  - request: show disk usage\n    response: 'df -h'\n"
++    ),
++    # The request goes last (ADR-0018 §4): {state} after {request} is refused.
++    "state-after-request": "request_template: '{request}{state}'\n",
++    "template-not-ending-in-request": "request_template: '{state}{request} please'\n",
++    # The safe loader raises ValueError (int() over the digit limit) and RecursionError
++    # (deep nesting), not YAMLError; both must still refuse start-up, naming the file.
++    "huge-integer": "system: " + "9" * 5000 + "\n",
++    "deep-nesting": "system: " + "[" * 5000 + "]" * 5000 + "\n",
++    "bad-timestamp": "system: 2024-13-45\n",
++}
++
++
++@pytest.mark.parametrize("text", MALFORMED.values(), ids=MALFORMED.keys())
++def test_malformed_user_prompts_refuse_start_up(monkeypatch, capsys, ubuntu_release, text):
++    path = user_prompts_file()
++    path.write_text(text, encoding="utf-8")
++    code, out, err, started, stub = start(
++        monkeypatch, capsys, "show disk usage", release=ubuntu_release
++    )
++    assert code != 0
++    assert not started.repl and started.reads == 0
++    assert str(path) in err
++    assert "Traceback" not in err
++
++
++def test_python_tag_in_user_prompts_is_not_run(
++    monkeypatch, capsys, ubuntu_release, tmp_path
++):
++    pwned = tmp_path / "pwned"
++    path = user_prompts_file()
++    tag = f'!!python/object/apply:os.system ["touch {pwned}"]\n'
++    path.write_text(tag, encoding="utf-8")
++    code, out, err, started, stub = start(
++        monkeypatch, capsys, "show disk usage", release=ubuntu_release
++    )
++    assert code != 0
++    assert not started.repl and started.reads == 0
++    assert str(path) in err
++    assert not pwned.exists()
++
++
++def test_bidi_control_in_a_broken_prompts_line_is_escaped(
++    monkeypatch, capsys, ubuntu_release
++):
++    path = user_prompts_file()
++    path.write_text("system: [broken ‮ here\n", encoding="utf-8")
++    code, out, err, started, stub = start(monkeypatch, capsys, release=ubuntu_release)
++    assert code != 0
++    assert not started.repl
++    assert str(path) in err
++    assert "broken \\u202e here" in err  # the broken line is quoted, escaped
++    assert "‮" not in err
++
++
++@pytest.mark.parametrize(
++    "shell_line",
++    ['shell = "‮bash"', "shell = ‮bash"],
++    ids=["bad-value", "bad-toml-syntax"],
++)
++def test_bidi_control_in_a_broken_target_toml_is_escaped(
++    monkeypatch, capsys, tmp_path, shell_line
++):
++    # U+202E sits in the broken `shell` line: a value that fails validation, or a line
++    # that is not valid TOML at all. The targets root's own name holds U+202E too: the
++    # path is printed in the error, and neither the validator (it quotes with !r) nor
++    # tomllib (it quotes no line text) puts a raw U+202E there, so the path is what makes
++    # this fail unless the start-up error print escapes.
++    root = tmp_path / "targets‮root"
++    folder = root / "testos-1"
++    (folder / "prompts").mkdir(parents=True)
++    (folder / "prompts" / "prompts.yaml").write_text(
++        DEFAULT_PROMPTS.read_text(encoding="utf-8"), encoding="utf-8"
++    )
++    (folder / "target.toml").write_text(
++        'id = "testos-1"\n'
++        'display_name = "Test OS 1"\n'
++        f"{shell_line}\n"
++        'package_owner_query = ["owner-of"]\n'
++        '[os_release]\nID = "testos"\nVERSION_ID = "1"\n'
++        '[sudo]\nimplementation = "test-sudo"\nversion = "1.0"\n',
++        encoding="utf-8",
++    )
++    release = tmp_path / "os-release"
++    release.write_text('ID=testos\nVERSION_ID="1"\n', encoding="utf-8")
++    code, out, err, started, stub = start(
++        monkeypatch, capsys, targets_root=root, release=release
++    )
++    assert code != 0
++    assert not started.repl
++    assert "\\u202e" in err
++    assert "‮" not in err
++    assert "targets\\u202eroot" in err
++
++
++# (d) proposal/v1 §Conformance: accepted shapes and rejections ---------------------------
++
++LONG = "a" * 2001
++
++REJECTED = {
++    "extra-property": '{"kind": "command", "command": "ls", "risk": "read-only", "x": 1}',
++    "missing-kind": '{"command": "ls", "risk": "read-only"}',
++    "unknown-kind": '{"kind": "explain", "reason": "unclear-request"}',
++    "unknown-risk": '{"kind": "command", "command": "ls", "risk": "harmless"}',
++    "unknown-reason": '{"kind": "refuse", "reason": "too-busy"}',
++    "empty-command": '{"kind": "command", "command": "", "risk": "read-only"}',
++    "clarify-with-command": (
++        '{"kind": "clarify", "reason": "unclear-request", "command": "ls"}'
++    ),
++    "refuse-without-reason": '{"kind": "refuse"}',
++    "missing-risk": '{"kind": "command", "command": "ls"}',
++    "command-with-reason": (
++        '{"kind": "command", "command": "ls", "risk": "read-only", '
++        '"reason": "unclear-request"}'
++    ),
++    "over-long-command": json.dumps(
++        {"kind": "command", "command": LONG, "risk": "read-only"}
++    ),
++    "invalid-json": '{"kind": "command", "command": "ls", ',
++    "json-array": '[{"kind": "command", "command": "ls", "risk": "read-only"}]',
++    "huge-integer": "9" * 4301,
++    # Deep nesting makes the JSON decoder raise RecursionError, which must not escape.
++    "deep-nesting": "[" * 100000 + "]" * 100000,
++    # A repeated key is rejected, not read as last-key-wins (which would be a command).
++    "duplicate-key": (
++        '{"kind": "refuse", "kind": "command", "command": "ls", "risk": "read-only"}'
++    ),
++}
++
++
++@pytest.mark.parametrize("raw", REJECTED.values(), ids=REJECTED.keys())
++def test_non_conforming_response_is_rejected_and_the_repl_keeps_running(raw):
++    stub, out = session("show disk usage", "@list files", responses=[raw, DF])
++    assert out == NO_USABLE + "\n" + DF_SHOWN + "\n"
++    assert len(stub.inputs) == 2
++
++
++def test_lone_surrogate_command_is_rejected_on_a_utf8_stream():
++    raw = '{"kind": "command", "command": "\\ud800", "risk": "read-only"}'
++    out = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
++    from nl_shell.backend import RecordingStub
++
++    stub = RecordingStub([raw, DF])
++    repl = Repl(
++        scripted("show disk usage", "@list files"), out, backend=stub,
++        prompts=loaded_prompts(),
++    )
++    assert repl.run() == 0
++    out.flush()
++    assert out.buffer.getvalue().decode("utf-8") == NO_USABLE + "\n" + DF_SHOWN + "\n"
++
++
++@pytest.mark.parametrize(
++    ("raw", "shown"),
++    [
++        (DF, DF_SHOWN),
++        (
++            json.dumps({"kind": "command", "command": "a" * 2000, "risk": "mutating"}),
++            "Proposed command (risk: mutating, 1 line):\n"
++            f"  | {'a' * 2000}\n{NOTHING_RUNS_YET}",
++        ),
++        ('{"kind": "clarify", "reason": "missing-information"}', CLARIFY),
++        ('{"kind": "refuse", "reason": "not-a-shell-task"}', REFUSE),
++    ],
++    ids=["command", "command-at-2000", "clarify", "refuse"],
++)
++def test_valid_shapes_are_accepted(raw, shown):
++    _, out = session("show disk usage", responses=[raw])
++    assert out == shown + "\n"
++
++
++# (e) how a proposal is shown; hidden characters ----------------------------------------
++
++
++def test_multi_line_command_is_shown_with_every_line_prefixed():
++    raw = json.dumps({"kind": "command", "command": "cd /tmp\nls -la", "risk": "read-only"})
++    _, out = session("show disk usage", responses=[raw])
++    assert out == (
++        "Proposed command (risk: read-only, 2 lines):\n"
++        "  | cd /tmp\n"
++        "  | ls -la\n"
++        f"{NOTHING_RUNS_YET}\n"
++    )
++
++
++def test_tab_in_a_command_is_shown_as_is():
++    raw = json.dumps({"kind": "command", "command": "printf 'a\tb'", "risk": "read-only"})
++    _, out = session("show disk usage", responses=[raw])
++    assert out == (
++        "Proposed command (risk: read-only, 1 line):\n"
++        "  | printf 'a\tb'\n"
++        f"{NOTHING_RUNS_YET}\n"
++    )
++
++
++def test_a_command_line_cannot_pose_as_the_proposal_header():
++    spoof = "Proposed command (risk: read-only, 1 line):"
++    command = f"rm -rf ~\n{spoof}"
++    raw = json.dumps({"kind": "command", "command": command, "risk": "destructive"})
++    _, out = session("show disk usage", responses=[raw])
++    lines = out.splitlines()
++    assert spoof not in lines
++    assert f"  | {spoof}" in lines
++    assert lines[0] == "Proposed command (risk: destructive, 2 lines):"
++
++
++HIDDEN = {
++    "esc": ("\x1b", "\\x1b"),
++    "cr": ("\r", "\\x0d"),
++    "del": ("\x7f", "\\x7f"),
++    "c1-nel": ("\x85", "\\x85"),
++    "rlo-u202e": ("‮", "\\u202e"),
++    "zwsp-u200b": ("​", "\\u200b"),
++    "bom-ufeff": ("﻿", "\\ufeff"),
++    "line-separator-u2028": (" ", "\\u2028"),
++    "tag-ue0041": ("\U000e0041", "\\U000e0041"),
++    # Range boundaries, so narrowing a range in the predicate turns a vector red.
++    "c0-first-u0000": ("\x00", "\\x00"),
++    "c0-last-u001f": ("\x1f", "\\x1f"),
++    "c1-csi-u009b": ("\x9b", "\\x9b"),
++    "bidi-alm-u061c": ("؜", "\\u061c"),
++    "paragraph-separator-u2029": (" ", "\\u2029"),
++    "tag-last-ue007f": ("\U000e007f", "\\U000e007f"),
++}
++
++
++@pytest.mark.parametrize(("char", "escaped"), HIDDEN.values(), ids=HIDDEN.keys())
++def test_command_with_a_hidden_character_is_rejected(char, escaped):
++    for ensure_ascii in (True, False):
++        raw = json.dumps(
++            {"kind": "command", "command": f"ls{char} -la", "risk": "read-only"},
++            ensure_ascii=ensure_ascii,
++        )
++        _, out = session("show disk usage", responses=[raw])
++        assert out == NO_USABLE + "\n"
++
++
++@pytest.mark.parametrize(("char", "escaped"), HIDDEN.values(), ids=HIDDEN.keys())
++def test_hidden_character_in_a_request_is_escaped_in_context(char, escaped):
++    typed = f"show{char}disk usage"
++    stub, out = session(typed, ":context", responses=[DF])
++    recorded = stub.inputs[0]
++    assert recorded[-1][1].endswith(typed)  # sent raw
++    assert out == DF_SHOWN + "\n" + expected_context(recorded) + "\n"
++    assert out.splitlines()[-1].endswith(f"show{escaped}disk usage")
++    assert char not in out
++
++
++# (f) `:status` lists the loaded prompt files -------------------------------------------
++
++
++@pytest.mark.parametrize("with_user_file", [False, True], ids=["default-only", "with-user"])
++def test_status_lists_the_loaded_prompt_files(
++    monkeypatch, capsys, ubuntu_release, with_user_file
++):
++    import nl_shell
++
++    user = user_prompts_file()
++    if with_user_file:
++        user.write_text("system: Mine.\n", encoding="utf-8")
++    monkeypatch.setenv("XDG_RUNTIME_DIR", "/nonexistent/nl-shell-test-runtime")
++    code, out, err, started, stub = start(
++        monkeypatch, capsys, ":status", release=ubuntu_release
++    )
++    assert (code, err) == (0, "")
++    expected = [
++        f"nl-shell {nl_shell.__version__}",
++        "target: ubuntu-26.04 (Ubuntu 26.04 LTS)",
++        "target matches this OS",
++        f"prompts: {DEFAULT_PROMPTS}",
++    ]
++    if with_user_file:
++        expected.append(f"prompts: {user}")
++    # The model client's two lines (#77) follow the prompt files.
++    from nl_shell import teacher_client
++
++    expected += [
++        "model endpoint: /nonexistent/nl-shell-test-runtime/nl-shell/model.sock",
++        f"model backend: {teacher_client.TeacherClient.kind}",
++    ]
++    assert out.splitlines() == expected
++
++
++# (g) no backend configured -------------------------------------------------------------
++
++
++@pytest.mark.parametrize("line", ["show disk usage", "@show disk usage"])
++def test_without_a_backend_requests_get_the_no_backend_reply(line):
++    out = io.StringIO()
++    assert Repl(scripted(line), out).run() == 0
++    assert out.getvalue() == NO_BACKEND + "\n"
++
++
++# Every REPL reply is escaped, not only proposals and `:context` -------------------------
++
++
++def test_every_repl_reply_escapes_hidden_characters():
++    # An unknown meta-command echoes what was typed; a raw U+202E or ESC there would
++    # reach the terminal unless the REPL escapes every reply it prints.
++    out = io.StringIO()
++    assert Repl(scripted(":foo‮\x1b[2J"), out).run() == 0
++    printed = out.getvalue()
++    assert printed.startswith("Unknown meta-command :foo\\u202e\\x1b[2J. Known: :")
++    assert printed.endswith(".\n") and printed.count("\n") == 1
++    assert "‮" not in printed
++    assert "\x1b" not in printed
+diff --git a/tests/test_cli.py b/tests/test_cli.py
+index 00e7bb0..b0f02dd 100644
+--- a/tests/test_cli.py
++++ b/tests/test_cli.py
+@@ -17,6 +17,12 @@ VERSION_ID = "1"
+ implementation = "test-sudo"
+ version = "1.0"
+ """
++# The target's default prompts layer (#143): start-up refuses a target without one.
++PROMPTS_YAML = """\
++system: You propose one bash command.
++examples: []
++request_template: "{state}{request}"
++"""
+ 
+ 
+ def test_version_flag(capsys):
+@@ -30,6 +36,10 @@ def test_main_runs_the_interactive_repl(monkeypatch, tmp_path):
+     root = tmp_path / "targets"
+     (root / "testos-1").mkdir(parents=True)
+     (root / "testos-1" / "target.toml").write_text(TARGET_TOML, encoding="utf-8")
++    (root / "testos-1" / "prompts").mkdir()
++    (root / "testos-1" / "prompts" / "prompts.yaml").write_text(
++        PROMPTS_YAML, encoding="utf-8"
++    )
+     release = tmp_path / "os-release"
+     release.write_text('ID=testos\nVERSION_ID="1"\n', encoding="utf-8")
+     seen = {}
+@@ -38,13 +48,19 @@ def test_main_runs_the_interactive_repl(monkeypatch, tmp_path):
+         def run(self):
+             return 0
+ 
+-    def interactive(cls, status_lines=()):
++    def interactive(cls, status_lines=(), **_kwargs):
+         seen["status_lines"] = [line() for line in status_lines]
+         return FakeRepl()
+ 
+     monkeypatch.setattr(cli.Repl, "interactive", classmethod(interactive))
++    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+     assert cli.main([], targets_root=root, os_release_paths=[release]) == 0
++    from nl_shell import teacher_client
++
+     assert seen["status_lines"] == [
+         "target: testos-1 (Test OS 1)",
+         "target matches this OS",
++        f"prompts: {root / 'testos-1' / 'prompts' / 'prompts.yaml'}",
++        f"model endpoint: {tmp_path / 'run' / 'nl-shell' / 'model.sock'}",
++        f"model backend: {teacher_client.TeacherClient.kind}",
+     ]
+diff --git a/tests/test_input_modes.py b/tests/test_input_modes.py
+index be395f9..e145e49 100644
+--- a/tests/test_input_modes.py
++++ b/tests/test_input_modes.py
+@@ -10,20 +10,19 @@ COMMAND = (
+     "That looks like a shell command, but nl-shell can't run anything yet: "
+     "the bash session arrives in M0.2."
+ )
++# A plain Repl has no model backend (the interactive default until #77): natural
++# language and `@request` get the same reply.
+ NATURAL_LANGUAGE = (
+-    "That looks like a natural-language request, but nl-shell can't answer it yet: "
+-    "the model backend arrives in M0.8."
++    "No model backend is configured, so nl-shell can't answer this yet: "
++    "the model client arrives with #77."
+ )
+ ASK = (
+     "That is an ask-mode question (?), but nl-shell can't answer it yet: "
+     "ask mode arrives in M0.8."
+ )
+-PROPOSE = (
+-    "That is a one-command request (@), but nl-shell can't propose a command yet: "
+-    "command proposals arrive in M0.8."
+-)
++PROPOSE = NATURAL_LANGUAGE
+ AGENT = "@@ is reserved for the agent loop, which arrives with M0.6b (#76)."
+-CONTEXT = ":context is not available yet: it arrives with M0.8 (#16)."
++CONTEXT = "No model input yet: :context shows the model input of the last request."
+ HISTORY = ":history is not available yet: it arrives with M0.9 (#17)."
+ # `:status` prints a block whose FIRST line is `nl-shell <version>`. A session adds its own
+ # lines after it (#92, #16, #77), so the table checks only that first line, not the block.
+@@ -49,7 +48,6 @@ REPLY_NAMES = {
+     COMMAND: "command",
+     NATURAL_LANGUAGE: "natural-language",
+     ASK: "ask",
+-    PROPOSE: "propose",
+     AGENT: "agent-reserved",
+     CONTEXT: "context",
+     HISTORY: "history",
+@@ -105,7 +103,8 @@ def fake_path(tmp_path, monkeypatch):
+ 
+ 
+ def test_replies_are_distinct():
+-    assert len(REPLY_NAMES) == 15
++    # PROPOSE is NATURAL_LANGUAGE (no backend), so 14 distinct replies.
++    assert len(REPLY_NAMES) == 14
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -115,7 +114,7 @@ def test_replies_are_distinct():
+         ("\\frobnicate the widgets", COMMAND),
+         ("\\ls -la", COMMAND),
+         ("?why did that fail", ASK),
+-        ("@show disk usage", PROPOSE),
++        ("@show disk usage", PROPOSE),  # the no-backend reply
+         # `@@` is checked before `@`: this must not reach the `@` route as "@clean ...".
+         ("@@clean up my downloads", AGENT),
+         (":context", CONTEXT),
+diff --git a/tests/test_repl.py b/tests/test_repl.py
+index f51b032..7f09536 100644
+--- a/tests/test_repl.py
++++ b/tests/test_repl.py
+@@ -10,9 +10,10 @@ COMMAND = (
+     "That looks like a shell command, but nl-shell can't run anything yet: "
+     "the bash session arrives in M0.2."
+ )
++# A plain Repl has no model backend (the interactive default until #77).
+ NATURAL_LANGUAGE = (
+-    "That looks like a natural-language request, but nl-shell can't answer it yet: "
+-    "the model backend arrives in M0.8."
++    "No model backend is configured, so nl-shell can't answer this yet: "
++    "the model client arrives with #77."
+ )
+ ROUTE_NAMES = {COMMAND: "command", NATURAL_LANGUAGE: "natural-language"}
+ 
+diff --git a/tests/test_targets.py b/tests/test_targets.py
+index df8a9ee..a74b371 100644
+--- a/tests/test_targets.py
++++ b/tests/test_targets.py
+@@ -22,6 +22,7 @@ from nl_shell.repl import Repl
+ REPO = Path(__file__).resolve().parents[1]
+ VERSION_LINE = f"nl-shell {nl_shell.__version__}"
+ MISMATCH = "target does not match this OS"
++RUNTIME_DIR = "/nonexistent/nl-shell-test-runtime"  # no socket there; nothing connects
+ 
+ UBUNTU_2604 = """\
+ id = "ubuntu-26.04"
+@@ -52,6 +53,13 @@ implementation = "test-sudo"
+ version = "1.0"
+ """
+ 
++# Every target folder carries its default prompts layer (#143); start-up refuses one without.
++PROMPTS_YAML = """\
++system: You propose one bash command.
++examples: []
++request_template: "{state}{request}"
++"""
++
+ UBUNTU_RELEASE = 'NAME="Ubuntu"\nID=ubuntu\nVERSION_ID="26.04"\n'
+ DEBIAN_RELEASE = 'NAME="Debian GNU/Linux"\nID=debian\nID_LIKE=ubuntu\nVERSION_ID="13"\n'
+ 
+@@ -89,6 +97,9 @@ class Fake:
+ 
+     def add_target(self, folder, text):
+         (self.root / folder).mkdir(exist_ok=True)
++        prompts = self.root / folder / "prompts"
++        prompts.mkdir(exist_ok=True)
++        (prompts / "prompts.yaml").write_text(PROMPTS_YAML, encoding="utf-8")
+         path = self.root / folder / "target.toml"
+         if text is not None:
+             path.write_text(text, encoding="utf-8")
+@@ -141,12 +152,14 @@ def start(fake, monkeypatch, capsys):
+             selections.append(selection)
+             return selection
+ 
+-        def interactive(cls, status_lines=()):
++        def interactive(cls, status_lines=(), **kwargs):
+             started.append(True)
+-            return Repl(scripted(*lines), out, status_lines)
++            return Repl(scripted(*lines), out, status_lines, **kwargs)
+ 
+         monkeypatch.setattr(targets, "select", spy)
+         monkeypatch.setattr(Repl, "interactive", classmethod(interactive))
++        # The default model socket (#77) shows in `:status`; pin where it points.
++        monkeypatch.setenv("XDG_RUNTIME_DIR", RUNTIME_DIR)
+         try:
+             code = cli.main(argv, targets_root=fake.root, os_release_paths=fake.paths)
+         finally:
+@@ -159,6 +172,20 @@ def start(fake, monkeypatch, capsys):
+     return run
+ 
+ 
++def prompts_line(fake, target_id):
++    return f"prompts: {fake.root / target_id / 'prompts' / 'prompts.yaml'}"
++
++
++def model_lines():
++    """The two `:status` lines #77 adds: the model endpoint and the backend kind."""
++    from nl_shell import teacher_client
++
++    return (
++        f"model endpoint: {RUNTIME_DIR}/nl-shell/model.sock\n"
++        f"model backend: {teacher_client.TeacherClient.kind}\n"
++    )
++
++
+ def no_match_message(detected, config_file, available="testos-1, ubuntu-26.04"):
+     return (
+         f"nl-shell: no target matches this OS (detected: {detected}).\n"
+@@ -180,6 +207,8 @@ def test_exact_match_is_active_and_matching(fake, start):
+         f"{VERSION_LINE}\n"
+         "target: ubuntu-26.04 (Ubuntu 26.04 LTS)\n"
+         "target matches this OS\n"
++        f"{prompts_line(fake, 'ubuntu-26.04')}\n"
++        f"{model_lines()}"
+     )
+     sel = run.selection
+     assert sel.target.id == "ubuntu-26.04"
+@@ -236,6 +265,8 @@ def test_named_target_on_another_os_starts_marked_not_matching(fake, start):
+         f"{VERSION_LINE}\n"
+         "target: ubuntu-26.04 (Ubuntu 26.04 LTS)\n"
+         "target does not match this OS (detected: debian 13)\n"
++        f"{prompts_line(fake, 'ubuntu-26.04')}\n"
++        f"{model_lines()}"
+     )
+     sel = run.selection
+     assert sel.target.id == "ubuntu-26.04"
+@@ -544,6 +575,8 @@ def test_unreadable_etc_os_release_with_named_target_starts_not_matching(fake, s
+         f"{VERSION_LINE}\n"
+         "target: ubuntu-26.04 (Ubuntu 26.04 LTS)\n"
+         "target does not match this OS (detected: unknown unknown)\n"
++        f"{prompts_line(fake, 'ubuntu-26.04')}\n"
++        f"{model_lines()}"
+     )
+     sel = run.selection
+     assert sel.matches is False
+@@ -609,7 +642,7 @@ def test_target_folder_without_allowlist_loads(fake):
+     from nl_shell import targets
+ 
+     folder = fake.root / "testos-1"
+-    assert sorted(p.name for p in folder.iterdir()) == ["target.toml"]
++    assert sorted(p.name for p in folder.iterdir()) == ["prompts", "target.toml"]
+     target = targets.load("testos-1", fake.root)
+     assert target.id == "testos-1"
+     assert target.folder == folder
+@@ -685,11 +718,15 @@ def test_status_lines_do_not_leak_between_runs(fake, start):
+         f"{VERSION_LINE}\n"
+         "target: ubuntu-26.04 (Ubuntu 26.04 LTS)\n"
+         "target matches this OS\n"
++        f"{prompts_line(fake, 'ubuntu-26.04')}\n"
++        f"{model_lines()}"
+     )
+     assert second.out == (
+         f"{VERSION_LINE}\n"
+         "target: testos-1 (Test OS 1)\n"
+         "target does not match this OS (detected: ubuntu 26.04)\n"
++        f"{prompts_line(fake, 'testos-1')}\n"
++        f"{model_lines()}"
+     )
+     # And a Repl built afterwards, with no target, shows neither.
+     out = io.StringIO()
+diff --git a/tests/test_teacher_client.py b/tests/test_teacher_client.py
+new file mode 100644
+index 0000000..78a3f52
+--- /dev/null
++++ b/tests/test_teacher_client.py
+@@ -0,0 +1,670 @@
++"""The model client and `--dev-teacher` (#77).
++
++Every test talks to an in-process fake OpenAI-compatible server (stdlib `http.server`) on
++127.0.0.1 or on a Unix socket; nothing leaves the host and no model runs. The modules
++#77 and #143 add are imported inside the tests, so with the production change reverted
++each test fails on its own assertions instead of the file failing to import.
++"""
++
++from __future__ import annotations
++
++import http.server
++import io
++import json
++import shutil
++import socket
++import socketserver
++import tempfile
++import threading
++import time
++from pathlib import Path
++
++import pytest
++
++from nl_shell import cli
++from nl_shell.repl import Repl
++
++TARGET_TOML = """\
++id = "testos-1"
++display_name = "Test OS 1"
++shell = "bash"
++package_owner_query = ["owner-of"]
++
++[os_release]
++ID = "testos"
++VERSION_ID = "1"
++
++[sudo]
++implementation = "test-sudo"
++version = "1.0"
++"""
++PROMPTS_YAML = """\
++system: You propose one bash command.
++examples:
++  - request: show disk usage
++    response: '{"kind": "command", "command": "df -h", "risk": "read-only"}'
++request_template: "{state}{request}"
++"""
++VALID = '{"kind": "command", "command": "df -h", "risk": "read-only"}'
++NO_USABLE = "No usable proposal came back from the model."
++OSC52_STATUS = (
++    b"HTTP/1.1 500 \x1b]52;c;ZWNobyBwd25lZA==\x07\x1b[2K\rnl> fake\r\n"
++)
++HIDDEN = ("\x1b", "\x07", "\r")
++WAIT = 5  # upper bound for any wait on a fake server thread
++
++
++# --- fake server -------------------------------------------------------------------
++
++
++class Fake:
++    """One fake endpoint: records every request and answers with ``behaviour``."""
++
++    def __init__(self, server, address):
++        self.server = server
++        self.address = address
++        self.requests: list[dict] = []
++        self.behaviour = ok(VALID)
++        self.stop = threading.Event()
++
++    @property
++    def url(self) -> str:
++        host, port = self.address
++        return f"http://{host}:{port}"
++
++
++class Handler(http.server.BaseHTTPRequestHandler):
++    timeout = WAIT  # a handler never waits on a client longer than this
++
++    def do_POST(self):  # noqa: N802 (http.server naming)
++        fake: Fake = self.server.fake
++        length = int(self.headers.get("Content-Length", "0"))
++        body = self.rfile.read(length)
++        fake.requests.append(
++            {
++                "method": "POST",
++                "path": self.path,
++                "headers": {k.lower(): v for k, v in self.headers.items()},
++                "body": json.loads(body),
++            }
++        )
++        try:
++            fake.behaviour(self, fake)
++        except (BrokenPipeError, ConnectionResetError):
++            pass
++
++    def do_GET(self):  # noqa: N802
++        self.server.fake.requests.append({"method": "GET", "path": self.path})
++        self.send_error(404)
++
++    def log_message(self, *args):
++        pass
++
++
++class TCPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
++    daemon_threads = True
++    block_on_close = False
++
++
++class UnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
++    daemon_threads = True
++    block_on_close = False
++
++
++def ok(content):
++    def behaviour(handler, fake):
++        _send(handler, 200, json.dumps(
++            {"choices": [{"message": {"role": "assistant", "content": content}}]}
++        ).encode())
++    return behaviour
++
++
++def raw_body(data: bytes, status: int = 200):
++    def behaviour(handler, fake):
++        _send(handler, status, data)
++    return behaviour
++
++
++def queue(*contents):
++    """Answer request n with ``contents[n]``."""
++    pending = list(contents)
++
++    def behaviour(handler, fake):
++        ok(pending.pop(0))(handler, fake)
++    return behaviour
++
++
++def _send(handler, status, data):
++    handler.send_response(status)
++    handler.send_header("Content-Type", "application/json")
++    handler.send_header("Content-Length", str(len(data)))
++    handler.end_headers()
++    handler.wfile.write(data)
++
++
++@pytest.fixture
++def servers():
++    """Start fake servers; every one is shut down and its socket dir removed after."""
++    started: list[Fake] = []
++    dirs: list[str] = []
++
++    def tcp() -> Fake:
++        server = TCPServer(("127.0.0.1", 0), Handler)
++        return _start(server, server.server_address)
++
++    def unix(path: str) -> Fake:
++        Path(path).parent.mkdir(parents=True, exist_ok=True)
++        server = UnixServer(path, Handler)
++        return _start(server, path)
++
++    def _start(server, address) -> Fake:
++        fake = Fake(server, address)
++        server.fake = fake
++        thread = threading.Thread(
++            target=server.serve_forever, kwargs={"poll_interval": 0.05}
++        )
++        thread.daemon = True
++        thread.start()
++        started.append(fake)
++        return fake
++
++    def runtime_dir() -> str:
++        # Short: a Unix socket path must fit in about 107 bytes.
++        path = tempfile.mkdtemp(prefix="nls-")
++        dirs.append(path)
++        return path
++
++    yield type("Servers", (), {"tcp": staticmethod(tcp), "unix": staticmethod(unix),
++                               "runtime_dir": staticmethod(runtime_dir)})
++    for fake in started:
++        fake.stop.set()
++        fake.server.shutdown()
++        fake.server.server_close()
++    for path in dirs:
++        shutil.rmtree(path, ignore_errors=True)
++
++
++@pytest.fixture
++def default_socket(servers, monkeypatch):
++    """XDG_RUNTIME_DIR in a short temp dir; returns the default model socket path."""
++    run = servers.runtime_dir()
++    monkeypatch.setenv("XDG_RUNTIME_DIR", run)
++    return f"{run}/nl-shell/model.sock"
++
++
++def messages():
++    from nl_shell.prompts import Message
++
++    return [Message("system", "You propose."), Message("user", "show disk usage")]
++
++
++def client_for(fake: Fake, **kwargs):
++    from nl_shell import teacher_client
++
++    if isinstance(fake.address, str):
++        endpoint = teacher_client.Endpoint("unix", fake.address)
++    else:
++        endpoint = teacher_client.Endpoint("http", fake.url)
++    return teacher_client.TeacherClient(endpoint, **kwargs)
++
++
++def failure(client) -> str:
++    from nl_shell import backend
++
++    with pytest.raises(backend.BackendError) as exc:
++        client.complete(messages())
++    return exc.value.reason
++
++
++def scripted(lines):
++    pending = list(lines)
++
++    def read(_prompt):
++        if not pending:
++            raise EOFError
++        return pending.pop(0)
++    return read
++
++
++def load_prompts(tmp_path):
++    from nl_shell import prompts
++
++    folder = tmp_path / "target"
++    (folder / "prompts").mkdir(parents=True)
++    (folder / "prompts" / "prompts.yaml").write_text(PROMPTS_YAML, encoding="utf-8")
++    return prompts.load(folder)
++
++
++def run_cli(tmp_path, monkeypatch, argv=(), lines=(), config_text=None):
++    """``cli.main`` with an injected matching target, a scripted REPL and a StringIO."""
++    root = tmp_path / "targets"
++    folder = root / "testos-1"
++    (folder / "prompts").mkdir(parents=True)
++    (folder / "target.toml").write_text(TARGET_TOML, encoding="utf-8")
++    (folder / "prompts" / "prompts.yaml").write_text(PROMPTS_YAML, encoding="utf-8")
++    release = tmp_path / "os-release"
++    release.write_text('ID=testos\nVERSION_ID="1"\n', encoding="utf-8")
++    if config_text is not None:
++        config_dir = Path(tmp_path / "home-config" / "nl-shell")
++        config_dir.mkdir(parents=True)
++        (config_dir / "config.toml").write_text(config_text, encoding="utf-8")
++        monkeypatch.setenv("XDG_CONFIG_HOME", str(config_dir.parent))
++    out = io.StringIO()
++    seen: dict = {}
++
++    def interactive(cls, status_lines=(), **kwargs):
++        seen["status_lines"] = [line() for line in status_lines]
++        seen["kwargs"] = kwargs
++        return cls(scripted(lines), out, status_lines, **kwargs)
++
++    monkeypatch.setattr(cli.Repl, "interactive", classmethod(interactive))
++    rc = cli.main(list(argv), targets_root=root, os_release_paths=[release])
++    return rc, out.getvalue(), seen
++
++
++# --- (a) request shape -------------------------------------------------------------
++
++
++def test_request_shape(servers, default_socket):
++    from nl_shell import proposal
++
++    fake = servers.unix(default_socket)
++    sent = messages()
++    assert client_for(fake).complete(sent) == VALID
++    assert len(fake.requests) == 1
++    request = fake.requests[0]
++    assert (request["method"], request["path"]) == ("POST", "/v1/chat/completions")
++    body = request["body"]
++    assert body["messages"] == [{"role": m.role, "content": m.content} for m in sent]
++    response_format = body["response_format"]
++    assert response_format["type"] == "json_schema"
++    assert response_format["json_schema"]["schema"] == proposal.SCHEMA
++    assert "authorization" not in request["headers"]
++    assert "model" not in body
++
++
++@pytest.mark.parametrize("config_text, model", [
++    ('teacher_model = "m1"\n', "m1"),
++    ("", None),
++])
++def test_teacher_model_from_config(tmp_path, monkeypatch, servers, default_socket,
++                                   config_text, model):
++    fake = servers.unix(default_socket)
++    rc, out, _ = run_cli(tmp_path, monkeypatch, lines=["show disk usage"],
++                         config_text=config_text)
++    assert rc == 0
++    assert "Proposed command (risk: read-only" in out
++    assert len(fake.requests) == 1
++    assert fake.requests[0]["body"].get("model") == model
++    assert ("model" in fake.requests[0]["body"]) == (model is not None)
++
++
++# --- (b) strict transport handling -------------------------------------------------
++
++
++def test_http_error_status_is_rejected(servers):
++    fake = servers.tcp()
++    fake.behaviour = lambda handler, _fake: handler.send_error(503, "busy")
++    reason = failure(client_for(fake))
++    assert "503" in reason
++    assert len(fake.requests) == 1
++
++
++def test_redirect_is_not_followed(servers):
++    fake, other = servers.tcp(), servers.tcp()
++
++    def redirect(handler, _fake):
++        handler.send_response(307)
++        handler.send_header("Location", other.url + "/v1/chat/completions")
++        handler.send_header("Content-Length", "0")
++        handler.end_headers()
++
++    fake.behaviour = redirect
++    reason = failure(client_for(fake))
++    assert "redirect" in reason
++    assert len(fake.requests) == 1
++    assert other.requests == []
++
++
++@pytest.mark.parametrize("data", [
++    b"not json",
++    b'{"choices": []}',
++    b"{}",
++    b'{"choices": [{"message": {"content": null}}]}',
++    b'{"choices": [{"message": {"content": {"kind": "command"}}}]}',
++    b"[1, 2]",
++])
++def test_bad_body_is_rejected(servers, data):
++    fake = servers.tcp()
++    fake.behaviour = raw_body(data)
++    reason = failure(client_for(fake))
++    assert "JSON" in reason or "content" in reason
++    assert len(fake.requests) == 1
++
++
++def test_oversize_body_stops_reading_at_the_cap(servers):
++    fake = servers.tcp()
++    written = []
++
++    def endless(handler, fake):
++        handler.send_response(200)
++        handler.send_header("Content-Type", "application/json")
++        handler.end_headers()
++        while not fake.stop.is_set() and sum(written) < 64 * 1024 * 1024:
++            handler.wfile.write(b" " * 4096)
++            written.append(4096)
++
++    fake.behaviour = endless
++    start = time.monotonic()
++    reason = failure(client_for(fake, timeout_s=WAIT))
++    assert time.monotonic() - start < WAIT
++    assert "larger than" in reason
++    assert len(fake.requests) == 1
++
++
++def test_size_cap_override(servers):
++    fake = servers.tcp()
++    reason = failure(client_for(fake, max_response_bytes=10))
++    assert "larger than 10 bytes" in reason
++
++
++def test_server_that_never_answers_times_out(servers):
++    fake = servers.tcp()
++    fake.behaviour = lambda _handler, fake: fake.stop.wait(2)
++    start = time.monotonic()
++    reason = failure(client_for(fake, timeout_s=0.5))
++    assert time.monotonic() - start < 2
++    assert "within 0.5 s" in reason
++    assert len(fake.requests) == 1
++
++
++def slow_drip(handler, fake):
++    handler.send_response(200)
++    handler.send_header("Content-Type", "application/json")
++    handler.send_header("Content-Length", "100")
++    handler.end_headers()
++    handler.wfile.flush()
++    for _ in range(100):
++        if fake.stop.wait(0.2):
++            return
++        handler.wfile.write(b" ")
++        handler.wfile.flush()
++
++
++def test_slow_drip_body_hits_the_total_deadline(servers):
++    fake = servers.tcp()
++    fake.behaviour = slow_drip
++    start = time.monotonic()
++    reason = failure(client_for(fake, timeout_s=0.5))
++    assert time.monotonic() - start < 2
++    assert "within 0.5 s" in reason
++
++
++def test_model_timeout_from_config(tmp_path):
++    from nl_shell import config
++
++    path = tmp_path / "config.toml"
++    path.write_text('target = "x"\n', encoding="utf-8")
++    assert config.load(path).model_timeout_s == 10
++    path.write_text("[model]\ntimeout_s = 0.5\n", encoding="utf-8")
++    assert config.load(path).model_timeout_s == 0.5
++    path.write_text("[model]\ntimeout_s = 3\n", encoding="utf-8")
++    assert config.load(path).model_timeout_s == 3
++    for bad in ('"10"', "true", "0", "-1", "nan", "inf", "[1]"):
++        path.write_text(f"[model]\ntimeout_s = {bad}\n", encoding="utf-8")
++        with pytest.raises(config.ConfigError):
++            config.load(path)
++
++
++def test_cli_uses_model_timeout(tmp_path, monkeypatch, servers, default_socket):
++    fake = servers.unix(default_socket)
++    fake.behaviour = slow_drip
++    start = time.monotonic()
++    rc, out, _ = run_cli(tmp_path, monkeypatch, lines=["show disk usage"],
++                         config_text="[model]\ntimeout_s = 0.5\n")
++    assert time.monotonic() - start < 2
++    assert rc == 0
++    assert "The model server could not be used: " in out
++    assert len(fake.requests) == 1
++
++
++def test_https_to_plain_http_server_is_a_tls_error(servers):
++    from nl_shell import teacher_client
++
++    fake = servers.tcp()
++    port = fake.address[1]
++    endpoint = teacher_client.Endpoint("https", f"https://127.0.0.1:{port}")
++    reason = failure(teacher_client.TeacherClient(endpoint, timeout_s=WAIT))
++    assert "TLS" in reason
++    assert fake.requests == []
++
++
++# --- (c) endpoint rules -------------------------------------------------------------
++
++
++def test_select_endpoint_rules():
++    from nl_shell.teacher_client import Endpoint, EndpointError, select_endpoint
++
++    run = "/run/user/1000"
++    sock = "/run/user/1000/nl-shell/model.sock"
++    lan = "http://192.168.1.20:8080"
++    loop = "http://127.0.0.1:8080"
++
++    assert select_endpoint(None, None, run) == (Endpoint("unix", sock), [])
++    endpoint, notes = select_endpoint(None, loop, run)
++    assert endpoint == Endpoint("unix", sock)
++    assert len(notes) == 1 and "--dev-teacher" in notes[0]
++    assert select_endpoint(True, loop, run) == (Endpoint("http", loop), [])
++    assert select_endpoint("http://localhost:9", loop, run) == (
++        Endpoint("http", "http://localhost:9"), [])
++    assert select_endpoint("https://teacher.lan", None, run) == (
++        Endpoint("https", "https://teacher.lan"), [])
++    for remote in (lan, "http://teacher.lan", "http://[fe80::1]:8080"):
++        endpoint, notes = select_endpoint(remote, None, run)
++        assert endpoint == Endpoint("http", remote)
++        assert len(notes) == 1 and "SSH tunnel" in notes[0]
++    for local in ("http://127.9.9.9", "http://[::1]:8080", "http://LOCALHOST"):
++        assert select_endpoint(local, None, run)[1] == []
++    for no_runtime in (None, "", "relative/dir"):
++        assert select_endpoint(None, None, no_runtime)[0] == Endpoint("unix", None)
++    for bad in ("ftp://host", "http://user:pw@host", "http://user@host", "http://",
++                "http://host?x=1"):
++        with pytest.raises(EndpointError):
++            select_endpoint(bad, None, run)
++
++
++def test_default_socket_without_flag_or_url(tmp_path, monkeypatch, servers,
++                                            default_socket):
++    fake = servers.unix(default_socket)
++    rc, out, _ = run_cli(tmp_path, monkeypatch, lines=["show disk usage"])
++    assert rc == 0
++    assert "Proposed command (risk: read-only, 1 line):" in out
++    assert len(fake.requests) == 1
++
++
++def test_config_url_without_flag_is_refused(tmp_path, monkeypatch, capsys, servers,
++                                            default_socket):
++    local, teacher = servers.unix(default_socket), servers.tcp()
++    rc, out, _ = run_cli(tmp_path, monkeypatch, lines=["show disk usage"],
++                         config_text=f'teacher_url = "{teacher.url}"\n')
++    assert rc == 0
++    assert "teacher_url" in capsys.readouterr().err
++    assert "Proposed command" in out
++    assert len(local.requests) == 1
++    assert teacher.requests == []
++
++
++def test_config_url_with_bare_flag_is_used(tmp_path, monkeypatch, servers,
++                                           default_socket):
++    local, teacher = servers.unix(default_socket), servers.tcp()
++    rc, out, _ = run_cli(tmp_path, monkeypatch, argv=["--dev-teacher"],
++                         lines=["show disk usage"],
++                         config_text=f'teacher_url = "{teacher.url}"\n')
++    assert rc == 0
++    assert "Proposed command" in out
++    assert len(teacher.requests) == 1
++    assert local.requests == []
++
++
++def test_flag_url_wins_over_config_url(tmp_path, monkeypatch, servers, default_socket):
++    configured, given = servers.tcp(), servers.tcp()
++    rc, _, _ = run_cli(tmp_path, monkeypatch, argv=["--dev-teacher", given.url],
++                       lines=["show disk usage"],
++                       config_text=f'teacher_url = "{configured.url}"\n')
++    assert rc == 0
++    assert len(given.requests) == 1
++    assert configured.requests == []
++
++
++def test_non_loopback_http_warns_on_stderr(tmp_path, monkeypatch, capsys,
++                                           default_socket):
++    # No request line, so nothing connects to the (unroutable) address.
++    rc, _, _ = run_cli(tmp_path, monkeypatch,
++                       argv=["--dev-teacher", "http://192.0.2.1:8080"])
++    assert rc == 0
++    assert "SSH tunnel" in capsys.readouterr().err
++
++
++# --- (d) through Repl ---------------------------------------------------------------
++
++
++def test_repl_shows_the_proposal(tmp_path, servers, default_socket):
++    fake = servers.unix(default_socket)
++    out = io.StringIO()
++    repl = Repl(scripted(["show disk usage"]), out, backend=client_for(fake),
++                prompts=load_prompts(tmp_path))
++    assert repl.run() == 0
++    assert out.getvalue().startswith(
++        "Proposed command (risk: read-only, 1 line):\n  | df -h\n"
++    )
++
++
++REJECTED = [
++    '{"kind": "command", "command": "ls", "risk": "read-only", "extra": 1}',
++    '{"kind": "command", "command": "ls"}',
++    '{"kind": "command", "command": "ls", "risk": "read-only", '
++    '"reason": "unclear-request"}',
++    json.dumps({"kind": "command", "command": "a" * 2001, "risk": "read-only"}),
++    '{"kind": "command", "command": "ls", ',
++    '[{"kind": "command", "command": "ls", "risk": "read-only"}]',
++]
++
++
++def test_repl_rejects_bad_proposals_and_keeps_reading(
++    tmp_path, servers, default_socket
++):
++    fake = servers.unix(default_socket)
++    fake.behaviour = queue(*REJECTED, VALID)
++    out = io.StringIO()
++    lines = [f"request {n}" for n in range(len(REJECTED) + 1)]
++    repl = Repl(scripted(lines), out, backend=client_for(fake),
++                prompts=load_prompts(tmp_path))
++    assert repl.run() == 0
++    replies = out.getvalue().splitlines()
++    assert replies[: len(REJECTED)] == [NO_USABLE] * len(REJECTED)
++    assert replies[len(REJECTED)].startswith("Proposed command (risk: read-only")
++    assert len(fake.requests) == len(REJECTED) + 1
++
++
++def test_repl_with_no_model_server(tmp_path, default_socket):
++    from nl_shell import teacher_client
++
++    endpoint = teacher_client.Endpoint("unix", default_socket)
++    out = io.StringIO()
++    repl = Repl(scripted(["show disk usage", "list files here"]), out,
++                backend=teacher_client.TeacherClient(endpoint),
++                prompts=load_prompts(tmp_path))
++    assert repl.run() == 0
++    expected = f"The model server isn't running (no answer at {default_socket})."
++    assert out.getvalue().splitlines() == [expected, expected]
++
++
++def test_repl_with_no_runtime_dir(tmp_path, monkeypatch):
++    from nl_shell import teacher_client
++
++    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
++    endpoint, _ = teacher_client.select_endpoint(None, None, None)
++    out = io.StringIO()
++    repl = Repl(scripted(["show disk usage"]), out,
++                backend=teacher_client.TeacherClient(endpoint),
++                prompts=load_prompts(tmp_path))
++    assert repl.run() == 0
++    assert out.getvalue().startswith("The model server isn't running (no answer at ")
++
++
++def control_status(handler, _fake):
++    body = b"\x1b[31merror\x07\r body"
++    handler.wfile.write(
++        OSC52_STATUS
++        + b"Content-Type: text/plain\r\n"
++        + f"Content-Length: {len(body)}\r\n".encode()
++        + b"Connection: close\r\n\r\n"
++        + body
++    )
++
++
++def test_server_text_is_escaped(tmp_path, servers, default_socket):
++    fake = servers.unix(default_socket)
++    fake.behaviour = control_status
++    reason = failure(client_for(fake))
++    for char in HIDDEN:
++        assert char not in reason
++    assert "500" in reason
++
++    out = io.StringIO()
++    repl = Repl(scripted(["show disk usage", "list files"]), out,
++                backend=client_for(fake), prompts=load_prompts(tmp_path))
++    assert repl.run() == 0
++    text = out.getvalue()
++    for char in HIDDEN:
++        assert char not in text
++    lines = text.splitlines()
++    assert len(lines) == 2  # one reply per request: the REPL kept reading
++    assert lines[0].startswith("The model server could not be used: HTTP status 500 ")
++
++
++# --- (e) :status --------------------------------------------------------------------
++
++
++def test_status_names_endpoint_and_backend(tmp_path, monkeypatch, default_socket):
++    from nl_shell import teacher_client
++
++    _, _, seen = run_cli(tmp_path, monkeypatch)
++    assert seen["status_lines"][-2:] == [
++        f"model endpoint: {default_socket}",
++        f"model backend: {teacher_client.TeacherClient.kind}",
++    ]
++    _, _, seen = run_cli(tmp_path / "flag", monkeypatch,
++                         argv=["--dev-teacher", "http://127.0.0.1:9"])
++    assert seen["status_lines"][-2] == "model endpoint: http://127.0.0.1:9"
++
++
++# --- (f) no TCP on the default path -------------------------------------------------
++
++
++def test_default_path_opens_no_tcp(tmp_path, monkeypatch, servers, default_socket):
++    local, teacher = servers.unix(default_socket), servers.tcp()
++    calls = []
++    connect = socket.socket.connect
++    create_connection = socket.create_connection
++
++    def record_connect(self, address):
++        calls.append((self.family, address))
++        return connect(self, address)
++
++    def record_create_connection(address, *args, **kwargs):
++        calls.append((socket.AF_INET, address))
++        return create_connection(address, *args, **kwargs)
++
++    monkeypatch.setattr(socket.socket, "connect", record_connect)
++    monkeypatch.setattr(socket, "create_connection", record_create_connection)
++    rc, out, _ = run_cli(tmp_path, monkeypatch, lines=["show disk usage"],
++                         config_text=f'teacher_url = "{teacher.url}"\n')
++    assert rc == 0
++    tcp = [c for c in calls if c[0] in (socket.AF_INET, socket.AF_INET6)]
++    unix = [c for c in calls if c[0] == socket.AF_UNIX]
++    assert tcp == []
++    assert unix == [(socket.AF_UNIX, default_socket)]
++    assert teacher.requests == []
++    assert len(local.requests) == 1
++    assert "Proposed command" in out

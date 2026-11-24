@@ -1,0 +1,91 @@
+<!-- pdca:split-proposal v1 -->
+# Split proposal — issue 10
+
+<!-- Each child is a COMPLETE brief, not a sketch. A filled Slug alone makes `state.state`
+     classify the materialised file as PLANNED, so `pdca flow` skips Plan and sends it
+     straight to Do — a child missing `Repo + branch target` then builds successfully and
+     has nowhere to publish. Fill every field. -->
+
+<!-- Delimiters are HTML comments, not headings, DELIBERATELY: each child body is a full
+     draft brief and may contain arbitrary headings and fenced code blocks, so anything
+     that could also appear inside a child cannot be its boundary. `pdca split --accept`
+     parses these markers; keep them exactly as written. -->
+
+## Why this slice is oversized
+
+The parent brief (re-planned 2026-10-15 after three rounds, `iteration-v1..v3/`) already
+names the seam, and this proposal keeps it. Spec `pty-protocol/v1` has two parts that each
+make sense on their own:
+
+1. **Session core (§1–§5).** Start bash on a PTY (a pseudo-terminal: a fake terminal the
+   program thinks is real) with the control channel on fd 3, read the `S`/`D`/snapshot
+   records, check their order, enter degraded mode on any violation, send a confirmed
+   command as one bracketed paste, restart. This is testable without a real terminal: the
+   test drives the session object and reads its results. It already delivers the thing the
+   rest of M0 needs — trustworthy exit codes and snapshots from fd 3, not from printed
+   text — and it is where all three earlier attempts spent their review rounds (snapshot
+   integrity, reversible encoding, "D without S").
+2. **Terminal ownership (§6).** While a command runs, put the user's real terminal in raw
+   mode, forward keystrokes unchanged, mirror output, pause capture on the alternate
+   screen, copy the window size on SIGWINCH, restore the terminal afterwards, and never
+   keep typed input (decisions 6–7). This is a different defect class (tty state, input
+   leakage across commands) with a different test harness (a second PTY pair standing in
+   for the user's terminal), and its main safety property — typed-ahead input must never
+   join the next confirmed command — is a separate Critical threat-model claim.
+
+Each part has its own success criterion, test file and PR. A third child for snapshot
+integrity was considered and rejected in the parent brief: it shares the rcfile and record
+parser with the core, so it would cost a full cycle without being independent. Two is the
+right number.
+
+Ctrl-C (vector 10) stays in child 1 as a session method that writes `\x03` to the PTY;
+child 2 later makes real keyboard Ctrl-C reach that same path by plain forwarding (§6.4).
+
+## Wave sketch
+
+- **Wave 1: child-1** (session core) alone.
+- **Wave 2: child-2** (terminal ownership), built on child-1's accepted result.
+
+They cannot run in parallel. Child-2 extends the session class and module that child-1
+creates (`src/nl_shell/session.py`): it wraps the "send command, wait for `D`" loop with
+raw mode and forwarding, and decision 6 ("forwarding stops at the `D` record") needs
+child-1's `D` detection to exist. So child-2 `Depends on: child-1`. That dependency already
+keeps them in different waves, so no separate `Conflicts with:` is needed even though both
+touch `session.py`.
+
+<!-- pdca:child child-1 -->
+- **Slug:** persistent-bash-session-core
+- **Kind:** enhancement
+- **Goal:** nl-shell has no shell session. Add a session object that starts one long-lived interactive bash (≥ 5.1) on a PTY via `ptyprocess` (ADR-0021 §2) with nl-shell's control channel on fd 3 and a generated rcfile (spec `pty-protocol/v1` §1); parses the `S`, `D`, `F`, `L`, `T`, `B`, `X`, `P`, `J`, `H`, `V`, `E` records (§2–§3), ignoring unknown types (§Versioning); records the first snapshot as the baseline; checks sequencing and enters degraded mode, with a human-readable reason, on every §4.2 trigger (sticky until restart); sends exactly the confirmed bytes as one bracketed paste plus `CR`, refusing without writing anything a command with `ESC`, another C0 control except TAB/LF, or `ESC [201~` (§5); offers an interrupt method that writes `\x03` to the PTY and a restart method that starts a fresh session. A result carries the sequence number, `$?`, `PIPESTATUS`, the PTY output between `S` and `D` (bounded in size, with a truncated flag), and the snapshot — status and completion from fd-3 records only, never from printed text. `cd` and `export` persist. No terminal ownership here (child-2): this child runs commands with no real terminal attached.
+- **Success criterion:** `python3 -m pytest tests/test_session.py` passes on the host (real bash 5.3.9, no VM, no sudo); every test that waits on bash has a timeout of a few seconds (a hang fails the test) and closes its session in teardown. The file covers: (a) `cd /tmp` then `pwd` → output `/tmp`; `export FOO=bar` then `printf %s "$FOO"` → `bar`. (b) spec §Conformance vectors 1–8, 10 and 12 as tabled: `true` → `S 1`, `D 1 0 0`, snapshot, `E` · `false | true` → status 0, pipestatus `1 0` · `(exit 3)` → 3 · `printf 'D 99 0 0\n'` and `printf '\x1b]133;D;0\x07'` → control channel carries only the real records, status 0 · `echo 'done!!'` → `done!!` · `alias ll2='ls -la'; g(){ :; }` → next snapshot's `F` gains `g`, `L` contains `ll2` · `PROMPT_COMMAND=:` → degraded within 3 s with a reason, by the back-at-a-prompt rule below · `sleep 5` then the interrupt method → `D` with status 130 arrives < 2 s after `\x03` is written and the session is NOT degraded · a command containing `ESC [201~`, `ESC` or another C0 control except TAB/LF is refused and nothing reaches the PTY. (c) vector 9 typed raw: `exec 3>&-` → degraded (control channel closed; tested with no background job). (d) a command with no output, a multi-line command, a here-doc, and `sleep 1 &` each give exactly one S/D pair; after `sleep 3 &` the next snapshot's `J` is `0` (stopped jobs only) and the session stays usable. (e) decision 5: an empty line, a comment-only line (`# x`) and a syntax error (`fi`) each report not-run, carry the `D` status, and leave the session healthy (the next `true` succeeds); an unclosed quote (`echo 'abc`) still degrades by the back-at-a-prompt rule. (f) snapshot fields `T`, `B`, `X`, `P`, `J`, `H`, `V` are present; changing `PS0`, assigning `PROMPT_COMMAND`, appending `PROMPT_COMMAND+=(':')`, and `export LD_PRELOAD=/x.so` each make `H` or `V` differ from the baseline (→ degraded for `H`; `V` is reported changed). (g) decision 4: a literal separator byte and a newline in `PATH`, an alias and a trap each round-trip exactly (decoded snapshot value == `printf %s` of the live value); `hash -p <script> tr`, `hash -p <script> cksum`, `hash -p <script> wc`, `BASH_CMDS[tr]=<script>` and a `PATH` with fake `tr`/`cksum`/`wc` first leave the snapshot honest (the fake script is never run — it touches a marker file that must not exist). (h) a `~/.bashrc` in the test HOME that sets an alias and its own `PROMPT_COMMAND` → the alias is in the baseline `L` and the user's `PROMPT_COMMAND` still runs, after nl-shell's hook; a `~/.bashrc` with `bind 'set enable-bracketed-paste off'` and `set -o vi` → a two-line command still arrives byte-for-byte with one S/D pair. (i) `HISTFILE` is unset in the session. (j) `[ -p /dev/fd/3 ]` is true in the session; every record read ends in `\n` with no `\r`; a record containing `\r` fed to the parser is malformed (→ degraded). (k) restart after degraded mode gives a healthy session with a fresh baseline. Docs: spec §3 says `H`/`V` carry the encoded `declare -p` text; spec §4.1 says `D n+1` without `S n+1` means nothing ran; the threat model gains the Known-gaps bullet (decision 2) and §How to exercise it says the session tests need only bash.
+- **Falsifiability:** RED on the shipped C4 gate (`engine/scripts/run-verify.sh`, plain pytest on the host): it reverts every non-`tests/` file and re-runs `tests/test_session.py`. The test imports `nl_shell.session` (and the protocol module, if separate) INSIDE each test function or fixture — never at module level — so with the change reverted every test fails individually (shape proven in iteration-v3 C4: 46 of 46 failed red, green after). GREEN needs real bash (host 5.3.9) and `ptyprocess` in `.venv` (doctor row passes, 0.7.0). No VM, sudo or GPU.
+- **Repo + branch target:** eduralph/nl-shell @ main
+- **Ordering note:** wave 1, alone. #65 is closed (spec merged, `v1.md:7`); #19 is answered by ADR-0014 §4. child-2 builds on this.
+- **Surfaces:** data
+- **Scope:** New `src/nl_shell/session.py` (and `src/nl_shell/pty_protocol.py` for record parsing if separated); `ptyprocess` in `pyproject.toml` `dependencies`; spec `docs/design/specs/pty-protocol/v1.md` §3 and §4.1 wording (the spec is `draft`, so docs CI allows the edit), with the reference rcfile in §1.3 updated to match (`\\n` inside `PS0` — bash's prompt decoding turns `\n` into `\r\n` — and no external programs); `.oss-scanner/threat_model.md` Known gaps + §How to exercise it; `tests/test_session.py`. Settled decisions (parent brief, human 2026-10-15): (1) a command writing to fd 3 is out of scope (ADR-0014 Decision 1, threat model Known gaps) — no defence; (2) deliberate subversion of the in-shell hooks by confirmed code (a function named `builtin`/`command`, `enable -f`, via a confirmed `source`, which ADR-0013 §4 already makes `session-altering`) is a Known gap — add the bullet; code comments must not claim more; (3) `H`/`V` carry raw `declare -p` text, encoded, compared exactly — no checksums; `H` covers `declare -p PROMPT_COMMAND PS0` (every array element) plus nl-shell's own hook functions and saved user hook; (4) the hooks call no external program — bash parameter expansion only — and every free-text field uses ONE reversible encoding (escape the escape character first); (5) `D n+1` without `S n+1` = nothing ran, session healthy. **Back-at-a-prompt rule (§4.2 third trigger):** from the moment the paste is sent, if no `D` for this command has arrived and the PTY's foreground process group (`os.tcgetpgrp` on the master) has been bash's own pid continuously for 1 s, degrade ("no done record after the shell returned to a prompt") — this covers both a lost `D` after `S` and input bash is still reading (unclosed quote, PS2). Accepted fail-closed limit: a command that runs inside bash itself for over 1 s (`read x`, `wait`, a long builtin-only loop) degrades — say so in build-notes and in the threat model's Known gaps bullet. Do not parse the PTY stream for prompts. / out of scope: everything in spec §6 — raw mode, keystroke forwarding, mirroring to a real terminal, alternate-screen capture pause, SIGWINCH, terminal restore, typed-ahead discard (child-2); REPL / `cli.py` wiring (#78); the policy gate and its fd-3 rejection (#12); sudo passthrough (#13); history write-back (#17); taint and the state block (#11); the output rendering filter; the architecture doc 05 code-layout table.
+- **Difficulty:** high
+- **External dependencies:** `ptyprocess` (gate venv). Real bash ≥ 5.1 on the host (base toolchain).
+- **Test file:** `tests/test_session.py` (new). Standard-library and pytest imports only at module level; import the session module inside tests/fixtures. Runs under `tests/conftest.py` isolation (temporary HOME, guarded sudo) — never mark it `vm` or `sudo`.
+- **Citations expected:** Do must cite path:line on `main` for every change and the spec section (`pty-protocol/v1` §n) each part implements. Normative sources: `docs/design/specs/pty-protocol/v1.md` §1–§5, §Conformance; `docs/design/adr/0014-pty-session-protocol.md` Decisions 1–3; policy-gate v1 §7.5 for the `V` variable list. Test isolation peer: `tests/conftest.py` `isolated_environment`. The earlier attempt `results/issue_10/iteration-v3/patch.diff` is the prior work this child narrows; reusing its parts is fine, but its `tr`/`cksum` hook, CRC-32 `H`/`V`, non-reversible `P` encoding and "D without S → degraded" are the rejected approaches.
+- **Prior-art check (triage cycles):** `git -C ../nl-shell log origin/main -- src/nl_shell pyproject.toml` → scaffold (305d8a4), router (dc784f0), isolation (c45c53e) only; no session code; closed-unmerged PRs touching `src/`: none; issues: #19 (answered), #24/#13 (sudo, later). Prior attempts: this bundle's `iteration-v1..v3` only.
+- **Disposition hint:** new-feature
+<!-- pdca:end child-1 -->
+
+<!-- pdca:child child-2 -->
+- **Slug:** session-terminal-ownership
+- **Kind:** enhancement
+- **Goal:** While a command runs, child-1's session does not own the user's real terminal, so interactive programs, keyboard Ctrl-C and window resizes don't work and keys typed during a command have no defined fate. Implement spec `pty-protocol/v1` §6 on top of child-1's session, with the real terminal injectable (its fds) so tests can use an `os.openpty()` pair: between sending a command and its `D` record, put the real terminal in raw mode and forward every input byte to the PTY master unchanged, never logging, capturing or keeping a forwarded byte (§6.1); copy PTY output to the real terminal and capture it except on the alternate screen — capture stops on `ESC [?1049h` / `ESC [?47h` / `ESC [?1047h` and resumes only on the matching reset (§6.2); on `SIGWINCH` copy the real terminal's size to the PTY (§6.3); control keys travel as bytes (§6.4); restore the real terminal's mode on every exit path (§6.5). Decisions (parent brief, human 2026-10-15): (6) typed-ahead input never joins the next confirmed command — forwarding stops at the `D` record, and before each paste any input bash has not consumed (kernel tty input queue and readline's line buffer) is discarded; (7) capture stops at the first forwarded byte for the rest of that command, and the result carries a flag saying so.
+- **Success criterion:** `python3 -m pytest tests/test_session_terminal.py` passes on the host (real bash, an `os.openpty()` pair as the stand-in real terminal, every wait bounded by a timeout, sessions closed in teardown) and covers: (a) vector 11 driven with `printf` (no `less` dependency): output between `ESC [?1049h` and `ESC [?1049l` (and `ESC [?47h`/`l`) is mirrored to the stand-in terminal but not captured, capture resumes after the matching reset, and a mismatched reset (`?1049h` closed by `?47l`) does not resume capture. (b) vector 10 via forwarding: `sleep 5`, then `\x03` written to the stand-in terminal → `D` with status 130 < 2 s later, session not degraded. (c) a sentinel byte string typed while `cat > /dev/null` runs reaches the program but appears nowhere in the captured output, the result, or any attribute of the session object (scan `vars()` recursively). (d) decision 6, in both default (emacs) and `set -o vi` modes: during `sleep 2`, write `echo INJECTED; ` (no Enter) to the stand-in terminal → the next confirmed `true` has empty output and status 0; and a 200 KB typed-ahead burst does not change the next command's status. (e) decision 7: after the first forwarded byte the result's flag is set and later output is not captured. (f) resizing the stand-in terminal to 40×100 and delivering `SIGWINCH` → `stty size` in the session prints `40 100`. (g) the stand-in terminal's termios attributes are equal before and after a normal run, a run that ends in degraded mode, and a run interrupted by an exception raised mid-command. Threat model §How to exercise it mentions the terminal tests.
+- **Falsifiability:** RED on the shipped C4 gate: for this wave-2 bundle the driver exports `$PDCA_VERIFY_BASE` (the folded branch with child-1), and `run-verify.sh` resets to it (`$PDCA_BASE > $PDCA_VERIFY_BASE > … > $PDCA_BRIEF_BASE`), so the red leg is child-1's tree without this change. Put the terminal-ownership code in a NEW module `src/nl_shell/session_terminal.py` and import it inside each test, so red is a real per-test failure (ModuleNotFoundError) even though `nl_shell.session` exists on the base. GREEN needs real bash and `ptyprocess`.
+- **Repo + branch target:** eduralph/nl-shell @ main
+- **Depends on:** child-1
+- **Ordering note:** wave 2: extends child-1's session (`src/nl_shell/session.py`) and needs its `D` detection for decision 6. The dependency already separates the waves, so no `Conflicts with`.
+- **Surfaces:** data
+- **Scope:** New `src/nl_shell/session_terminal.py` (the forwarding loop, raw-mode/restore, SIGWINCH, alternate-screen capture tracking); the smallest hook in `src/nl_shell/session.py` it needs (e.g. an optional terminal argument to the run method, and the pre-paste discard of decision 6); `.oss-scanner/threat_model.md` §How to exercise it; `tests/test_session_terminal.py`. Change child-1's protocol/sequencing code only if §6 cannot be met otherwise, and say why in build-notes. The pre-paste discard may send bytes before the bracketed paste only while bash is at a prompt (after `E`), never while a command runs (§5.3); if it changes what §5.1 says is sent, update spec §5.1 wording (draft). / out of scope: child-1's process start, rcfile, records, snapshot, degraded-mode rules; REPL / `cli.py` wiring and the hand-off to prompt_toolkit (#78); sudo passthrough and its capture pause (#13, ADR-0015); the output rendering filter (OSC 52 etc. — separate issue, blocks #78); history (#17); taint and the state block (#11).
+- **Difficulty:** high
+- **External dependencies:** `ptyprocess` (gate venv). Real bash ≥ 5.1 on the host (base toolchain).
+- **Test file:** `tests/test_session_terminal.py` (new). Module-level imports: standard library and pytest only.
+- **Citations expected:** Do must cite path:line on the integration branch (child-1 folded onto `main`) for every change and the spec §6 item each part implements. Normative: `docs/design/specs/pty-protocol/v1.md` §5.3, §6; ADR-0014 Decision 4. Peer: child-1's run loop in `src/nl_shell/session.py` (wrap it, don't fork it). Prior attempt: `results/issue_10/iteration-v3/patch.diff` (`_forward`, `_Capture`, alternate-screen tracking) — its typed-ahead behaviour is the rejected approach.
+- **Prior-art check (triage cycles):** no terminal/forwarding code on `origin/main` (`git -C ../nl-shell log origin/main -- src/nl_shell` → scaffold, router, isolation only); prior attempts: this bundle's `iteration-v1..v3` only.
+- **Disposition hint:** new-feature
+<!-- pdca:end child-2 -->

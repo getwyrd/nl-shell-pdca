@@ -1,0 +1,10 @@
+{
+  "mode": "new-pr",
+  "branch": "enhancement/140-persistent-bash-session-core",
+  "pr_url": "https://github.com/eduralph/nl-shell/pull/146",
+  "base": "main",
+  "repo": "eduralph/nl-shell",
+  "by": "Eduard Ralph",
+  "date": "2026-10-15",
+  "id_pending": false
+}

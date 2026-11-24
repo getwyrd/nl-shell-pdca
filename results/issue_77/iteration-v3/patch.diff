@@ -1,0 +1,1064 @@
+diff --git a/src/nl_shell/cli.py b/src/nl_shell/cli.py
+index 934e350..75e2052 100644
+--- a/src/nl_shell/cli.py
++++ b/src/nl_shell/cli.py
+@@ -7,7 +7,7 @@ import sys
+ from collections.abc import Sequence
+ from pathlib import Path
+ 
+-from nl_shell import __version__, config, os_release, targets
++from nl_shell import __version__, config, os_release, targets, teacher_client
+ from nl_shell.input_modes import StatusLine
+ from nl_shell.repl import Repl
+ 
+@@ -30,6 +30,15 @@ def main(
+         metavar="ID",
+         help="use this OS target even if it does not match this OS",
+     )
++    parser.add_argument(
++        "--dev-teacher",
++        nargs="?",
++        const="",
++        default=None,
++        metavar="URL",
++        help="for this session, use the model server at URL (or teacher_url in "
++        "config.toml) instead of the local model socket",
++    )
+     args = parser.parse_args(argv)
+ 
+     root = targets.TARGETS_ROOT if targets_root is None else targets_root
+@@ -41,6 +50,11 @@ def main(
+         settings = config.load(config_file)
+         named = args.target if args.target is not None else settings.target
+         selection = targets.select(named, root, paths)
++        endpoint = teacher_client.choose_endpoint(
++            dev_teacher=args.dev_teacher is not None,
++            flag_url=args.dev_teacher or None,
++            config_url=settings.teacher_url,
++        )
+     except targets.NoMatchingTarget as exc:
+         names = ", ".join(exc.available) or "none"
+         print(
+@@ -50,7 +64,7 @@ def main(
+             file=sys.stderr,
+         )
+         return 1
+-    except (config.ConfigError, targets.TargetError) as exc:
++    except (config.ConfigError, targets.TargetError, teacher_client.EndpointError) as exc:
+         print(f"nl-shell: {exc}", file=sys.stderr)
+         return 1
+ 
+@@ -60,7 +74,11 @@ def main(
+             f"(detected: {selection.detected_id} {selection.detected_version_id}).",
+             file=sys.stderr,
+         )
+-    status_lines = tuple(_constant(line) for line in selection.status_lines())
++    for message in endpoint.messages:
++        print(f"nl-shell: warning: {message}.", file=sys.stderr)
++    status_lines = tuple(
++        _constant(line) for line in (*selection.status_lines(), *endpoint.status_lines())
++    )
+     return Repl.interactive(status_lines=status_lines).run()
+ 
+ 
+diff --git a/src/nl_shell/config.py b/src/nl_shell/config.py
+index a3a9301..4e3f53f 100644
+--- a/src/nl_shell/config.py
++++ b/src/nl_shell/config.py
+@@ -6,8 +6,10 @@ It lives at ``$XDG_CONFIG_HOME/nl-shell/config.toml``. Per the XDG Base Director
+ ignored; a known key with the wrong type, or a file that is not valid TOML, is an error
+ that names the file.
+ 
+-Today the only key is ``target`` (ADR-0023 "Choosing the target"). Later issues (#77)
+-add their keys to ``Config`` and ``load``.
++The keys are ``target`` (ADR-0023 "Choosing the target"), and ``teacher_url`` and
++``teacher_model`` (ADR-0020 §3, #77). ``teacher_url`` is used only with ``--dev-teacher``
++(``nl_shell.teacher_client.choose_endpoint``); ``teacher_model`` is the model name sent to
++the model server, only if set (vLLM needs one; llama-server ignores it).
+ """
+ 
+ from __future__ import annotations
+@@ -28,6 +30,8 @@ class ConfigError(Exception):
+ @dataclass(frozen=True)
+ class Config:
+     target: str | None = None
++    teacher_url: str | None = None
++    teacher_model: str | None = None
+ 
+ 
+ def config_path(env: Mapping[str, str] | None = None) -> Path:
+@@ -57,7 +61,10 @@ def load(path: Path | None = None) -> Config:
+         raise ConfigError(f"{path}: not valid TOML: not valid UTF-8") from None
+     except tomllib.TOMLDecodeError as exc:
+         raise ConfigError(f"{path}: not valid TOML: {exc}") from None
+-    target = doc.get("target")
+-    if target is not None and not isinstance(target, str):
+-        raise ConfigError(f"{path}: `target` must be a string")
+-    return Config(target=target)
++    values = {}
++    for key in ("target", "teacher_url", "teacher_model"):
++        value = doc.get(key)
++        if value is not None and not isinstance(value, str):
++            raise ConfigError(f"{path}: `{key}` must be a string")
++        values[key] = value
++    return Config(**values)
+diff --git a/src/nl_shell/teacher_client.py b/src/nl_shell/teacher_client.py
+new file mode 100644
+index 0000000..fd35051
+--- /dev/null
++++ b/src/nl_shell/teacher_client.py
+@@ -0,0 +1,335 @@
++"""The model client: OpenAI chat completions over HTTP.
++
++ADR-0018 §1–§3 and §5, ADR-0020 §3. It talks to an OpenAI-compatible chat endpoint —
++llama.cpp ``llama-server`` or vLLM, with no API key — either over the local Unix socket
++(the default) or, for a session started with ``--dev-teacher``, over a TCP URL
++(``http://`` or ``https://``).
++
++Endpoint rules (ADR-0020 §3). By default nl-shell talks only to
++``$XDG_RUNTIME_DIR/nl-shell/model.sock``. Any other URL, a loopback TCP port included, is
++used only when the session was started with ``--dev-teacher``; a ``teacher_url`` in
++``config.toml`` on its own is refused with a message and the default socket is used. An
++unset ``XDG_RUNTIME_DIR`` means there is no default socket (we never guess
++``/run/user/<uid>``). A plain ``http://`` URL whose host is not loopback gets a warning: the
++state block would go out in clear.
++
++Responses are rejected, never repaired, and never retried (ADR-0018 §3): a non-2xx status,
++a redirect (never followed: it could send the state block to a host the user didn't
++name), a body over ``MAX_RESPONSE_BYTES``, a body that is not JSON, a missing
++``choices[0].message.content``, a TLS failure (certificate and protocol checks stay on;
++there is no plain-HTTP fallback), or no answer within the timeout. Each rejection is a
++``TeacherError`` whose ``reason`` says why.
++
++The request asks for constrained decoding with a JSON-schema ``response_format``; the
++schema is passed in by the caller, so the one ``proposal/v1`` schema the parser uses is
++also the one the model is held to (ADR-0018 §2). No credential is ever sent.
++"""
++
++from __future__ import annotations
++
++import http.client
++import ipaddress
++import json
++import os
++import socket
++import ssl
++from collections.abc import Mapping, Sequence
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any
++from urllib.parse import urlsplit
++
++# Connect and read timeouts, in seconds. A CPU-only teacher can be slow to answer.
++CONNECT_TIMEOUT_S = 5
++READ_TIMEOUT_S = 120
++# A maximal proposal/v1 answer (`command` is at most 2000 code points) plus the
++# chat-completions envelope fits in this with plenty of room.
++MAX_RESPONSE_BYTES = 64 * 1024
++CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
++SOCKET_DIR = "nl-shell"
++SOCKET_NAME = "model.sock"
++SCHEMA_NAME = "proposal_v1"
++
++MODEL_SERVER_NOT_RUNNING = "the model server isn't running"
++CLEAR_TEXT_WARNING = (
++    "the dev teacher at {url} is plain HTTP on a non-loopback host, so the state block "
++    "goes over the network in clear; use an SSH tunnel to a loopback port, or https://"
++)
++CONFIG_URL_REFUSED = (
++    "config.toml sets teacher_url = {url!r}, but a model endpoint other than the local "
++    "socket is used only with --dev-teacher; using the local model socket"
++)
++
++
++class TeacherError(Exception):
++    """A request to the model server was rejected; ``reason`` says why."""
++
++    def __init__(self, reason: str) -> None:
++        super().__init__(reason)
++        self.reason = reason
++
++
++class ModelServerUnavailable(TeacherError):
++    """Nothing is listening at the endpoint (or there is no default socket)."""
++
++
++class EndpointError(Exception):
++    """The endpoint the user named can't be used; the message says why."""
++
++
++@dataclass(frozen=True)
++class Endpoint:
++    """Where the model server is: a Unix socket path or an http(s) URL."""
++
++    socket_path: Path | None = None
++    url: str | None = None
++
++    @property
++    def is_default(self) -> bool:
++        return self.url is None
++
++    def describe(self) -> str:
++        if self.url is not None:
++            return f"{self.url} (dev teacher)"
++        return f"unix:{self.socket_path} (local model socket)"
++
++
++@dataclass(frozen=True)
++class EndpointDecision:
++    """The session's endpoint (``None``: no default socket) and what to tell the user."""
++
++    endpoint: Endpoint | None
++    messages: tuple[str, ...] = ()
++
++    def status_lines(self) -> tuple[str, ...]:
++        """The ``:status`` lines for this decision (ADR-0020 §4)."""
++        if self.endpoint is None:
++            endpoint = (
++                "endpoint: none (XDG_RUNTIME_DIR is not set, "
++                "so there is no local model socket)"
++            )
++        else:
++            endpoint = f"endpoint: {self.endpoint.describe()}"
++        return (endpoint, "backend: OpenAI chat completions (no API key)")
++
++
++def default_socket(env: Mapping[str, str] | None = None) -> Path | None:
++    """``$XDG_RUNTIME_DIR/nl-shell/model.sock``; ``None`` if that variable is unusable."""
++    env = os.environ if env is None else env
++    runtime = env.get("XDG_RUNTIME_DIR", "")
++    if not runtime or not os.path.isabs(runtime):
++        return None
++    return Path(runtime) / SOCKET_DIR / SOCKET_NAME
++
++
++def is_loopback_host(host: str) -> bool:
++    """``localhost``, ``127.0.0.0/8`` or ``::1``; other names are non-loopback (no DNS)."""
++    if host.lower() == "localhost":
++        return True
++    try:
++        return ipaddress.ip_address(host).is_loopback
++    except ValueError:
++        return False
++
++
++def check_url(url: str) -> None:
++    """Raise ``EndpointError`` unless ``url`` is an ``http(s)://`` URL with a host."""
++    parts = urlsplit(url)
++    if parts.scheme not in ("http", "https") or not parts.hostname:
++        raise EndpointError(f"model endpoint {url!r} must be an http:// or https:// URL")
++    try:
++        parts.port
++    except ValueError:
++        raise EndpointError(f"model endpoint {url!r} has an invalid port") from None
++    if parts.username is not None or parts.password is not None:
++        raise EndpointError(f"model endpoint {url!r} must not carry credentials")
++
++
++def choose_endpoint(
++    dev_teacher: bool,
++    flag_url: str | None,
++    config_url: str | None,
++    env: Mapping[str, str] | None = None,
++) -> EndpointDecision:
++    """The endpoint for this session, by ADR-0020 §3.
++
++    ``dev_teacher`` says whether ``--dev-teacher`` was given; ``flag_url`` is its URL (if
++    any). Without the flag a ``config_url`` is refused (a message) and the default socket
++    is used. Raises ``EndpointError`` for an unusable URL, or for the flag with no URL.
++    """
++    if not dev_teacher:
++        messages = (CONFIG_URL_REFUSED.format(url=config_url),) if config_url else ()
++        socket_path = default_socket(env)
++        endpoint = None if socket_path is None else Endpoint(socket_path=socket_path)
++        return EndpointDecision(endpoint, messages)
++    url = flag_url if flag_url else config_url
++    if not url:
++        raise EndpointError(
++            "--dev-teacher needs a URL: give one after the flag, or set teacher_url in "
++            "config.toml"
++        )
++    check_url(url)
++    parts = urlsplit(url)
++    messages: tuple[str, ...] = ()
++    if parts.scheme == "http" and not is_loopback_host(parts.hostname or ""):
++        messages = (CLEAR_TEXT_WARNING.format(url=url),)
++    return EndpointDecision(Endpoint(url=url), messages)
++
++
++class _UnixHTTPConnection(http.client.HTTPConnection):
++    """HTTP over a Unix stream socket."""
++
++    def __init__(self, path: Path, timeout: float) -> None:
++        super().__init__("localhost", timeout=timeout)
++        self._path = str(path)
++
++    def connect(self) -> None:
++        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++        sock.settimeout(self.timeout)
++        try:
++            sock.connect(self._path)
++        except BaseException:
++            sock.close()
++            raise
++        self.sock = sock
++
++
++class TeacherClient:
++    """One model server endpoint; ``complete`` sends one chat request."""
++
++    def __init__(
++        self,
++        endpoint: Endpoint | None,
++        response_schema: Mapping[str, Any],
++        *,
++        model: str | None = None,
++        connect_timeout: float = CONNECT_TIMEOUT_S,
++        read_timeout: float = READ_TIMEOUT_S,
++        max_response_bytes: int = MAX_RESPONSE_BYTES,
++    ) -> None:
++        if endpoint is not None and endpoint.url is not None:
++            check_url(endpoint.url)
++        self.endpoint = endpoint
++        self._schema = response_schema
++        self._model = model
++        self._connect_timeout = connect_timeout
++        self._read_timeout = read_timeout
++        self._max_bytes = max_response_bytes
++
++    def request_body(self, messages: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
++        """The chat-completions request body for ``messages``."""
++        body: dict[str, Any] = {
++            "messages": [dict(m) for m in messages],
++            "response_format": {
++                "type": "json_schema",
++                "json_schema": {
++                    "name": SCHEMA_NAME,
++                    "strict": True,
++                    "schema": self._schema,
++                },
++            },
++        }
++        if self._model is not None:
++            body["model"] = self._model
++        return body
++
++    def complete(self, messages: Sequence[Mapping[str, Any]]) -> str:
++        """Send ``messages``; return ``choices[0].message.content``.
++
++        Raises ``TeacherError`` (``ModelServerUnavailable`` if nothing is listening).
++        """
++        if self.endpoint is None:
++            raise ModelServerUnavailable(MODEL_SERVER_NOT_RUNNING)
++        payload = json.dumps(self.request_body(messages)).encode("utf-8")
++        conn, path = self._connection()
++        try:
++            try:
++                conn.connect()
++            except (FileNotFoundError, ConnectionRefusedError):
++                raise ModelServerUnavailable(MODEL_SERVER_NOT_RUNNING) from None
++            except ssl.SSLError as exc:
++                raise TeacherError(f"TLS error: {exc}") from None
++            except TimeoutError:
++                raise TeacherError(
++                    f"could not connect within {self._connect_timeout:g} s"
++                ) from None
++            except OSError as exc:
++                raise TeacherError(f"could not connect: {exc}") from None
++            conn.sock.settimeout(self._read_timeout)
++            try:
++                conn.request(
++                    "POST",
++                    path,
++                    body=payload,
++                    headers={
++                        "Content-Type": "application/json",
++                        "Accept": "application/json",
++                    },
++                )
++                response = conn.getresponse()
++                raw = self._read_body(response)
++            except TimeoutError:
++                raise TeacherError(
++                    f"the model server did not answer within {self._read_timeout:g} s"
++                ) from None
++            except ssl.SSLError as exc:
++                raise TeacherError(f"TLS error: {exc}") from None
++            except (http.client.HTTPException, OSError) as exc:
++                raise TeacherError(f"the connection failed: {exc}") from None
++        finally:
++            conn.close()
++        return _content(raw)
++
++    def _connection(self) -> tuple[http.client.HTTPConnection, str]:
++        assert self.endpoint is not None
++        if self.endpoint.url is None:
++            assert self.endpoint.socket_path is not None
++            conn = _UnixHTTPConnection(self.endpoint.socket_path, self._connect_timeout)
++            return conn, CHAT_COMPLETIONS_PATH
++        parts = urlsplit(self.endpoint.url)
++        base = parts.path.rstrip("/")
++        if base.endswith("/v1"):
++            base = base[: -len("/v1")]
++        path = base + CHAT_COMPLETIONS_PATH
++        if parts.scheme == "https":
++            context = ssl.create_default_context()
++            conn = http.client.HTTPSConnection(
++                parts.hostname, parts.port, timeout=self._connect_timeout, context=context
++            )
++        else:
++            conn = http.client.HTTPConnection(
++                parts.hostname, parts.port, timeout=self._connect_timeout
++            )
++        return conn, path
++
++    def _read_body(self, response: http.client.HTTPResponse) -> bytes:
++        status = response.status
++        if 300 <= status < 400:
++            raise TeacherError(
++                f"the model server answered with a redirect ({status}); not followed"
++            )
++        if not 200 <= status < 300:
++            raise TeacherError(
++                f"the model server answered with HTTP {status} {response.reason}"
++            )
++        length = response.getheader("Content-Length")
++        if length is not None and length.isdigit() and int(length) > self._max_bytes:
++            raise TeacherError(f"the response is larger than {self._max_bytes} bytes")
++        raw = response.read(self._max_bytes + 1)
++        if len(raw) > self._max_bytes:
++            raise TeacherError(f"the response is larger than {self._max_bytes} bytes")
++        return raw
++
++
++def _content(raw: bytes) -> str:
++    try:
++        doc = json.loads(raw.decode("utf-8"))
++    except (UnicodeDecodeError, ValueError):
++        raise TeacherError("the response body is not JSON") from None
++    try:
++        content = doc["choices"][0]["message"]["content"]
++    except (KeyError, IndexError, TypeError):
++        raise TeacherError("the response has no choices[0].message.content") from None
++    if not isinstance(content, str):
++        raise TeacherError("choices[0].message.content is not a string")
++    return content
+diff --git a/tests/test_cli.py b/tests/test_cli.py
+index 00e7bb0..0f88bae 100644
+--- a/tests/test_cli.py
++++ b/tests/test_cli.py
+@@ -27,6 +27,7 @@ def test_version_flag(capsys):
+ 
+ 
+ def test_main_runs_the_interactive_repl(monkeypatch, tmp_path):
++    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+     root = tmp_path / "targets"
+     (root / "testos-1").mkdir(parents=True)
+     (root / "testos-1" / "target.toml").write_text(TARGET_TOML, encoding="utf-8")
+@@ -47,4 +48,6 @@ def test_main_runs_the_interactive_repl(monkeypatch, tmp_path):
+     assert seen["status_lines"] == [
+         "target: testos-1 (Test OS 1)",
+         "target matches this OS",
++        "endpoint: none (XDG_RUNTIME_DIR is not set, so there is no local model socket)",
++        "backend: OpenAI chat completions (no API key)",
+     ]
+diff --git a/tests/test_targets.py b/tests/test_targets.py
+index df8a9ee..d2c8213 100644
+--- a/tests/test_targets.py
++++ b/tests/test_targets.py
+@@ -22,6 +22,12 @@ from nl_shell.repl import Repl
+ REPO = Path(__file__).resolve().parents[1]
+ VERSION_LINE = f"nl-shell {nl_shell.__version__}"
+ MISMATCH = "target does not match this OS"
++# The model endpoint lines `cli.main` adds after the target lines (#77). The `start`
++# fixture unsets XDG_RUNTIME_DIR, so there is no local model socket.
++MODEL_LINES = (
++    "endpoint: none (XDG_RUNTIME_DIR is not set, so there is no local model socket)\n"
++    "backend: OpenAI chat completions (no API key)\n"
++)
+ 
+ UBUNTU_2604 = """\
+ id = "ubuntu-26.04"
+@@ -128,6 +134,8 @@ def start(fake, monkeypatch, capsys):
+     the result #12 will read directly, not only through printed text.
+     """
+ 
++    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
++
+     def run(argv, *lines):
+         from nl_shell import targets
+ 
+@@ -180,6 +188,7 @@ def test_exact_match_is_active_and_matching(fake, start):
+         f"{VERSION_LINE}\n"
+         "target: ubuntu-26.04 (Ubuntu 26.04 LTS)\n"
+         "target matches this OS\n"
++        f"{MODEL_LINES}"
+     )
+     sel = run.selection
+     assert sel.target.id == "ubuntu-26.04"
+@@ -236,6 +245,7 @@ def test_named_target_on_another_os_starts_marked_not_matching(fake, start):
+         f"{VERSION_LINE}\n"
+         "target: ubuntu-26.04 (Ubuntu 26.04 LTS)\n"
+         "target does not match this OS (detected: debian 13)\n"
++        f"{MODEL_LINES}"
+     )
+     sel = run.selection
+     assert sel.target.id == "ubuntu-26.04"
+@@ -544,6 +554,7 @@ def test_unreadable_etc_os_release_with_named_target_starts_not_matching(fake, s
+         f"{VERSION_LINE}\n"
+         "target: ubuntu-26.04 (Ubuntu 26.04 LTS)\n"
+         "target does not match this OS (detected: unknown unknown)\n"
++        f"{MODEL_LINES}"
+     )
+     sel = run.selection
+     assert sel.matches is False
+@@ -685,11 +696,13 @@ def test_status_lines_do_not_leak_between_runs(fake, start):
+         f"{VERSION_LINE}\n"
+         "target: ubuntu-26.04 (Ubuntu 26.04 LTS)\n"
+         "target matches this OS\n"
++        f"{MODEL_LINES}"
+     )
+     assert second.out == (
+         f"{VERSION_LINE}\n"
+         "target: testos-1 (Test OS 1)\n"
+         "target does not match this OS (detected: ubuntu 26.04)\n"
++        f"{MODEL_LINES}"
+     )
+     # And a Repl built afterwards, with no target, shows neither.
+     out = io.StringIO()
+diff --git a/tests/test_teacher_client.py b/tests/test_teacher_client.py
+new file mode 100644
+index 0000000..d7eac27
+--- /dev/null
++++ b/tests/test_teacher_client.py
+@@ -0,0 +1,530 @@
++"""The model client and the endpoint rules (#77; ADR-0018 §1–§3, §5; ADR-0020 §3–§4).
++
++Every server here is a small in-process ``http.server`` fake, on ``127.0.0.1`` (port 0) or
++on a Unix socket in a short temporary directory, so nothing reaches the network or a real
++model. The new modules are imported inside each test: the C4 red leg reverts them, and a
++module-level import would stop the file from loading instead of making it fail.
++"""
++
++from __future__ import annotations
++
++import http.server
++import json
++import os
++import shutil
++import socket
++import socketserver
++import tempfile
++import threading
++import time
++from pathlib import Path
++
++import pytest
++
++from nl_shell import cli
++
++# A stand-in schema object. The client sends whatever schema it is given, unchanged; the
++# test checks that it arrives as the request's response_format schema.
++SCHEMA = {
++    "type": "object",
++    "properties": {"command": {"type": "string"}, "risk": {"type": "string"}},
++    "required": ["command", "risk"],
++    "additionalProperties": False,
++}
++PROPOSAL = {"command": "ls -la", "risk": "read_only"}
++MESSAGES = [
++    {"role": "system", "content": "You propose one bash command."},
++    {"role": "user", "content": "list the files here"},
++]
++
++TARGET_TOML = """\
++id = "testos-1"
++display_name = "Test OS 1"
++shell = "bash"
++package_owner_query = ["owner-of"]
++
++[os_release]
++ID = "testos"
++VERSION_ID = "1"
++
++[sudo]
++implementation = "test-sudo"
++version = "1.0"
++"""
++
++
++def chat_body(content):
++    return json.dumps(
++        {"choices": [{"index": 0, "message": {"role": "assistant", "content": content}}]}
++    ).encode("utf-8")
++
++
++class Reply:
++    """What the fake server answers: status, headers, body, and an optional delay."""
++
++    def __init__(self, status=200, body=b"", headers=None, delay=0.0):
++        self.status = status
++        self.body = body
++        self.headers = headers or {}
++        self.delay = delay
++
++
++def make_handler(fake):
++    class Handler(http.server.BaseHTTPRequestHandler):
++        def do_POST(self):
++            length = int(self.headers.get("Content-Length") or 0)
++            body = self.rfile.read(length)
++            fake.requests.append(
++                {
++                    "method": "POST",
++                    "path": self.path,
++                    "headers": {k.lower(): v for k, v in self.headers.items()},
++                    "body": body,
++                }
++            )
++            reply = fake.reply
++            if reply.delay:
++                fake.release.wait(reply.delay)
++            try:
++                self.send_response(reply.status)
++                for name, value in reply.headers.items():
++                    self.send_header(name, value)
++                self.send_header("Content-Length", str(len(reply.body)))
++                self.end_headers()
++                self.wfile.write(reply.body)
++            except OSError:
++                pass  # the client gave up first (the timeout test)
++
++        def do_GET(self):
++            fake.requests.append({"method": "GET", "path": self.path})
++            self.send_response(404)
++            self.end_headers()
++
++        def log_message(self, *args):
++            pass
++
++        def log_error(self, *args):
++            fake.errors.append(args)
++
++    return Handler
++
++
++class _TCPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
++    daemon_threads = True
++    block_on_close = False
++
++
++class _UnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
++    daemon_threads = True
++    block_on_close = False
++
++
++class FakeServer:
++    def __init__(self, reply=None, unix_path=None):
++        self.reply = reply or Reply(body=chat_body(json.dumps(PROPOSAL)))
++        self.requests = []
++        self.errors = []
++        self.release = threading.Event()
++        handler = make_handler(self)
++        if unix_path is None:
++            self.server = _TCPServer(("127.0.0.1", 0), handler)
++            self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
++            self.port = self.server.server_address[1]
++        else:
++            self.server = _UnixServer(str(unix_path), handler)
++            self.url = None
++        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
++        self.thread.start()
++
++    def stop(self):
++        self.release.set()
++        self.server.shutdown()
++        self.server.server_close()
++        self.thread.join(timeout=2)
++
++
++@pytest.fixture
++def servers():
++    started = []
++
++    def start(reply=None, unix_path=None):
++        fake = FakeServer(reply, unix_path)
++        started.append(fake)
++        return fake
++
++    yield start
++    for fake in started:
++        fake.stop()
++
++
++@pytest.fixture
++def runtime_dir(monkeypatch):
++    """A short XDG_RUNTIME_DIR (a Unix socket path must fit in sun_path)."""
++    path = Path(tempfile.mkdtemp(prefix="nls-"))
++    monkeypatch.setenv("XDG_RUNTIME_DIR", str(path))
++    yield path
++    shutil.rmtree(path, ignore_errors=True)
++
++
++def default_socket_path(runtime):
++    (runtime / "nl-shell").mkdir(exist_ok=True)
++    return runtime / "nl-shell" / "model.sock"
++
++
++def write_config(text):
++    path = Path(os.environ["XDG_CONFIG_HOME"]) / "nl-shell" / "config.toml"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(text, encoding="utf-8")
++
++
++def tcp_client(url, **kwargs):
++    from nl_shell import teacher_client
++
++    return teacher_client.TeacherClient(teacher_client.Endpoint(url=url), SCHEMA, **kwargs)
++
++
++# (a) a valid response --------------------------------------------------------------------
++
++
++def test_valid_response_returns_the_content_and_the_request_is_the_chat_api(servers):
++    fake = servers()
++    content = tcp_client(fake.url).complete(MESSAGES)
++    assert json.loads(content) == PROPOSAL
++    assert len(fake.requests) == 1
++    request = fake.requests[0]
++    assert request["method"] == "POST"
++    assert request["path"] == "/v1/chat/completions"
++    assert "authorization" not in request["headers"]
++    body = json.loads(request["body"])
++    assert body["messages"] == MESSAGES
++    assert body["response_format"]["type"] == "json_schema"
++    assert body["response_format"]["json_schema"]["schema"] == SCHEMA
++    assert "model" not in body
++
++
++def test_teacher_model_from_config_is_sent_only_when_set(servers):
++    from nl_shell import config
++
++    fake = servers()
++    write_config('teacher_model = "m1"\n')
++    settings = config.load()
++    assert settings.teacher_model == "m1"
++    tcp_client(fake.url, model=settings.teacher_model).complete(MESSAGES)
++    assert json.loads(fake.requests[0]["body"])["model"] == "m1"
++
++    write_config("")
++    tcp_client(fake.url, model=config.load().teacher_model).complete(MESSAGES)
++    assert "model" not in json.loads(fake.requests[1]["body"])
++
++
++def test_config_rejects_a_non_string_teacher_url():
++    from nl_shell import config
++
++    write_config("teacher_url = 5\n")
++    with pytest.raises(config.ConfigError, match="teacher_url"):
++        config.load()
++
++
++# (b) rejected, never repaired, never retried -------------------------------------------
++
++
++@pytest.mark.parametrize(
++    ("reply", "reason"),
++    [
++        (Reply(status=500, body=b"boom"), "HTTP 500"),
++        (Reply(status=404, body=b""), "HTTP 404"),
++        (Reply(body=b"<html>not json</html>"), "not JSON"),
++        (Reply(body=b'{"id": "x"}'), "choices[0].message.content"),
++        (Reply(body=b'{"choices": []}'), "choices[0].message.content"),
++        (Reply(body=b'{"choices": [{"message": {}}]}'), "choices[0].message.content"),
++        (Reply(body=chat_body(None)), "not a string"),
++        (Reply(body=chat_body("x" * (64 * 1024))), "larger than"),
++    ],
++)
++def test_bad_responses_are_rejected_with_a_reason_and_no_retry(servers, reply, reason):
++    from nl_shell import teacher_client
++
++    fake = servers(reply)
++    with pytest.raises(teacher_client.TeacherError) as exc:
++        tcp_client(fake.url).complete(MESSAGES)
++    assert reason in exc.value.reason
++    assert len(fake.requests) == 1
++
++
++def test_an_oversize_body_without_a_length_is_cut_off_at_the_cap(servers):
++    from nl_shell import teacher_client
++
++    class Chunked(http.server.BaseHTTPRequestHandler):
++        protocol_version = "HTTP/1.1"
++        sent = []
++
++        def do_POST(self):
++            self.rfile.read(int(self.headers.get("Content-Length") or 0))
++            self.send_response(200)
++            self.send_header("Transfer-Encoding", "chunked")
++            self.end_headers()
++            chunk = b"x" * 4096
++            try:
++                for _ in range(1024):  # 4 MiB if nobody stops reading
++                    self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
++                    Chunked.sent.append(len(chunk))
++            except OSError:
++                pass
++
++        def log_message(self, *args):
++            pass
++
++    server = _TCPServer(("127.0.0.1", 0), Chunked)
++    thread = threading.Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    try:
++        url = f"http://127.0.0.1:{server.server_address[1]}"
++        with pytest.raises(teacher_client.TeacherError) as exc:
++            tcp_client(url, max_response_bytes=1024).complete(MESSAGES)
++        assert "larger than 1024 bytes" in exc.value.reason
++    finally:
++        server.shutdown()
++        server.server_close()
++        thread.join(timeout=2)
++
++
++def test_a_redirect_is_not_followed(servers):
++    from nl_shell import teacher_client
++
++    target = servers()
++    redirecting = servers(
++        Reply(status=307, headers={"Location": target.url + "/v1/chat/completions"})
++    )
++    with pytest.raises(teacher_client.TeacherError) as exc:
++        tcp_client(redirecting.url).complete(MESSAGES)
++    assert "redirect" in exc.value.reason
++    assert len(redirecting.requests) == 1
++    assert target.requests == []
++
++
++def test_no_answer_within_the_read_timeout_is_rejected(servers):
++    from nl_shell import teacher_client
++
++    assert teacher_client.CONNECT_TIMEOUT_S == 5
++    assert teacher_client.READ_TIMEOUT_S == 120
++    started = time.monotonic()
++    fake = servers(Reply(body=chat_body(json.dumps(PROPOSAL)), delay=2.0))
++    with pytest.raises(teacher_client.TeacherError) as exc:
++        tcp_client(fake.url, read_timeout=0.5).complete(MESSAGES)
++    assert "did not answer within 0.5 s" in exc.value.reason
++    assert len(fake.requests) == 1
++    fake.stop()
++    assert time.monotonic() - started < 2.0
++
++
++def test_https_to_a_plain_http_server_fails_on_tls_with_no_fallback(servers):
++    from nl_shell import teacher_client
++
++    fake = servers()
++    with pytest.raises(teacher_client.TeacherError) as exc:
++        tcp_client(f"https://127.0.0.1:{fake.port}", read_timeout=2).complete(MESSAGES)
++    assert exc.value.reason.startswith("TLS error")
++    assert fake.requests == []
++
++
++# (c) endpoint rules ---------------------------------------------------------------------
++
++
++def test_default_endpoint_is_the_runtime_socket(servers, runtime_dir):
++    from nl_shell import teacher_client
++
++    fake = servers(unix_path=default_socket_path(runtime_dir))
++    decision = teacher_client.choose_endpoint(False, None, None)
++    assert decision.messages == ()
++    assert decision.endpoint.socket_path == runtime_dir / "nl-shell" / "model.sock"
++    content = teacher_client.TeacherClient(decision.endpoint, SCHEMA).complete(MESSAGES)
++    assert json.loads(content) == PROPOSAL
++    assert fake.requests[0]["path"] == "/v1/chat/completions"
++    assert json.loads(fake.requests[0]["body"])["messages"] == MESSAGES
++
++
++def test_config_url_without_the_flag_is_refused_and_gets_nothing(servers, runtime_dir):
++    from nl_shell import teacher_client
++
++    fake = servers()
++    decision = teacher_client.choose_endpoint(False, None, fake.url)
++    assert decision.endpoint.url is None
++    assert decision.endpoint.socket_path == runtime_dir / "nl-shell" / "model.sock"
++    assert len(decision.messages) == 1
++    assert "--dev-teacher" in decision.messages[0]
++    assert fake.url in decision.messages[0]
++    with pytest.raises(teacher_client.ModelServerUnavailable):
++        teacher_client.TeacherClient(decision.endpoint, SCHEMA).complete(MESSAGES)
++    assert fake.requests == []
++
++
++def test_config_url_with_the_flag_is_used(servers, runtime_dir):
++    from nl_shell import teacher_client
++
++    fake = servers()
++    decision = teacher_client.choose_endpoint(True, None, fake.url)
++    assert decision.endpoint.url == fake.url
++    assert decision.messages == ()  # loopback: no clear-text warning
++    teacher_client.TeacherClient(decision.endpoint, SCHEMA).complete(MESSAGES)
++    assert len(fake.requests) == 1
++
++
++def test_flag_url_is_used_over_the_config_url(servers, runtime_dir):
++    from nl_shell import teacher_client
++
++    fake = servers()
++    other = servers()
++    decision = teacher_client.choose_endpoint(True, fake.url, other.url)
++    assert decision.endpoint.url == fake.url
++    teacher_client.TeacherClient(decision.endpoint, SCHEMA).complete(MESSAGES)
++    assert len(fake.requests) == 1
++    assert other.requests == []
++
++
++@pytest.mark.parametrize(
++    ("url", "warned"),
++    [
++        ("http://192.168.1.20:8080", True),
++        ("http://teacher.lan:8080", True),
++        ("http://127.0.0.1:8080", False),
++        ("http://127.3.4.5:8080", False),
++        ("http://localhost:8080", False),
++        ("http://[::1]:8080", False),
++        ("https://192.168.1.20:8443", False),
++    ],
++)
++def test_plain_http_to_a_non_loopback_host_is_warned(monkeypatch, url, warned):
++    from nl_shell import teacher_client
++
++    calls = []
++    monkeypatch.setattr(socket, "create_connection", lambda *a, **k: calls.append(a))
++    decision = teacher_client.choose_endpoint(True, url, None)
++    assert decision.endpoint.url == url
++    assert bool(decision.messages) is warned
++    if warned:
++        assert "SSH tunnel" in decision.messages[0]
++        assert "https://" in decision.messages[0]
++    assert calls == []
++
++
++def test_no_runtime_dir_means_no_default_socket(monkeypatch):
++    from nl_shell import teacher_client
++
++    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
++    decision = teacher_client.choose_endpoint(False, None, None)
++    assert decision.endpoint is None
++    with pytest.raises(teacher_client.ModelServerUnavailable) as exc:
++        teacher_client.TeacherClient(decision.endpoint, SCHEMA).complete(MESSAGES)
++    assert exc.value.reason == "the model server isn't running"
++
++
++def test_absent_default_socket_says_the_model_server_is_not_running(runtime_dir):
++    from nl_shell import teacher_client
++
++    decision = teacher_client.choose_endpoint(False, None, None)
++    with pytest.raises(teacher_client.ModelServerUnavailable) as exc:
++        teacher_client.TeacherClient(decision.endpoint, SCHEMA).complete(MESSAGES)
++    assert exc.value.reason == "the model server isn't running"
++
++
++@pytest.mark.parametrize("url", ["ftp://host/x", "teacher.lan:8080", "http://u:p@host/"])
++def test_an_unusable_flag_url_is_an_error(url):
++    from nl_shell import teacher_client
++
++    with pytest.raises(teacher_client.EndpointError):
++        teacher_client.choose_endpoint(True, url, None)
++
++
++# cli wiring: (c) refusal message, (e) :status, (f) no TCP on the default path ----------
++
++
++@pytest.fixture
++def cli_env(tmp_path, monkeypatch):
++    """A matching target and os-release (as #92's tests do) and a captured Repl."""
++    root = tmp_path / "targets"
++    (root / "testos-1").mkdir(parents=True)
++    (root / "testos-1" / "target.toml").write_text(TARGET_TOML, encoding="utf-8")
++    release = tmp_path / "os-release"
++    release.write_text('ID=testos\nVERSION_ID="1"\n', encoding="utf-8")
++    seen = {}
++
++    def interactive(cls, status_lines=()):
++        seen["status_lines"] = status_lines
++        lines = iter(["list the files here", ":status"])
++
++        def read(_prompt):
++            try:
++                return next(lines)
++            except StopIteration:
++                raise EOFError from None
++
++        import io
++
++        out = io.StringIO()
++        seen["out"] = out
++        return cls(read, out, status_lines)
++
++    monkeypatch.setattr(cli.Repl, "interactive", classmethod(interactive))
++
++    def run(argv):
++        return cli.main(argv, targets_root=root, os_release_paths=[release])
++
++    return run, seen
++
++
++def test_status_shows_the_dev_teacher_endpoint_and_backend(cli_env, capsys):
++    run, seen = cli_env
++    assert run(["--dev-teacher", "http://127.0.0.1:8080"]) == 0
++    lines = [line() for line in seen["status_lines"]]
++    assert "endpoint: http://127.0.0.1:8080 (dev teacher)" in lines
++    assert any(line.startswith("backend: OpenAI chat completions") for line in lines)
++    assert "endpoint: http://127.0.0.1:8080 (dev teacher)" in seen["out"].getvalue()
++    assert capsys.readouterr().err == ""
++
++
++def test_status_shows_the_default_socket(cli_env, runtime_dir):
++    run, seen = cli_env
++    assert run([]) == 0
++    lines = [line() for line in seen["status_lines"]]
++    sock = runtime_dir / "nl-shell" / "model.sock"
++    assert f"endpoint: unix:{sock} (local model socket)" in lines
++
++
++def test_cli_warns_about_clear_text_to_a_non_loopback_host(cli_env, capsys):
++    run, _seen = cli_env
++    assert run(["--dev-teacher", "http://192.168.1.20:8080"]) == 0
++    err = capsys.readouterr().err
++    assert "SSH tunnel" in err and "http://192.168.1.20:8080" in err
++
++
++def test_cli_flag_with_no_url_anywhere_is_an_error(cli_env, capsys):
++    run, _seen = cli_env
++    assert run(["--dev-teacher"]) == 1
++    assert "--dev-teacher needs a URL" in capsys.readouterr().err
++
++
++def test_config_url_without_the_flag_makes_no_tcp_connection(
++    cli_env, runtime_dir, monkeypatch, capsys
++):
++    run, seen = cli_env
++    write_config('teacher_url = "http://127.0.0.1:9"\n')
++    connects = []
++    real_connect = socket.socket.connect
++    real_create = socket.create_connection
++
++    def record_connect(self, address):
++        connects.append((self.family, address))
++        return real_connect(self, address)
++
++    def record_create(address, *args, **kwargs):
++        connects.append((socket.AF_INET, address))
++        return real_create(address, *args, **kwargs)
++
++    monkeypatch.setattr(socket.socket, "connect", record_connect)
++    monkeypatch.setattr(socket, "create_connection", record_create)
++    assert run([]) == 0
++    err = capsys.readouterr().err
++    assert "teacher_url" in err and "--dev-teacher" in err
++    lines = [line() for line in seen["status_lines"]]
++    assert any(line.startswith("endpoint: unix:") for line in lines)
++    assert [c for c in connects if c[0] in (socket.AF_INET, socket.AF_INET6)] == []

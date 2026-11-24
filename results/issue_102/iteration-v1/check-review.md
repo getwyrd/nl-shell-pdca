@@ -1,0 +1,23 @@
+Review terminal ownership during confirmed commands: raw input forwarding, output capture boundaries, resize propagation, restoration, and typed-ahead input disposal.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The forwarding window and capture rules are explicit and testable; target/docs/design/specs/pty-protocol/v1.md:430 and target/docs/design/specs/pty-protocol/v1.md:443. |
+| C2 Reproduction (red pre-fix) | PASS | Frozen evidence shows all 15 terminal tests fail without production changes, principally on the absent terminal module; gate-logs/C4-verify.log:15. |
+| C3 Change | PASS | The patch stays within terminal ownership, its session integration, and associated normative documentation; target/src/nl_shell/session.py:714 and target/src/nl_shell/session_terminal.py:101. |
+| C4 Verification (red→green) | PASS | Frozen C4 output records 15 green tests and 15 red failures; independent pytest execution was unavailable because this reviewer host lacks pytest, so this verdict rests on the captured run, not an independent reproduction; gate-logs/C4-verify.log:10. |
+| C5 Causal adequacy | NEEDS-HUMAN | Accept the residual drain race for v1 or require the acknowledgement back-channel — delayed forwarding can still prepend input to the next confirmed command; target/docs/design/specs/pty-protocol/v1.md:438 and target/.oss-scanner/threat_model.md:212. |
+| T1 Structure | PASS | Terminal mechanics remain in a separate standard-library module and reuse the existing protocol loop; target/src/nl_shell/session_terminal.py:29 and target/src/nl_shell/session.py:732. |
+| T2 Shape | PASS | Threat-model changes describe the remaining injection window and how terminal tests exercise the change; target/.oss-scanner/threat_model.md:212 and target/.oss-scanner/threat_model.md:232; frozen touch-check agrees, gate-logs/T2-threat-model.log:10. |
+| T3 Runtime | PASS | Frozen full-suite output shows 496 passed with one forkpty deprecation warning; independent suite execution could not start without pytest; gate-logs/T3-suite.log:10. |
+| T4 Contribution | N/A | Contribution artifacts are intentionally absent at Check; substantive audit re-runs at publish; gate-logs/T4-contribution.log:10. |
+| T5 Judgment | NEEDS-HUMAN [impl] | Output backpressure must preserve deadline and control-channel progress — mirror retries indefinitely on a full output destination, preventing timeout handling and D detection; independently reproduced with a full nonblocking pipe, target/src/nl_shell/session_terminal.py:239. |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Confirm decisions 6/7 and strict alternate-screen pairing meet the intended user experience, and clear affected-path prior art against merged and closed/rejected work — the bundle has only a synthetic base commit and no closed-work evidence; target/docs/design/specs/pty-protocol/v1.md:430, target/docs/design/specs/pty-protocol/v1.md:443, brief.md:15 and brief.md:20. |
+
+Evidence limits: `python3 -m pytest tests/test_session.py tests/test_session_terminal.py -q` in the target failed before collection with `No module named pytest`; therefore no stash/red/restore/green mutation was attempted. All four frozen logs were read. The C4 and T3 logs show actual tests, not a code-read or substituted tool; the reviewer-host limitation does not establish an unmet dependency in those gate runs. `git diff --check` passed. Local affected-path history for the new module and test is empty; the sole local commit is the synthetic pre-fix base, so independent merged/closed prior-art confirmation is unavailable. No INTEGRATION.md is supplied in the target.
+
+Independent backpressure reproduction: a standard-library-only subprocess imported the target terminal module, filled an `os.pipe()` with its write end nonblocking until `BlockingIOError`, and called `Terminal(read_fd, write_fd).own(read_fd).mirror(b'output')`. The subprocess exceeded a 0.5-second bound and was terminated by the parent. The retry loop has no deadline or control callback; a blocking terminal output fd can likewise block at `os.write`. Queue mirrored output and service it through the session selector with bounded buffering and deadline/control progress; add a regression with a destination that stops consuming output. This is separate from the brief's accepted-for-review input-drain race.
+
+For human acceptance after that correction, exercise the existing terminal tests with real bash and ptyprocess using `python3 -m pytest tests/test_session.py tests/test_session_terminal.py`; inspect the documented delayed-D race before accepting v1. REPL integration remains outside this patch's scope.
+
+<!-- pdca:leaf-complete -->

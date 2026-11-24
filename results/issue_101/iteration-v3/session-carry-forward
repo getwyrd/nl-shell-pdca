@@ -1,0 +1,3 @@
+The security holes and product-fit problems need a planning review.
+Security holes (live-reproduced in round 3, see SUMMARY §6): PS1 re-setting __nls_ps0 so ran commands report "nothing ran" with output hidden and no degrade; a DEBUG trap changing H-covered state after the snapshot (rebind CR / set -H) so the next confirmed command runs altered; `set +o emacs` breaking bracketed paste; `stty intr '|'` turning `|` into SIGINT (Critical) — termios not covered by the snapshot.
+Product fit: the 1 s back-at-a-prompt rule degrades common `$(...)` commands (`out=$(make)`), and recovery via restart kills the running command.

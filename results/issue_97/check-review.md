@@ -1,0 +1,25 @@
+Review the documentation immutability check and its isolated Python execution, preventing frozen-record edits and PR-supplied modules from bypassing CI.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The freeze policy and permitted transitions are explicit and testable; the authoritative immutability commitment is grounded at target/docs/design/adr/0001-record-architecture-decisions.md:22 and target/docs/design/README.md:18. |
+| C2 Reproduction (red pre-fix) | PASS | Independently reproduced the current iteration's bypass: a real Git repository with an edited Accepted ADR and planted re.py returns success without isolation (review-replay.log:1); the full pre-feature test failure is also captured at gate-logs/C4-verify.log:1384. |
+| C3 Change | PASS | The five affected files fit the authorized freeze-check scope; both CI execution branches isolate imports, and the regression tests cover the base-copy and bootstrap paths (target/.github/workflows/docs-checks.yml:39; target/tests/test_docs_checks.py:621). |
+| C4 Verification (red→green) | PASS | Independent Python/Git replay changes the shadowing attack from exit 0 to exit 1 with the offending path, including isolated script execution (review-replay.log:1); frozen gate evidence records 71 green and 71 red tests without collection errors (gate-logs/C4-verify.log:12, :1384). |
+| C5 Causal adequacy | PASS | Removing the checkout from Python's import search addresses the demonstrated execution takeover directly; no capability guard masks a load-time cause (target/.github/workflows/docs-checks.yml:28; review-replay.log:4). |
+| T1 Structure | PASS | The stdlib checker remains outside the shipped runtime package, with Git access, status parsing and comparisons separated; tests exercise subprocess behavior (target/scripts/docs_checks.py:150, :205; target/tests/test_docs_checks.py:19). |
+| T2 Shape | PASS | The workflow has an unfiltered pull_request trigger and read-only permissions, with isolated base-script execution; the frozen scanner reports no security-relevant path under its configured classification (target/.github/workflows/docs-checks.yml:8; gate-logs/T2-threat-model.log:10). |
+| T3 Runtime | PASS | The captured full-suite execution reports 106 passing tests; this is logged evidence, not a local suite rerun, because local Python lacks pytest (gate-logs/T3-suite.log:13). |
+| T4 Contribution | N/A | Contribution artifacts are intentionally absent at Check; the substantive audit is deferred to the mandatory publish rerun (gate-logs/T4-contribution.log:10). |
+| T5 Judgment | NEEDS-HUMAN | Confirm affected-path prior art in merged history and closed/rejected work before accepting this approach — the supplied target has one synthetic base commit, no remote, and no tracker evidence, so that investigation cannot establish prior decisions (target/scripts/docs_checks.py:1; target/tests/test_docs_checks.py:1). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Confirm the recorded policy choices and observe the docs job on the actual draft PR — local shell execution does not establish GitHub event/ref wiring or repository enforcement; inspect the docs job for a clean PR and test an Accepted ADR body edit on a disposable PR, expecting failure naming its path (target/.github/workflows/docs-checks.yml:9, :33; target/docs/design/adr/README.md:11). |
+
+Evidence and limits:
+
+- Source citations above were checked against the supplied patched target. No stale-target condition was found. The target was not modified.
+- Local `python3 -m pytest --version` reports `No module named pytest`; consequently no full-suite stash/red/unstash/green rerun was performed. The complete frozen gate logs were read instead. Their red leg removes the new checker and produces ordinary test failures, not collection failures. The independent iteration-specific replay uses the real installed Python and Git, with no substitute implementation or tool shim; its output is in `review-replay.log` and its repository is `review-replay/`.
+- The replay demonstrated root-level module shadowing without `-I`, rejection with stdin execution under `-I`, and rejection with script execution under `-I`. It does not claim to reproduce GitHub Actions hosting. The brief lists no external dependencies, but its required draft-PR CI outcome is not present in the frozen evidence and remains part of validation.
+- Affected-path history was queried for scripts/docs_checks.py, tests/test_docs_checks.py, .github/workflows/docs-checks.yml and both changed indexes. Only synthetic commit `3800ad7` was available; `git remote -v` returned no entries. No INTEGRATION.md is supplied, so additional project-specific human-only items cannot be enumerated from this bundle.
+- The bootstrap fallback is explicitly authorized when the base lacks the checker; it is not a symptom guard. Editing the workflow itself remains the explicitly excluded repository-settings concern. No builder-fixable defect was established in this review.
+
+<!-- pdca:leaf-complete -->

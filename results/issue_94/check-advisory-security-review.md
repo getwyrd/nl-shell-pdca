@@ -1,0 +1,14 @@
+# Security review (advisory) — issue 94 / architecture-os-targets
+
+**Attacker-reachable inputs touched: none.** The patch changes only Markdown under `docs/design/architecture/` and adds a document-assertion test (`tests/test_architecture_targets.py`) that reads those Markdown files from the repo. No runtime code changes, so no item on the threat model's "Where untrusted input enters" list (command output, model proposals, downloaded weights at install time, training data, and so on) reaches a changed line.
+
+What I checked:
+
+- **The design text for downloaded weights (threat model input 9; Critical: "a tampered model or binary is installed without detection").** The new text in `docs/design/architecture/07-deployment-view.md` (§7.1, "Model integrity (planned)") and `05-building-block-view.md` (the "REPL target inputs" and "Installer" bullets) matches ADR-0023 lines 61–70 (`target/docs/design/adr/0023-os-targets.md:61-70`): SHA-256 verified against `model.toml` before use, the REPL refuses weights whose hash doesn't match, downloads only at install or explicit update, and adapters bound to target plus base-weight hash. The patch removes no integrity, signing or verification wording. The only removed security-adjacent line (`10-quality-risks-glossary.md`, sudo-rs row) is reworded to "target sudo updates (sudo-rs for `ubuntu-26.04`)", which keeps the same check. No weakening.
+- **Built vs. planned claims against the code.** The doc says `sensitive.toml` and `model.toml` are not read yet, and that a mismatched named target only warns today. That matches the source: `src/nl_shell/gate/sensitive.py:3` still uses a built-in list until #190, nothing under `src/` reads `model.toml`, and `src/nl_shell/targets.py:32,276` only records `MISMATCH_REASON`. The policy-gate rule ("on a mismatched named target, every command must need confirmation") is kept and correctly marked as planned. So the doc does not tell a reviewer a protection exists when it doesn't.
+- **The new test.** It reads fixed repo paths (`Path(__file__).resolve().parents[1] / "docs/design/architecture"`) and does string checks. No untrusted input, no subprocess, no network.
+- **Gates.** T2 (threat-model touch) passed with "no security-relevant path touched", and that's correct for a docs-only change. C4 is `unverifiable` because there's no production change to revert, which is expected for a docs-only patch and is not a security problem.
+
+No findings. One note, not a finding: the threat model's component list says "the installer (signed weights, …)" (`target/.oss-scanner/threat_model.md:211`), while ADR-0023 and this patch describe hash checking against a manifest shipped in the package, not a signature. That wording gap is older than this patch and the patch doesn't change it, so I'm not raising it here.
+
+<!-- pdca:leaf-complete -->

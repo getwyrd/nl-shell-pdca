@@ -1,0 +1,26 @@
+Add a persistent bash PTY session with fd-3 completion and state records, confirmed-byte input, bounded output capture, and sticky degradation/restart.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The brief defines executable conformance cases and explicit exclusions for this session-only increment; the target specifies sequencing and fail-closed behavior (brief.md:3; target/docs/design/specs/pty-protocol/v1.md:163). |
+| C2 Reproduction (red pre-fix) | PASS | Independently stashing the two new production modules makes the Session import fail; the frozen gate additionally records all 65 tests failing individually without the production change (gate-logs/C4-verify.log:14; target/tests/test_session.py:26). |
+| C3 Change | PASS | The changed paths fit the authorized session, protocol, dependency, tests and documentation scope; CLI and REPL remain untouched (brief.md:9; target/src/nl_shell/session.py:11; target/pyproject.toml:16). |
+| C4 Verification (red→green) | PASS | Frozen evidence shows 65 green tests and 65 pre-fix failures; independent restored-source execution confirms real bash commands work after the missing-module red; full pytest was not rerun locally because pytest is absent (gate-logs/C4-verify.log:10; target/tests/test_session.py:124). |
+| C5 Causal adequacy | NEEDS-HUMAN | Decide whether failing closed on absent Readline framing is the acceptable causal remedy, or whether capture should remove its dependency on that capability; the new runtime guard protects a path that expects bracketed paste, triggering the required symptom-guard review; no eager/load-time cause was established (target/src/nl_shell/session.py:139; target/src/nl_shell/session.py:436). |
+| T1 Structure | PASS | Pure protocol state transitions are separated from PTY lifecycle and I/O, keeping sequencing independently inspectable and later terminal ownership outside this change (target/src/nl_shell/pty_protocol.py:156; target/src/nl_shell/session.py:230). |
+| T2 Shape | PASS | Threat-model changes describe deliberate hook subversion and the one-second builtin limitation; the frozen scanner confirms the required threat-model touch, and an independent docs-link scan reports 60 links with zero broken (target/.oss-scanner/threat_model.md:170; gate-logs/T2-threat-model.log:10). |
+| T3 Runtime | PASS | Frozen full-suite output records 242 passing tests; independent real-bash runs confirm pipeline status, persistent exports, output, nounset/unset PATH, degradation and restart without a tool shim (gate-logs/T3-suite.log:15; target/src/nl_shell/session.py:111; target/src/nl_shell/session.py:272). |
+| T4 Contribution | N/A | Contribution artifacts are intentionally absent at Check; the substantive contribution audit must rerun at publish (gate-logs/T4-contribution.log:10). |
+| T5 Judgment | NEEDS-HUMAN | Confirm that the policy-gate V wording remains a v1 clarification, and substantiate merged plus closed/rejected prior art for all affected paths; the brief reports a src/ and pyproject search, but this flattened target has only one base commit and no closed-work evidence (brief.md:14; brief.md:17; target/docs/design/specs/policy-gate/v1.md:203). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Accept the session-only increment and its documented fail-closed limitations for downstream terminal integration; successful protocol tests do not decide whether degraded sessions after long builtins or the documented Ctrl-C completion race meet product needs (target/.oss-scanner/threat_model.md:175; target/src/nl_shell/session.py:381). |
+
+Evidence and limits:
+
+- Grounding used only the provided target and artifacts. The target contains the patched files; no stale-target caveat was needed. The temporary stash was restored, and no implementation was edited.
+- Independent checks used real bash 5.3.9 and ptyprocess 0.7.0. `true` returned status 0; `false | true` returned status 0 and PIPESTATUS `(1, 0)`; exporting FOO persisted and printing it returned `b'bar'`; `set -u; unset PATH` and the following echo stayed healthy. After restoring the modules, echo returned `b'restored\r\n'`; disabling bracketed paste degraded with the H-diff reason; restart returned a healthy status-0 result.
+- The red check independently confirms the missing-feature import failure, not all 65 behavioral assertions. Full red/green and full-suite judgments rely on the readable frozen logs: pytest is unavailable in this reviewer environment. The actual runtime dependencies were present and exercised, so this is not an unmet runtime dependency.
+- Read all four frozen gate logs. C4's pre-fix failures are ModuleNotFoundError inside tests, not collection errors. T2 establishes that the threat-model file was touched, not a substantive security proof. T4 is deferred by design.
+- Independently ran `python3 scripts/docs_links.py` and `git diff --check` in the target; zero broken links and no whitespace findings. No INTEGRATION.md was supplied or found in the provided tree, so any additional human-only project checklist cannot be enumerated from this bundle.
+- No confirmed builder-fixable defect was established. The C5 runtime-guard question is a design judgment, not a claim that the guard is incorrect; hence it has no `[impl]` tag.
+
+<!-- pdca:leaf-complete -->

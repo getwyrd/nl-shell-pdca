@@ -1,0 +1,19 @@
+Review the new chat-completions transport and REPL error recovery, including bounded deadlines and safe server diagnostics.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The transport, failure contract, explicit exclusions and fake-server acceptance cases are concrete and mutually consistent; brief.md:3. |
+| C2 Reproduction (red pre-fix) | PASS | New functionality is absent in the base: the frozen red run executes all 79 tests and fails without collection/setup errors; gate-logs/C4-verify.log:1913. |
+| C3 Change | PASS | The four affected files stay within the transport/backend/REPL/test scope and retain the existing schema, parser and renderer; target/src/nl_shell/teacher_client.py:357, target/src/nl_shell/repl.py:170. |
+| C4 Verification (red→green) | PASS | Frozen evidence records 79 green and 79 red tests, including the independent backend catch; local pytest rerun was unavailable because this interpreter lacks pytest, so this verdict relies on the captured run; gate-logs/C4-verify.log:13, gate-logs/C4-verify.log:1913. |
+| C5 Causal adequacy | PASS | Deadline enforcement encloses DNS/connect/read rather than probing an assumed capability; direct reviewer checks confirmed huge-int timeout rejection and bounded excerpts; target/src/nl_shell/teacher_client.py:180, target/src/nl_shell/teacher_client.py:365. |
+| T1 Structure | PASS | The backend remains the interface, the client returns raw content, and the REPL retains strict proposal parsing; all four changed Python files independently passed AST parsing; target/src/nl_shell/backend.py:28, target/src/nl_shell/repl.py:166. |
+| T2 Shape | NEEDS-HUMAN | Decide whether this new network/error trust boundary requires a threat-model update despite the brief excluding documentation edits — the scanner explicitly leaves that security decision to sign-off; gate-logs/T2-threat-model.log:10, target/src/nl_shell/teacher_client.py:413. |
+| T3 Runtime | PASS | The frozen full-suite run reports 560 passes with one forkpty deprecation warning; local pytest is unavailable, and no independent suite run is claimed; gate-logs/T3-suite.log:25. |
+| T4 Contribution | N/A | Contribution artifacts are intentionally absent at Check; the substantive contribution audit must rerun at publish; gate-logs/T4-contribution.log:10. |
+| T5 Judgment | NEEDS-HUMAN | Confirm affected-path prior art against merged and closed/rejected work before publishing — the disposable target contains only one synthetic base commit and no remotes, so its affected-path git log cannot independently establish the brief's historical claim; brief.md:20. |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Decide whether fake-server transport coverage and interim failure replies are sufficient for this scoped child — real llama.cpp/vLLM interoperability and the deferred unavailable-state UX are not established by these tests; target/src/nl_shell/teacher_client.py:4, target/src/nl_shell/repl.py:39. |
+
+Evidence limits: I read all four frozen gate logs. The instance-scoped gate wrappers are not supplied here, so the scanner and contribution dispositions above come from their full logs. The attempted command `python3 -m pytest tests/test_teacher_client.py -q` exited with `No module named pytest`; consequently I did not stash the patch for a red run that this interpreter could not execute. No target-state staleness was found. PyYAML 6.0.3 imports successfully in the reviewer interpreter, and the captured green tests exercise prompt loading, so the brief's named external dependency is discharged. No INTEGRATION.md was present in the supplied target to enumerate additional human-only checks. The direct checks also confirmed HTTPS default port 443 and normalization of `/v1` to `/v1/chat/completions`. No implementation defect was established by this review.
+
+<!-- pdca:leaf-complete -->

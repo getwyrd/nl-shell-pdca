@@ -1,0 +1,23 @@
+router: send English that starts with a command name to the model
+
+Typing a plain sentence such as "find large files in my home" or "who is
+logged in" used to be sent to bash, because the first word happens to be a
+command on $PATH or a bash builtin. The user got a shell error or an odd
+command run instead of an answer from the model.
+
+The router now treats such a line as natural language when it reads like an
+English sentence. Once the first word resolves as a command, the line counts
+as English if it holds an apostrophe that bash would see as an unclosed quote
+("find what's using port 80"), or if all of these hold: the command is not
+echo or printf, the line has at least four words, no word starts with "-",
+there is no shell metacharacter, and at least one word is a common English
+function word such as "the", "in" or "is". Anything else keeps today's
+routing. A wrong route still only costs a model call or a gate check, and
+\cmd still forces bash.
+
+The router table in tests/test_repl.py flips the vector that pinned the old
+limitation and adds cases that each pin one part of the rule. The module
+docstring and the router row in the building-block view describe the new
+rule and what it still misses.
+
+Fixes #108

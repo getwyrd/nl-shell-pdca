@@ -1,0 +1,44 @@
+# Security review — issue 197 / ast-policy-gate-command-engine (advisory)
+
+**Attacker-reachable inputs this diff touches:** the model's proposal text (threat model "Where untrusted input enters" item 5), plus typed input and session-state setters that reach `nl_shell.gate.classify` (item 4). Every changed line in `src/nl_shell/gate/rules.py`, `commands.py`, `__init__.py` and `targets/ubuntu-26.04/commands.toml` is on that path.
+
+Method: I ran the patched gate (`$PDCA_TARGET/src`, with the pdca venv's tree-sitter-bash 0.25.1) on about 450 crafted command strings, as proposals, and checked the shell behaviour behind each finding with real bash 5.3.9 on this host. Severity uses the threat model's scale.
+
+## Findings
+
+- NEEDS-HUMAN [impl] — **High** — `src/nl_shell/gate/rules.py:537-539` (`finish`), with the rows at `targets/ubuntu-26.04/commands.toml:740,753,911,954,970`. A row that opens a shell when given no command (`no_command = "opens-shell"` or `opens_shell = true`) is marked "opens an interactive shell" and its stdin is never checked. `stdin_code()` only runs for `no_command = "stdin-code"`. But that shell reads its stdin as code, just like bare `bash`. Who controls it: the model's proposal. What goes wrong: privileged or destructive code fed on stdin is classed `mutating`, and a proposal is not rejected (class 2 / decision B). Reproducer (proposal origin):
+  - `unshare <<< 'sudo -i'` → `mutating`, not rejected. `bash <<< 'sudo -i'` is `privileged`, rejected.
+  - `chroot / <<< 'sudo -i'`, `sg adm <<< 'sudo -i'`, `newgrp <<< 'sudo -S true'`, `script -q /dev/null <<< 'sudo -i'` → `mutating`, not rejected.
+  - `echo 'rm -rf ~' | unshare`, `curl x | script`, `curl x | chroot /` → `mutating`. `curl x | bash` is `destructive` ("runs code the gate cannot read").
+
+  Checked on this host: `unshare <<< 'echo INNER-RAN-via-unshare'` prints `INNER-RAN-via-unshare`, and so does `script -q /dev/null <<< 'echo …'`. Fix: when a mode opens a shell because no command was given, run the same `stdin_code` path with grammar `sh` (literal stdin goes through recursion; a pipe, file or unknown stdin is decision B). Add these cases to `tests/test_gate_commands.py`. The class-2 property test checks that `no_command` is declared, but nothing checks what happens to stdin.
+
+- NEEDS-HUMAN [impl] — **High** — `targets/ubuntu-26.04/commands.toml:1251` (`fc -e`, `role = "script"`). bash does not treat the `-e` value as a file. It builds `"<ename> <tmpfile>"` and runs it as bash text. So `fc -e 'sudo -i'` runs `sudo -i /tmp/bash-fc.*` as root. The gate calls it "runs a file as code" and gives `destructive`, not rejected. It should be `privileged` and rejected, like `bash -c 'sudo -i'`. This is class 3: the field is read in the wrong grammar. Reproducer: `classify("fc -e 'sudo -i'", origin="proposal")` → `destructive`, `rejected=False`. On this host, `bash -c 'set -o history; history -s true; fc -e "echo FC-EDITOR-TEXT-RAN-AS-BASH; :"'` prints the marker, so `;` worked as a bash list separator. Fix: make `-e` a `text:bash` field. The edited file is still decision B, which already applies.
+
+- NEEDS-HUMAN [impl] — **High** — `targets/ubuntu-26.04/commands.toml:28` (`[variables] stored`) and `src/nl_shell/gate/rules.py:700-707` (`write`). An env assignment named `BASH_FUNC_<name>%%` is how bash exports functions. A child bash imports the value as a function definition, so it is stored code (class 6). The table does not list it and nothing matches the pattern. Reproducer (proposal): `env 'BASH_FUNC_ls%%=() { sudo -i; }' bash -c ls` → `mutating`, not rejected. `env 'BASH_FUNC_ls%%=() { rm -rf ~; }' bash -c ls` → `mutating` (Medium on its own). On this host, `env 'BASH_FUNC_ls%%=() { echo FUNC-FROM-ENV-RAN; }' bash -c ls` prints `FUNC-FROM-ENV-RAN`. Fix: treat any `env`/`env -S` assignment whose name matches `BASH_FUNC_*%%` as stored bash code. Class the function body, or use decision B when it can't be read, and make it at least `session-altering`. Add it to the class-6 tests. (The prefix-assignment form, `BASH_FUNC_ls%%=… bash`, is already a parse error and rejected.)
+
+- NEEDS-HUMAN [human] — **High** — `src/nl_shell/gate/rules.py:640-643` (`text`), and `:506` for `eval`. Decision B puts non-literal shell text at `destructive`, even when the literal part names a privileged command or a §5-rejected form. A rejection is never possible this way. Reproducers (proposal), each `destructive`, `rejected=False`:
+  - `eval "sudo -S true${x:-}"`
+  - `bash -c "sudo -i $x"`
+  - `bash -c "export SUDO_ASKPASS=/tmp/x $x"`
+  - `sh -c "sudo -A true ${x}"`
+  - `trap "sudo -i $x" EXIT`
+  - `alias ls="sudo -i $x"`
+  - `PROMPT_COMMAND="sudo -i $x"`
+
+  With `x` unset, the first one runs exactly `sudo -S true`. This matches the spec as written (§4.1 decision B: "at least destructive"). It does not match the threat model text this patch adds: "`sudo -S`, `sudo --stdi`, `sudo "$P"` cannot hide", and "Wrappers … don't hide a privileged step". It is also inconsistent with elevating rows, where a non-literal word is rejected (`sudo "$x"` is rejected; `bash -c "sudo -i $x"` is not). A privileged step classed lower is High on the threat model's scale. The worse outcome would be the password reaching captured output through `sudo -S` while passthrough is off (passthrough starts only for the `privileged` class). I did not confirm that: sudo probably turns echo off on a tty stdin. The choice is a spec change to decision B, so it needs a human. Options: (a) for a proposal, reject or raise to `privileged` any non-literal text in a parsed grammar; (b) parse the text with each expansion as an opaque word, so the literal `sudo -S` is seen; (c) accept the gap and write it into the threat model next to the class-7 gap.
+
+## Checked, no finding
+
+- **sudo family and §5 rejections:** short, clustered, attached, long and abbreviated options (`--stdi`, `--std`, `-nS`, `-Su root`, `-C3 -S`, `--prompt=x`), `--` handling, and options hidden behind `env`, `env -S` (`-S'…'`, `-iS`, `--split-string=`), `nice`, `timeout`, `stdbuf`, `setsid`, `flock`, `script -c`, `watch`, `xargs`, `find -exec`, `busybox`, `command`, `builtin`, `exec -a/-c/-l`, `ssh-agent`, `x-terminal-emulator -e`, `ptyxis --`. Pipes, here-strings and here-docs into sudo through wrappers. All were rejected or `privileged` as required. `sudo -hS true` is not rejected, but the table reads `-h` as taking an attached host value (`-hS` is host "S"), which matches sudo's own option parsing.
+- **Protected variables (class 5):** `export`, `export -n`, `declare -x/-n/-i`, `typeset`, `local`, `readonly`, `read`, `read -a`, `printf -v`/`-vNAME`, `mapfile`, `readarray`, `getopts`, `wait -p`, `unset`, `let`, nested `bash -c 'export …'`, `builtin`/`command` prefixes. All rejected. `for SUDO_PROMPT in x` and `select SUDO_PROMPT` get through, but the brief puts that out of scope as walker work (brief "Out of scope"), so I am not raising it here.
+- **Interpreters and text runners:** python3, perl, tclsh, gjs, gdb (`-ex`, `-x`, `--args sudo`), screen, tmux, at/batch, sg, busybox applets, run-parts, machinectl, systemd-run, run0, login, sulogin. Decision B applies or they are `privileged` as expected. awk/sed/vim/git code paths stay `mutating`, which is the documented class-7 / floor gap.
+- **Stored code:** `PS4`/`PROMPT_COMMAND` through `env`, `BASH_ENV`/`ENV`, `complete -C`, `bind -x`, `trap`/`alias` through `builtin`, function bodies. All classed. Readline macros (`bind '"…": "text"'`) stay `session-altering`; the snapshot's `H` (`bind -p/-s/-X`) covers them.
+- **Spec §4 destructive list:** every form listed (rm `-R`/`--recur`/glob/non-literal operand, find `-delete`/`-execdir`/`-ok`, dd, mkfs*, wipefs, shred, truncate, fdisk family, chmod/chown `-R`, git clean / reset `--hard` / push `--force`, including `-C`/`-c` globals, systemctl verbs with options first, all `kill -9 -1` spellings) is at least `destructive`.
+- **Resource use:** 8 KB inputs of nested wrappers, env-split, arithmetic subscripts and long options all return in 0.03 s or less, as decision C or a normal class. No hang or exception.
+- **Fixed load location:** `src/nl_shell/gate/commands.py:59-71,316-338` reads no environment variable, working directory or home directory, and refuses a resolved path outside `TARGETS_ROOT`. The target id comes from the only folder under `targets/` instead of the brief's `"ubuntu-26.04"` constant. That fails closed (decision C) if there are zero or several folders, so it is not a security issue.
+
+## Test coverage
+
+`tests/test_gate_commands.py` does not exercise any of the four findings above: stdin into a shell opened with no command, `fc -e`, `BASH_FUNC_*`, or non-literal text that names sudo. The first three are gaps in the attacker-reachable cases of classes 2, 3 and 6, and the builder can add tests for them along with the fixes.
+<!-- pdca:leaf-complete -->

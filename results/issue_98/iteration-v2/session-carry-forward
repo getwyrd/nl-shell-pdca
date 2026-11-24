@@ -1,0 +1,8 @@
+Keep the patch and decision 5's rule as is; only add the tests the adversary review (SUMMARY §6 item 3) showed are missing. Each must go red if its rule clause is removed from scripts/docs_links.py:
+1. Fence close "at least as long": "````\n```\n[x](missing.md)\n````\n" must PASS (inner shorter run does not close the fence). Add a companion case where a link after the real close is reported.
+2. Fence close "same character": "```\n~~~\n[x](missing.md)\n```\n" must PASS (~~~ does not close a backtick fence).
+3. Escaped backtick does not open a span: "\`see [x](esc-missing.md) `y`" must FAIL and name esc-missing.md.
+4. Inline code stays within a paragraph: "`a\n\n[x](para-missing.md) `" must FAIL and name para-missing.md.
+5. Backslash escapes in dest are undone: a valid "[g](gu\_ide.md)" pointing at tracked gu_ide.md must PASS.
+6. Reference definition after ">" markers: "> [t]: missing.md" must FAIL and name missing.md.
+Root-absolute links ("/docs/x.md", §6 item 4): do not change resolution; add them to the known-gaps list in the script's docstring (they are resolved relative to the file's directory, so they are reported broken).

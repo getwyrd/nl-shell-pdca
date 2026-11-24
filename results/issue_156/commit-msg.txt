@@ -1,0 +1,24 @@
+Look up which package provides a command from the target's data
+
+When a command is not found, nl-shell should be able to say which package
+would install it. Until now it had no way to ask the active OS target for
+that. This adds an optional [command_provider] table to target.toml and a
+small read-only lookup over the data it names.
+
+The ubuntu-26.04 target points it at the local command-not-found database
+(/var/lib/command-not-found/commands.db). The lookup opens that file
+read-only, never fetches anything and never creates the file. It passes the
+command word as a bound SQL parameter and returns nothing when the data is
+missing or unreadable. It returns package names sorted, without duplicates,
+and only when they pass the Debian package-name rule, because the names end
+up in text shown to the user. The package code still names no OS or path:
+both come from target.toml (ADR-0023).
+
+The target loader validates the new table the same way it reads [sudo], but
+the table is optional: a target without it simply has no provider. The
+threat model lists the database as trusted input.
+
+Nothing calls the lookup yet. Wiring it into the "command not found"
+suggestion is a separate change.
+
+Fixes #156

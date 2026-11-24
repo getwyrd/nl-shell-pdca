@@ -1,0 +1,6 @@
+Rebuild the same slice (scope, rules r1-r6 and workflow shape unchanged); fix these reproduced defects, each with a regression test:
+- Frozen status across renames: when checking whether a changed path is frozen, follow renames between the merge-base and the base tip (git diff -M --name-status merge_base base_tip) and compare against the frozen copy at its renamed base-tip path. Regression: PR edits proposals/draft/0001 body while main ratifies it (git mv to accepted/, status accepted) -> must fail (today: "docs-immutability: OK", exit 0).
+- Code inside list items: a fenced block (``` or ~~~) or an indented code block nested under a list item must be masked; judge indentation relative to the list item's content column, and keep the existing test that ordinary indented list text is still link-checked. Regression: "1. Step\n\n    ~~~\n    see [x](missing.md)\n    ~~~\n" -> must pass (today exit 1).
+- Reference definitions: unescape backslash-escaped punctuation in reference destinations the same way as inline ones. Regression: "[ref]: file\(v1\).md" to a tracked file(v1).md -> must pass.
+- Escaped backtick: "\`" must not open a code span. Regression: "Use \` then [x](gone.md) and \` end." -> must fail, naming gone.md.
+CODEOWNERS / running the base copy of the checker stays a maintainer call, out of this rebuild.

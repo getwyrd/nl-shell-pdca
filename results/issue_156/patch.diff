@@ -1,0 +1,487 @@
+diff --git a/.oss-scanner/threat_model.md b/.oss-scanner/threat_model.md
+index cdde4e0..808e3c4 100644
+--- a/.oss-scanner/threat_model.md
++++ b/.oss-scanner/threat_model.md
+@@ -98,7 +98,12 @@ Trusted:
+ - dpkg-owned man pages and an allowlist of `--help` outputs harvested in the reference VM,
+   and the vendored tldr snapshot (local-reference, ADR-0016);
+ - nl-shell's own config files in the user's home directory, except that a model endpoint
+-  in them is refused without `--dev-teacher` (ADR-0020).
++  in them is refused without `--dev-teacher` (ADR-0020);
++- the target's command-provider data, `/var/lib/command-not-found/commands.db` on the
++  ubuntu-26.04 target (`[command_provider]` in its `target.toml`): root-owned,
++  package-managed, opened read-only and never fetched (ADR-0003), and not writable by an
++  attacker. The package names read from it are still filtered to the Debian package-name
++  rule, because they end up in text shown to the user.
+ 
+ ## What must hold
+ 
+diff --git a/src/nl_shell/command_provider.py b/src/nl_shell/command_provider.py
+new file mode 100644
+index 0000000..ec8170c
+--- /dev/null
++++ b/src/nl_shell/command_provider.py
+@@ -0,0 +1,65 @@
++"""Which package provides a command: a lookup over the active target's local data.
++
++The target names the data in its ``target.toml`` (``[command_provider]``, read by
++``nl_shell.targets``); this module names no OS and no path (ADR-0023). The data is local:
++the file is opened read-only and nothing is ever fetched (ADR-0003). When the target has
++no provider, or its data is absent or unreadable, the lookup returns ``()``.
++
++Package names come back sorted, without duplicates, and only when they pass the Debian
++package-name rule (Debian Policy §5.6.1: lowercase letters, digits, ``+``, ``-`` and
++``.``, at least two characters, starting with a letter or digit). The names end up in
++text shown to the user, so anything else is dropped.
++"""
++
++from __future__ import annotations
++
++import re
++import sqlite3
++from collections.abc import Callable
++from contextlib import closing
++from pathlib import Path
++
++from nl_shell.targets import CommandProvider
++
++# A lookup takes a command word and returns the names of the packages that provide it.
++Lookup = Callable[[str], tuple[str, ...]]
++
++# Matched against the whole string with re.fullmatch, so a trailing newline is rejected
++# (a `$` anchor would accept one).
++_PACKAGE_NAME = re.compile(r"[a-z0-9][a-z0-9+.-]+")
++# Seconds to wait on a locked database before giving up.
++_TIMEOUT = 1.0
++
++
++def is_package_name(name: object) -> bool:
++    """True when ``name`` is a string that passes the Debian package-name rule."""
++    return isinstance(name, str) and _PACKAGE_NAME.fullmatch(name) is not None
++
++
++def _none(word: str) -> tuple[str, ...]:
++    return ()
++
++
++def provider_lookup(provider: CommandProvider | None) -> Lookup:
++    """The package lookup that ``provider`` describes; ``None`` gives one that finds nothing."""
++    if provider is None or provider.format != "sqlite":
++        return _none
++
++    def lookup(word: str) -> tuple[str, ...]:
++        path = Path(provider.path)
++        try:
++            # Checked first so a lookup never creates the file.
++            if not path.is_file():
++                return ()
++            # as_uri() percent-encodes `?`, `#` and `%` in the path, so they can't end the
++            # path early or add URI parameters.
++            uri = path.as_uri() + "?mode=ro"
++            with closing(sqlite3.connect(uri, uri=True, timeout=_TIMEOUT)) as db:
++                # The word is a bound parameter: no SQL is built from it.
++                rows = db.execute(provider.query, (word,)).fetchall()
++        except (sqlite3.Error, OSError, ValueError):
++            return ()
++        names = {row[0] for row in rows if row and is_package_name(row[0])}
++        return tuple(sorted(names))
++
++    return lookup
+diff --git a/src/nl_shell/targets.py b/src/nl_shell/targets.py
+index b250e75..c1ef974 100644
+--- a/src/nl_shell/targets.py
++++ b/src/nl_shell/targets.py
+@@ -30,6 +30,7 @@ TARGET_FILE = "target.toml"
+ SUPPORTED_SHELLS = ("bash",)  # ADR-0023 "Shells later"
+ UNKNOWN = "unknown"
+ MISMATCH_REASON = "target does not match this OS"
++COMMAND_PROVIDER_FORMATS = ("sqlite",)  # [command_provider] format
+ 
+ # A target id is a plain folder name: no separators, no `.` or `..`, nothing hidden.
+ _PLAIN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+@@ -61,6 +62,21 @@ class NoMatchingTarget(TargetError):
+         super().__init__(text)
+ 
+ 
++@dataclass(frozen=True)
++class CommandProvider:
++    """``[command_provider]``: local data that names the package providing a command.
++
++    ``format`` is the kind of source (only ``sqlite``), ``path`` the absolute path of the
++    file, opened read-only and never fetched (ADR-0003), and ``query`` one SQL statement
++    with a single ``?`` for the command word that returns package names in its first
++    column.
++    """
++
++    format: str
++    path: str
++    query: str
++
++
+ @dataclass(frozen=True)
+ class Target:
+     """One loaded ``target.toml``. ``fields`` is the whole parsed file, read-only."""
+@@ -75,6 +91,8 @@ class Target:
+     sudo_version: str
+     folder: Path
+     fields: Mapping[str, Any] = field(repr=False, compare=False)
++    # Optional: a target without it names no package for "command not found".
++    command_provider: CommandProvider | None = None
+ 
+     def matches(self, release: Mapping[str, str]) -> bool:
+         """True when os-release ``ID`` and ``VERSION_ID`` equal this target's, exactly."""
+@@ -193,6 +211,26 @@ def _validate(doc: dict[str, Any], folder: Path, path: Path) -> Target:
+         raise TargetError(
+             f"{path}: `package_owner_query` must be a non-empty list of non-empty strings"
+         )
++    # Optional, unlike [os_release] and [sudo]: absent means no provider.
++    provider = None
++    if "command_provider" in doc:
++        source = table("command_provider")
++        kind = string(source, "format", "command_provider.format")
++        if kind not in COMMAND_PROVIDER_FORMATS:
++            raise TargetError(
++                f"{path}: command_provider.format {kind!r} is not supported "
++                f"(supported: {', '.join(COMMAND_PROVIDER_FORMATS)})"
++            )
++        data_path = string(source, "path", "command_provider.path")
++        if not Path(data_path).is_absolute():
++            raise TargetError(f"{path}: `command_provider.path` must be an absolute path")
++        sql = string(source, "query", "command_provider.query")
++        if sql.count("?") != 1:
++            raise TargetError(
++                f"{path}: `command_provider.query` must have exactly one `?` "
++                "(the command word)"
++            )
++        provider = CommandProvider(format=kind, path=data_path, query=sql)
+     return Target(
+         id=target_id,
+         display_name=display_name,
+@@ -204,6 +242,7 @@ def _validate(doc: dict[str, Any], folder: Path, path: Path) -> Target:
+         sudo_version=string(sudo, "version", "sudo.version"),
+         folder=folder,
+         fields=MappingProxyType(doc),
++        command_provider=provider,
+     )
+ 
+ 
+diff --git a/targets/ubuntu-26.04/target.toml b/targets/ubuntu-26.04/target.toml
+index d2e90a3..8ee6979 100644
+--- a/targets/ubuntu-26.04/target.toml
++++ b/targets/ubuntu-26.04/target.toml
+@@ -10,6 +10,14 @@
+ #                        no `ID_LIKE` or nearby-version fallback
+ #   [sudo]               the sudo implementation on this OS and the version nl-shell's sudo
+ #                        handling was checked against (ADR-0015)
++#   [command_provider]   optional: local data naming the package that provides a command, for
++#                        the "command not found" suggestion. `format` is the kind of source
++#                        (only `sqlite`), `path` the absolute path of the file (opened
++#                        read-only, never fetched; ADR-0003), `query` one SQL statement with a
++#                        single `?` for the command word that returns package names in its
++#                        first column. Here: the command-not-found database, tables
++#                        commands(command, pkgID) and packages(pkgID, name). When the file is
++#                        absent or unreadable, no package is named.
+ 
+ id = "ubuntu-26.04"
+ display_name = "Ubuntu 26.04 LTS"
+@@ -23,3 +31,10 @@ VERSION_ID = "26.04"
+ [sudo]
+ implementation = "sudo-rs"
+ version = "0.2.13"
++
++[command_provider]
++format = "sqlite"
++path = "/var/lib/command-not-found/commands.db"
++query = """
++SELECT packages.name FROM commands JOIN packages ON packages.pkgID = commands.pkgID
++WHERE commands.command = ? ORDER BY packages.name"""
+diff --git a/tests/test_command_provider.py b/tests/test_command_provider.py
+new file mode 100644
+index 0000000..c8a3712
+--- /dev/null
++++ b/tests/test_command_provider.py
+@@ -0,0 +1,284 @@
++"""The target's ``[command_provider]`` and the package lookup over it (child of #62).
++
++The loader rows write a fake target folder under ``tmp_path``. The reader rows build a
++SQLite file under ``tmp_path`` with the same two tables as the shipped target's data,
++``commands(command, pkgID)`` and ``packages(pkgID, name)``, so they never depend on the
++host's package data; only the last test reads the host's file and is skipped without it.
++The modules under test are imported inside the tests, so the file still loads (and fails)
++on a tree without them.
++"""
++
++import sqlite3
++from pathlib import Path
++
++import pytest
++
++REPO = Path(__file__).resolve().parents[1]
++SHIPPED = "ubuntu-26.04"
++HOST_DB = Path("/var/lib/command-not-found/commands.db")
++
++BASE = """\
++id = "testos-1"
++display_name = "Test OS 1"
++shell = "bash"
++package_owner_query = ["owner-of"]
++
++[os_release]
++ID = "testos"
++VERSION_ID = "1"
++
++[sudo]
++implementation = "test-sudo"
++version = "1.0"
++"""
++QUERY = (
++    "SELECT packages.name FROM commands JOIN packages ON packages.pkgID = commands.pkgID "
++    "WHERE commands.command = ? ORDER BY packages.name"
++)
++PROVIDER = f"""
++[command_provider]
++format = "sqlite"
++path = "/data/commands.sqlite"
++query = "{QUERY}"
++"""
++
++
++def load(tmp_path, text):
++    from nl_shell import targets
++
++    folder = tmp_path / "targets" / "testos-1"
++    folder.mkdir(parents=True)
++    (folder / "target.toml").write_text(text, encoding="utf-8")
++    return targets.load("testos-1", tmp_path / "targets")
++
++
++def make_db(path, rows):
++    """A database at ``path``; ``rows`` are (command, pkgID, name) triples."""
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with sqlite3.connect(path) as db:
++        db.execute("CREATE TABLE commands (command TEXT, pkgID INTEGER)")
++        db.execute("CREATE TABLE packages (pkgID INTEGER, name)")
++        for command, pkg_id, name in rows:
++            db.execute("INSERT INTO commands VALUES (?, ?)", (command, pkg_id))
++            db.execute("INSERT INTO packages VALUES (?, ?)", (pkg_id, name))
++    db.close()
++    return path
++
++
++def lookup_for(path):
++    from nl_shell.command_provider import provider_lookup
++    from nl_shell.targets import CommandProvider
++
++    return provider_lookup(CommandProvider(format="sqlite", path=str(path), query=QUERY))
++
++
++# Loader -------------------------------------------------------------------------------
++
++
++def test_valid_provider_loads(tmp_path):
++    from nl_shell.targets import CommandProvider
++
++    target = load(tmp_path, BASE + PROVIDER)
++    assert target.command_provider == CommandProvider(
++        format="sqlite", path="/data/commands.sqlite", query=QUERY
++    )
++
++
++def test_target_without_provider_has_none(tmp_path):
++    target = load(tmp_path, BASE)
++    assert target.command_provider is None
++
++
++@pytest.mark.parametrize(
++    "table",
++    [
++        pytest.param(PROVIDER.replace('"sqlite"', '"csv"'), id="unknown-format"),
++        pytest.param(PROVIDER.replace("/data/commands.sqlite", "data/c.sqlite"), id="relative"),
++        pytest.param(PROVIDER.replace("= ?", "= 'x'"), id="no-placeholder"),
++        pytest.param(PROVIDER.replace("= ?", "= ? OR commands.command = ?"), id="two-?"),
++        pytest.param(PROVIDER.replace('format = "sqlite"\n', ""), id="missing-format"),
++        pytest.param(
++            PROVIDER.replace('path = "/data/commands.sqlite"\n', ""), id="missing-path"
++        ),
++        pytest.param(PROVIDER.replace(f'query = "{QUERY}"\n', ""), id="missing-query"),
++        pytest.param(PROVIDER.replace('"sqlite"', "1"), id="non-string-format"),
++        pytest.param(PROVIDER.replace('"/data/commands.sqlite"', "[]"), id="non-string-path"),
++        pytest.param(PROVIDER.replace('"sqlite"', '""'), id="empty-format"),
++        pytest.param(PROVIDER.replace('"/data/commands.sqlite"', '""'), id="empty-path"),
++        pytest.param(PROVIDER.replace(f'"{QUERY}"', '""'), id="empty-query"),
++    ],
++)
++def test_invalid_provider_is_refused(tmp_path, table):
++    from nl_shell.targets import TargetError
++
++    with pytest.raises(TargetError, match="command_provider"):
++        load(tmp_path, BASE + table)
++
++
++def test_provider_that_is_not_a_table_is_refused(tmp_path):
++    from nl_shell.targets import TargetError
++
++    # A plain key has to come before the first table header.
++    with pytest.raises(TargetError, match="`command_provider` must be a table"):
++        load(tmp_path, 'command_provider = "sqlite"\n' + BASE)
++
++
++def test_shipped_target_has_sqlite_provider():
++    from nl_shell import targets
++
++    provider = targets.load(SHIPPED, REPO / "targets").command_provider
++    assert provider is not None
++    assert provider.format == "sqlite"
++    assert provider.path == "/var/lib/command-not-found/commands.db"
++
++
++# Reader -------------------------------------------------------------------------------
++
++
++def test_finds_the_package(tmp_path):
++    db = make_db(tmp_path / "c.db", [("htop", 1, "htop")])
++    assert lookup_for(db)("htop") == ("htop",)
++
++
++def test_two_packages_come_back_sorted(tmp_path):
++    from nl_shell.command_provider import provider_lookup
++    from nl_shell.targets import CommandProvider
++
++    db = make_db(tmp_path / "c.db", [("vi", 1, "nvi"), ("vi", 2, "vim")])
++    # The result is sorted whatever order the query returns rows in.
++    reversed_query = QUERY.replace("ORDER BY packages.name", "ORDER BY packages.name DESC")
++    for query in (QUERY, reversed_query):
++        provider = CommandProvider(format="sqlite", path=str(db), query=query)
++        assert provider_lookup(provider)("vi") == ("nvi", "vim")
++
++
++def test_duplicate_names_collapse(tmp_path):
++    db = make_db(tmp_path / "c.db", [("htop", 1, "htop"), ("htop", 2, "htop")])
++    assert lookup_for(db)("htop") == ("htop",)
++
++
++def test_path_with_uri_characters(tmp_path):
++    db = make_db(tmp_path / "a?b#c%41d" / "c.db", [("htop", 1, "htop")])
++    assert lookup_for(db)("htop") == ("htop",)
++
++
++def test_unknown_word_gives_nothing(tmp_path):
++    db = make_db(tmp_path / "c.db", [("htop", 1, "htop")])
++    assert lookup_for(db)("no-such-command") == ()
++
++
++def test_missing_file_gives_nothing_and_is_not_created(tmp_path):
++    db = tmp_path / "absent.db"
++    assert lookup_for(db)("htop") == ()
++    assert not db.exists()
++
++
++def test_not_sqlite_gives_nothing(tmp_path):
++    db = tmp_path / "c.db"
++    db.write_bytes(b"this is not a database\n" * 100)
++    assert lookup_for(db)("htop") == ()
++
++
++def test_schema_without_tables_gives_nothing(tmp_path):
++    db = tmp_path / "c.db"
++    with sqlite3.connect(db) as conn:
++        conn.execute("CREATE TABLE other (x)")
++    conn.close()
++    assert lookup_for(db)("htop") == ()
++
++
++def test_lookups_leave_the_file_unchanged(tmp_path):
++    db = make_db(tmp_path / "c.db", [("htop", 1, "htop")])
++    before = db.read_bytes()
++    lookup = lookup_for(db)
++    for word in ("htop", "x", "'; DROP TABLE commands; --"):
++        lookup(word)
++    assert db.read_bytes() == before
++    assert sorted(p.name for p in tmp_path.iterdir()) == ["c.db"]
++
++
++def test_read_only_mode_is_used(tmp_path, monkeypatch):
++    from nl_shell import command_provider
++
++    db = make_db(tmp_path / "c.db", [("htop", 1, "htop")])
++    seen = []
++    real = sqlite3.connect
++
++    def connect(database, *args, **kwargs):
++        seen.append((database, kwargs.get("uri")))
++        return real(database, *args, **kwargs)
++
++    monkeypatch.setattr(command_provider.sqlite3, "connect", connect)
++    assert lookup_for(db)("htop") == ("htop",)
++    assert seen == [(db.as_uri() + "?mode=ro", True)]
++
++
++@pytest.mark.parametrize("word", ["htop'", "htop; DROP TABLE commands", "ht%", "'"])
++def test_word_is_a_bound_parameter(tmp_path, word):
++    db = make_db(tmp_path / "c.db", [("htop", 1, "htop")])
++    assert lookup_for(db)(word) == ()
++    # Still intact afterwards.
++    assert lookup_for(db)("htop") == ("htop",)
++
++
++def test_no_provider_finds_nothing():
++    from nl_shell.command_provider import provider_lookup
++
++    lookup = provider_lookup(None)
++    assert lookup("htop") == ()
++    assert lookup("ls") == ()
++
++
++# Package-name rule ----------------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "name",
++    [
++        pytest.param("HTOP", id="upper"),
++        pytest.param("htop; rm -rf ~", id="shell"),
++        pytest.param("htop\nevil", id="newline-inside"),
++        pytest.param("htop\n", id="trailing-newline"),
++        pytest.param("-htop", id="leading-dash"),
++        pytest.param(42, id="int"),
++        pytest.param(b"htop", id="bytes"),
++        pytest.param(None, id="null"),
++    ],
++)
++def test_bad_names_are_dropped(tmp_path, name):
++    db = make_db(tmp_path / "c.db", [("htop", 1, name)])
++    assert lookup_for(db)("htop") == ()
++
++
++@pytest.mark.parametrize("name", ["libc6", "g++", "python3.12"])
++def test_good_names_are_kept(tmp_path, name):
++    db = make_db(tmp_path / "c.db", [("x", 1, name)])
++    assert lookup_for(db)("x") == (name,)
++
++
++def test_bad_name_does_not_hide_good_one(tmp_path):
++    db = make_db(tmp_path / "c.db", [("htop", 1, "htop\n"), ("htop", 2, "htop")])
++    assert lookup_for(db)("htop") == ("htop",)
++
++
++# The module names no OS and no path ------------------------------------------------------
++
++
++@pytest.mark.parametrize("text", ["ubuntu", "/var/", "commands.db"])
++def test_module_names_no_os_or_path(text):
++    import nl_shell.command_provider as module
++
++    source = Path(module.__file__).read_text(encoding="utf-8")
++    assert text not in source.lower()
++
++
++# Supplementary: the host's real data ----------------------------------------------------
++
++
++@pytest.mark.skipif(not HOST_DB.is_file(), reason=f"{HOST_DB} not present on this host")
++def test_real_lookup_finds_htop():
++    from nl_shell import targets
++    from nl_shell.command_provider import provider_lookup
++
++    provider = targets.load(SHIPPED, REPO / "targets").command_provider
++    assert "htop" in provider_lookup(provider)("htop")

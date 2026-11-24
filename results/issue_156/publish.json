@@ -1,0 +1,11 @@
+{
+  "mode": "stacked-pr",
+  "branch": "enhancement/156-ubuntu-command-not-found-provider",
+  "pr_url": "https://github.com/eduralph/nl-shell/pull/162",
+  "base": "main",
+  "repo": "eduralph/nl-shell",
+  "by": "Eduard Ralph",
+  "date": "2026-10-15",
+  "id_pending": false,
+  "stacks_on": []
+}

@@ -1,0 +1,22 @@
+# Adversarial review — issue #196, round 4
+
+I could run the gate. tree-sitter 0.26.0 and tree-sitter-bash 0.25.1 came from the local uv cache into a scratch venv, and I compared each result with real bash 5.3.9 on this host. pytest was not available, so I did not re-run the suite. I read `gate-logs/C4-verify.log` instead. The red leg fails all 189 tests on `ModuleNotFoundError: nl_shell.gate`. That is expected for a new package, and the brief allows it (imports sit inside the test functions). It is not a refutation. The green leg runs the production `classify` and `parse.walk`, not a copy.
+
+Most round-3 fixes hold. I could not break these:
+- funsub: `${ x; }`, `${|…}`, tab, newline, inside `"…"` and in here-doc bodies all fail closed. bash rejects `${(`, `${;` and `${&` as bad substitutions, so the `_FUNSUB` regex at `parse.py:89` is complete for 5.3.9.
+- Quoted here-doc delimiters: `<<E\F` gives the right body and `rm x` is reached. `<<E'F'`, `<<"E"F`, a stray `E ` or `E<tab>` end line, a here-doc in `$(…)` ended by `E)`, and two here-docs on one line all fail closed.
+- `"$\⏎(…)"` and a split `{f\⏎d}>x` fail closed.
+- `{a[0]}>x` and `{fd}<<<x` are rejected.
+- `/dev/fd/3/`, `/dev/./fd/3`, `"/dev/fd/"3`, `/dev/fd/\3`, `/dev/fd/[3]`, `/dev/?(fd)/3` and the `/proc/self/root/` forms are all rejected.
+
+What I could break:
+
+- NEEDS-HUMAN [impl] — **An extglob redirect target that opens fd 3 is not rejected.** `src/nl_shell/gate/parse.py:72` (`_GLOB = "*?["`) and `_pattern` at `:396-408` treat only `* ? [` and braces as patterns. With extglob on, bash also globs `@(…)`, `+(…)` and `!(…)`. Interactive bash on Ubuntu has extglob on: `/usr/share/bash-completion/bash_completion:45` runs `shopt -s extglob`, and `bash -ic 'shopt extglob'` prints `on` here. I checked with real bash: `shopt -s extglob; exec 3>f; echo via-plus >/dev/+(fd)/3` writes to `f` through fd 3. The gate gives `classify("echo x >/dev/@(fd)/3")` → `mutating`, `rejected=False`, and the same for `+(fd)` and `!(null)`. Only the generic "unparseable" floor applies, because tree-sitter cuts the target at `(` into `>/dev/@`. This misses the round-3 instruction "reject globbed redirect targets", and it makes `threat_model.md:126` ("or a target bash would glob … is rejected") false. Fix: reject a redirect when its target, or the bytes right after it, contain an unquoted `[@+!?*](`. Or reject any redirect inside an unparseable tree, the same way here-docs are handled at `parse.py:654-657`. Add `>/dev/@(fd)/3`, `>/dev/+(fd)/3` and `>/dev/!(x)/3` to `tests/test_policy_gate.py:303`.
+
+- NEEDS-HUMAN [impl] — **The parse-time figure in the threat model is too low by about 5×.** `.oss-scanner/threat_model.md:120-122` and `parse.py:46-47` say the quadratic worst case is "`${` repeated: about 2.4 s at this cap". Measured here at the 64 KiB cap: `"${"*n` takes 3.0 s, `"a=("*n` 7.7 s, and `"$["*n` **12.7 s** (then `mutating`, unparseable). The round-3 sign-off asked for this wording to be accurate. Fix: name `$[` as the worst known input with its real time. Or bound the parse itself: tree-sitter 0.26's `Parser.parse` takes a `progress_callback` that can cancel, and a cancelled parse can be treated as decision C. Then the "total-work budget across the whole classification" covers parsing too. Add a timing test for `"$["*n`.
+
+- NEEDS-HUMAN [impl] — **`/proc/<pid>/cwd/` is an absolute literal path that can open a descriptor, and the gate does not reject it.** `_descriptor_path` (`parse.py:82-85`, `:496-520`) unwraps `/proc/<x>/root/` but not `/proc/<x>/cwd/`. Real bash: `exec 3>f; cd /dev/fd && echo via-proc-cwd >/proc/self/cwd/3` writes to `f`. The gate gives `classify("echo x >/proc/self/cwd/3")` → `mutating`, not rejected. `threat_model.md:124-127` says a literal target path that opens a descriptor is rejected, and only *relative* paths are excused. This is an absolute path. The attack does need a `cd` first, so it sits near the documented cwd-state gap. Fix: treat any target under `/proc/<x>/cwd` (and `/proc/<x>/task/<t>/cwd`) as `"?"` (rejected), the same way `..` is handled at `:505-508`. Or reword the threat model to cover it.
+
+- Not a refutation, just a note: fail-closed is over-broad for some ordinary commands. `cat <<E && cat <<F …`, `cat <<E; rm z …` and `<<E"F"` all become `privileged`/rejected because `parse.py:654-657` fails closed on any here-doc in a tree with an ERROR node. This matches the round-3 instruction. I list it only so sign-off knows that normal two-here-doc lines will be refused.
+
+<!-- pdca:leaf-complete -->

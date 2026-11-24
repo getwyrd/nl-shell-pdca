@@ -1,0 +1,11 @@
+{
+  "before_sha": "238e7239ad90eb8f152b0b55ba0b6ca27c81dc9463c79c2efdbf165ef83aa366",
+  "after_sha": "9ce789612c28401d3e3ab8c1881b4a8086b15fbfbbafbe74dfe8fefa7e4e3228",
+  "revised": true,
+  "findings": 6,
+  "completed": true,
+  "not_completed": {},
+  "leaves": [
+    "plan-reviewer"
+  ]
+}

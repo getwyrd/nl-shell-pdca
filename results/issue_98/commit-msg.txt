@@ -1,0 +1,20 @@
+Add a CI check that relative links in Markdown docs resolve
+
+Nothing checked the relative links between nl-shell's docs. A change could
+rename or delete a doc, or mistype a link target, and every workflow still
+passed, leaving readers with dead links.
+
+scripts/docs_links.py scans every tracked .md file and fails, naming the
+file, line and link, when a relative link points at nothing in the repo. It
+follows a short, fixed rule rather than full CommonMark: HTML comments,
+fenced code and inline code are skipped; inline, image and reference links
+are checked; external links and pure #fragment links are ignored. Known gaps
+(indented code blocks, <...> destinations, root-absolute links and others)
+are listed in the script's docstring.
+
+The check runs as a new step in the Docs checks workflow, after the frozen
+design record step. tests/test_docs_links.py covers the rule case by case
+against throwaway git repos and also runs the check on the repo itself, so a
+broken link on main shows up in the test suite as well.
+
+Fixes #98

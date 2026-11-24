@@ -1,0 +1,1619 @@
+diff --git a/.oss-scanner/threat_model.md b/.oss-scanner/threat_model.md
+index 717c371..3133254 100644
+--- a/.oss-scanner/threat_model.md
++++ b/.oss-scanner/threat_model.md
+@@ -178,14 +178,21 @@ bug only if nl-shell's use of it is what makes it exploitable). The training pip
+ - **Child processes inherit the control channel (fd 3).** Only code running as the user can
+   use it, which is out of scope.
+ - **The PTY session runs with the user's own rights.** There is no sandbox around the shell.
+-- **The session core claims only a closed list (interim, until #141).**
+-  `src/nl_shell/session.py` claims only what pty-protocol v1 §1.3 lists: a command that ran is never reported as
+-  "nothing ran" for the listed cases; a confirmed change to `PROMPT_COMMAND`, `PS0`, or the
+-  attributes of `PS1`/`PS2` degrades at that command's snapshot (its code may still run once
+-  after it), and one to a plain `PS1`/`PS2` is overwritten. Nothing else is claimed until #141
+-  (tamper checks) and #145 (review of what else can evade the hooks) land. `run()` without
+-  a timeout can wait forever on a terminal read on an fd other than 0 (`read -u 2 x`,
+-  #136). #78 MUST NOT wire the session to confirmed commands before #141 lands.
++- **The session's tamper checks cover a closed list** (pty-protocol v1 §1.2, §3). These
++  are not covered, each with its follow-up:
++  - a loadable builtin (`enable -f`) or a function named `builtin`, `command`, `local` or
++    `return` that replaces what the hooks call: the gate classes these commands
++    `session-altering` (ADR-0024);
++  - `~/.bashrc` or `~/.inputrc` edited by a command and picked up when the session
++    restarts (#134);
++  - with `kernel.yama.ptrace_scope = 0`, a command can attach to bash and change it
++    (#137);
++  - a command made only of builtins that runs longer than 1 s at a terminal read degrades
++    the session (#136); `run()` without a timeout can wait forever on a terminal read on
++    an fd other than 0 (`read -u 2 x`, #136);
++  - the outside checks (terminal settings, bash's fds, a stopped bash, TIOCSTI) read Linux
++    `/proc` and work only on Linux (#138);
++  - a child process can write fake records on the inherited control channel (fd 3) (#135).
+ 
+ ## How to exercise it
+ 
+diff --git a/docs/design/specs/pty-protocol/v1.md b/docs/design/specs/pty-protocol/v1.md
+index e498326..4d9a9c1 100644
+--- a/docs/design/specs/pty-protocol/v1.md
++++ b/docs/design/specs/pty-protocol/v1.md
+@@ -40,7 +40,9 @@ handling (ADR-0015), or what captured output is used for (taint, ADR-0016).
+ ### 1. Starting the session
+ 
+ 1. nl-shell MUST start `bash --noprofile --rcfile <rcfile> -i` on a PTY, with the write end
+-   of a pipe as fd 3 in the child and the read end kept by nl-shell.
++   of a pipe as fd 3 in the child and the read end kept by nl-shell, and the read end of a
++   second pipe as fd 4 in the child and its write end kept by nl-shell (nl-shell writes
++   one line on it for every `D` record, §3).
+ 2. The rcfile MUST source the user's `~/.bashrc` (if present) **before** installing
+    nl-shell's hooks, and MUST:
+    - turn off history expansion (`set +H`);
+@@ -51,6 +53,13 @@ handling (ADR-0015), or what captured output is used for (taint, ADR-0016).
+    - set `PS1` and `PS2` to fixed values after the user's `PROMPT_COMMAND` and again after
+      the snapshot, unless a command gave them attributes (such as `readonly`), which `H`
+      shows (§3);
++   - force `bind 'set enable-bracketed-paste on'` after `~/.bashrc` (which may have
++     turned it off, or set vi mode: bash 5.1 and later handle a bracketed paste in vi
++     insert mode too);
++   - make `PS4` readonly after `~/.bashrc`: with `xtrace` on, bash expands `PS4` for the
++     hooks' first traced commands, before they can turn `xtrace` off, so a `PS4` set by a
++     command would run code before the snapshot;
++   - after writing `D`, wait (at most 5 s) for nl-shell's line on fd 4 before going on;
+    - set `PS0` and `PROMPT_COMMAND` as in the reference rcfile below.
+ 3. Reference rcfile (tested on Ubuntu 26.04, bash 5.3.9; `src/nl_shell/session.py`
+    `RCFILE`, and `tests/test_session.py` checks the two are the same):
+@@ -64,8 +73,9 @@ shopt -s promptvars
+ __nls_ea=$(shopt -p expand_aliases); shopt -u expand_aliases
+ __nls_user_pc=()
+ if declare -p PROMPT_COMMAND >/dev/null 2>&1; then __nls_user_pc=("${PROMPT_COMMAND[@]}"); fi
+-__nls_seq=-1 __nls_st=0 __nls_ps=() __nls_v= __nls_c= __nls_n=0 __nls_pre=
+-PS0='$(\\builtin printf "S %s\\n" "$((__nls_seq + 1))" >&3)'
++readonly PS4
++__nls_seq=-1 __nls_st=0 __nls_ps=() __nls_v= __nls_c= __nls_n=0 __nls_pre= __nls_x=0 __nls_k=0
++PS0='$(\\builtin printf "S %s\\n" "$((__nls_seq + 1))" 2>&1 >&3)'
+ __nls_ret() { \builtin return "$1"; }
+ __nls_enc() {
+   __nls_v=$2
+@@ -75,30 +85,36 @@ __nls_enc() {
+   \builtin printf '%s %s\n' "$1" "$__nls_v" >&3
+ }
+ __nls_done() {
+-  \builtin set -- "$?" "${PIPESTATUS[@]}"
+-  __nls_pre=$(\builtin declare -p __nls_pre __nls_c __nls_n __nls_ps __nls_st __nls_v 2>&1) ||
+-    \builtin :
+-  __nls_st=$1
+-  \builtin shift
+-  __nls_ps=("$@")
+-  \builtin printf '\033]7700;@NLS_END@\007'
+-  __nls_seq=$((__nls_seq + 1))
+-  \builtin printf -v __nls_v ' %s' "${__nls_ps[@]}"
+-  \builtin printf 'D %s %s%s\n' "$__nls_seq" "$__nls_st" "$__nls_v" >&3
+-  for __nls_c in "${__nls_user_pc[@]}"; do
+-    if __nls_ret "$__nls_st"; then
+-      \builtin eval "$__nls_c" || \builtin :
+-    else
+-      \builtin eval "$__nls_c" || \builtin :
+-    fi
+-  done
+-  __nls_st=0 __nls_ps=() __nls_v= __nls_c= __nls_n=0
++  # One builtin first: with `builtin` or `printf` disabled no record can be written, and
++  # every further call could run a command_not_found_handle; stop here instead.
++  \builtin printf '' && {
++    __nls_pre=$(\builtin declare -p __nls_pre __nls_c __nls_k __nls_n __nls_ps __nls_st __nls_v \
++      __nls_x 2>&1) || \builtin :
++    __nls_x=0
++    if [[ -o xtrace ]]; then __nls_x=1; \builtin set +x; fi
++    __nls_st=$1
++    __nls_ps=("${@:2}")
++    \builtin printf '\033]7700;@NLS_END@\007'
++    __nls_seq=$((__nls_seq + 1))
++    \builtin printf -v __nls_v ' %s' "${__nls_ps[@]}"
++    \builtin printf 'D %s %s%s\n' "$__nls_seq" "$__nls_st" "$__nls_v" >&3
++    \builtin read -r -t 5 -u 4 __nls_v
++    __nls_k=$?
++    for __nls_c in "${__nls_user_pc[@]}"; do
++      if __nls_ret "$__nls_st"; then
++        \builtin eval "$__nls_c" || \builtin :
++      else
++        \builtin eval "$__nls_c" || \builtin :
++      fi
++    done
++    __nls_st=0 __nls_ps=() __nls_v= __nls_c= __nls_n=0
++    (( 1 ))
++  }
+ }
+ __nls_snap() {
+-  \builtin set -- "$1" "${BASHOPTS-}"
+   \builtin shopt -u expand_aliases
+   for __nls_c in PS1 PS2; do
+-    __nls_v=$(\builtin declare -p "$__nls_c" 2>/dev/null) || __nls_v=
++    __nls_v=$(\builtin declare -p "$__nls_c" 2>&1) || __nls_v=
+     if [[ -z $__nls_v || ${__nls_v%%=*} == "declare -"[-x]" $__nls_c" ]]; then
+       if [[ $__nls_c == PS1 ]]; then PS1='\$ '; else PS2='> '; fi
+     fi
+@@ -106,47 +122,73 @@ __nls_snap() {
+   __nls_v= __nls_c=
+   __nls_enc H "$( {
+     \builtin declare -p PS0 PROMPT_COMMAND __nls_user_pc TERM PS1 PS2
+-    \builtin shopt -p promptvars
+-    for __nls_c in __nls_c __nls_done __nls_ea __nls_enc __nls_n __nls_pre __nls_ps __nls_ret __nls_seq __nls_snap __nls_st __nls_user_pc __nls_v; do
+-      \builtin declare -p "$__nls_c" 2>/dev/null || \builtin printf '%s unset\n' "$__nls_c"
++    \builtin shopt -p promptvars extdebug
++    \builtin shopt -po functrace histexpand emacs vi
++    \builtin printf 'DEBUG/RETURN traps: %s\n' "$2"
++    for __nls_c in PS4 BASH_XTRACEFD __nls_c __nls_done __nls_ea __nls_enc __nls_k __nls_n __nls_pre __nls_ps __nls_ret __nls_seq __nls_snap __nls_st __nls_user_pc __nls_v __nls_x; do
++      \builtin declare -p "$__nls_c" 2>&1 || \builtin printf '%s unset\n' "$__nls_c"
+     done
+     \builtin declare -f __nls_done __nls_snap __nls_enc __nls_ret
++    __nls_v=$(\builtin enable -a 2>&1)
++    for __nls_c in : alias bind builtin compgen declare enable eval jobs printf return set shopt trap read; do
++      case $'\n'$__nls_v$'\n' in
++        *$'\n'"enable $__nls_c"$'\n'*) \builtin printf 'builtin %s enabled\n' "$__nls_c" ;;
++        *) \builtin printf 'builtin %s not enabled\n' "$__nls_c" ;;
++      esac
++    done
++    \builtin bind -v
++    for __nls_c in emacs vi-insert vi-command; do
++      \builtin printf 'keymap %s\n' "$__nls_c"
++      \builtin bind -m "$__nls_c" -p
++      \builtin bind -m "$__nls_c" -s
++      \builtin bind -m "$__nls_c" -X
++    done
+   } 2>&1 )"
+   __nls_enc V "$(
+     for __nls_c in PAGER MANPAGER SYSTEMD_PAGER GIT_PAGER LESSOPEN LESSCLOSE LD_PRELOAD LD_LIBRARY_PATH BASH_ENV ENV; do
+-      \builtin declare -p "$__nls_c" 2>/dev/null || \builtin printf '%s unset\n' "$__nls_c"
++      \builtin declare -p "$__nls_c" 2>&1 || \builtin printf '%s unset\n' "$__nls_c"
+     done
+   )"
+-  __nls_enc F "$(\builtin compgen -A function)"
+-  __nls_enc L "$(\builtin alias -p)"
++  __nls_enc F "$(\builtin compgen -A function 2>&1)"
++  __nls_enc L "$(\builtin alias -p 2>&1)"
+   __nls_enc T "$1"
+-  __nls_enc B "$(\builtin enable -n)"
+-  __nls_enc X "$(\builtin shopt -p extdebug)"
++  __nls_enc B "$(\builtin enable -n 2>&1)"
++  __nls_enc X "$(\builtin shopt -p extdebug 2>&1)"
+   __nls_enc P "${PATH-}"
+-  __nls_v=$(\builtin jobs -ps) __nls_n=0
++  __nls_v=$(\builtin jobs -ps 2>&1) __nls_n=0
+   if [[ -n $__nls_v ]]; then __nls_c=${__nls_v//[!$'\n']/}; __nls_n=$((${#__nls_c} + 1)); fi
+   \builtin printf 'J %s\n' "$__nls_n" >&3
+   __nls_st=0 __nls_ps=() __nls_v= __nls_c= __nls_n=0 __nls_pre=
+   \builtin printf 'E\n' >&3
+   PS1='\$ ' PS2='> '
+-  if [[ :$2: == *:expand_aliases:* ]]; then \builtin shopt -s expand_aliases; fi
++  if [[ :$3: == *:expand_aliases:* ]]; then \builtin shopt -s expand_aliases; fi
++  if [[ $__nls_x == 1 ]]; then __nls_x=0; \builtin set -x; fi
+ }
+ \builtin unset PROMPT_COMMAND
+-PROMPT_COMMAND=('' '\__nls_done; \__nls_snap "$(\builtin trap -p)"')
++PROMPT_COMMAND=('' '\__nls_done "$?" "${PIPESTATUS[@]}" && \__nls_snap "$(\builtin trap -p 2>&1)" "$(\builtin trap -p DEBUG RETURN 2>&1)" "${BASHOPTS-}"')
+ builtin eval "$__nls_ea"; builtin unset __nls_ea
+ ```
+ 
+    The hooks call no external program, only bash builtins and parameter expansion.
+    `PS0` writes `\\n` because bash decodes prompt escapes before expanding `PS0` and would
+    turn `\n` into CR LF. `PROMPT_COMMAND` element 0 is empty (it keeps `$?` and
+-   `PIPESTATUS`), so `PROMPT_COMMAND=:` replaces it and leaves nl-shell's hook in place.
++   `PIPESTATUS`), so `PROMPT_COMMAND=:` replaces it and leaves nl-shell's hook in place;
++   the hook passes them to `__nls_done` as arguments. `__nls_done` first calls one builtin
++   (`printf`); if that fails (`builtin` or `printf` disabled), no record can be written, so
++   it stops and the snapshot is skipped, and the prompt rule (§4.2) degrades the session.
++   Every command substitution in the hooks captures stderr (`2>&1`), so a failing or
++   disabled builtin never yields an empty value that matches the baseline. After `D`,
++   `__nls_done` reads one line from fd 4 (`read -t 5 -u 4`), so bash is still in the hooks,
++   not in readline, when nl-shell reads the terminal settings for that `D` (§3);
++   `__nls_k` holds the read's status and is part of `H`, so a wait that failed or timed
++   out degrades at that snapshot.
+    `@NLS_END@` is replaced by a random token at every start: `__nls_done` prints that OSC
+    sequence on the PTY before it writes `D` and before the user's `PROMPT_COMMAND` runs,
+    and a command's output is what follows readline's end of the paste (`ESC [?2004l`) and
+    precedes that marker. The hooks are safe under `set -u` and `set -e`.
+ 
+-   **What this protects.** This is a closed list; nothing else is claimed yet (#141,
+-   #145).
++   **What this protects.** This is a closed list; nothing else is claimed (the review of
++   what else can evade the hooks is #145).
+    - A command that ran is never reported as "nothing ran" while the session stays
+      healthy, for: ordinary commands; a confirmed command that changes anything `H`
+      covers (§3), which degrades at that command's own snapshot; a `PS1` that assigns hook
+@@ -160,9 +202,18 @@ builtin eval "$__nls_ea"; builtin unset __nls_ea
+      is overwritten by nl-shell before it is shown. A confirmed change to `PS0` or
+      `PROMPT_COMMAND`, or to the attributes of `PS1`/`PS2` (such as `readonly`), degrades
+      at that command's own snapshot (`H`), but the code it set may still run once after
+-     that snapshot, before nl-shell refuses further commands. Other routes that run code
+-     after the snapshot (readline `bind -x`, a top-level DEBUG trap around
+-     `PROMPT_COMMAND` elements, `PS4`/xtrace) are not claimed.
++     that snapshot, before nl-shell refuses further commands. A `PS1`/`PS2` from
++     `~/.bashrc` that nl-shell cannot set to its fixed value (it has attributes such as
++     `readonly`) would be expanded at every prompt, after the snapshot, so the session
++     starts degraded.
++   - The bytes bash runs for a paste are the confirmed bytes, or nothing is sent (I1), for
++     the changes `H` covers (§3: traps `DEBUG`/`RETURN`, `extdebug`, `functrace`,
++     `xtrace`/`PS4`/`BASH_XTRACEFD`, history expansion, the hook builtins' enable state,
++     readline on/off, emacs/vi, readline variables and key bindings), each found at the
++     snapshot of the command that made it; and for the outside checks of §3 (terminal
++     settings, bash's fds 0-2, a stopped bash, TIOCSTI), which run before every paste.
++     `PS4` is readonly, so a command cannot set it; the hooks turn `xtrace` off for their
++     own body and back on as their last command.
+ 
+ ### 2. Records
+ 
+@@ -201,9 +252,43 @@ compared exactly; there is no checksum.
+   `E`; a confirmed change to their value or attributes shows in that command's `H`. The
+   only value that changes between snapshots is the sequence counter, which MUST equal the
+   `D` record's number. Everything else MUST equal the baseline byte for byte.
++  `H` also covers every Table A "detect" row of the session design (#101), so a
++  confirmed change to any of them degrades at that command's snapshot: the `DEBUG` and
++  `RETURN` traps (`trap -p DEBUG RETURN`, read at the top level of `PROMPT_COMMAND`, since
++  a function does not see them); `shopt -p extdebug`; `functrace`, `histexpand`, `emacs`
++  and `vi` (`shopt -po`); whether `xtrace` was on when the hooks started (`__nls_x`),
++  `declare -p` of `PS4` and `BASH_XTRACEFD`; whether each builtin the hooks call
++  (`HOOK_BUILTINS` in `session.py`) is enabled; and readline: `bind -v` (every variable)
++  and `bind -p`, `bind -s` and `bind -X` of the `emacs`, `vi-insert` and `vi-command`
++  keymaps (functions, macros and shell commands).
++- `T`, `X` and `B` are reported for the gate and not compared. `B` lists every disabled
++  builtin; only the hook builtins' enable state is part of `H`, so `enable -n` of a hook
++  builtin degrades and `enable -n` of any other builtin is only reported.
+ - `V` is `declare -p` of the pager and loader variables listed in spec `policy-gate/v1`
+   §7.5 (`NAME unset` when unset).
+ 
++**Outside checks.** nl-shell also reads, from outside bash, what bash could change without
++it showing in a snapshot, and compares it with what it read at the first prompt:
++
++- the PTY's terminal settings (`tcgetattr` on the master, which Linux answers with the
++  slave's), ignoring what readline changes while it waits for a line (`ICANON`, `ECHO`,
++  `ISIG`, `ICRNL`, `INLCR`, `IXON`, `IXANY`, `ISTRIP`, `INPCK`, `VMIN`, `VTIME`,
++  `VDISCARD`, `VLNEXT`); `ISIG` MUST be on whenever readline does not have the terminal;
++- bash's fds 0, 1 and 2 (`/proc/<bash pid>/fd/N`), which MUST be the session's terminal
++  (fd 1 may be the control pipe for an instant while a hook writes a record);
++- whether bash is stopped (`/proc/<bash pid>/stat` state `T` or `t`).
++
++They run immediately before every paste (nothing is written if one fails) and when each
++snapshot's `E` arrives. The terminal settings are also read for every `D` record, before
++nl-shell writes its line on fd 4: bash waits for that line in `__nls_done` (§1.3), so it
++is in the hooks, not in readline, and the settings are the ones the next command runs
++with. This is the one time `stty -isig` is visible, as readline turns `ISIG` back on while
++it waits. If the settings read then have `ICANON` and `ECHO` off, as readline's do,
++whether `ISIG` is on cannot be judged from them, and the session degrades. The stopped
++check also runs on every poll while a command runs. At start, nl-shell reads
++`/proc/sys/dev/tty/legacy_tiocsti`; unless it holds `0` (or it cannot be read), the session
++starts degraded. These checks read Linux `/proc`.
++
+ ### 4. Sequencing and degraded mode
+ 
+ 1. After sending a command, nl-shell MUST see `S n+1`, then `D n+1 …`, then a snapshot
+@@ -228,7 +313,17 @@ compared exactly; there is no checksum.
+      timeout can wait forever; timed or single-key reads (`read -t`, `read -n1 -t`) and
+      `select` degrade even when they would finish;
+    - the snapshot's `H` differs from the baseline (nl-shell's hooks were changed); this is
+-     found at the snapshot of the command that changed them.
++     found at the snapshot of the command that changed them;
++   - an outside check (§3) differs from the baseline: terminal settings or bash's fds 0-2;
++   - bash is stopped;
++   - TIOCSTI is allowed (`legacy_tiocsti` is not `0`, or cannot be read), at start;
++   - at start, `PS1` or `PS2` cannot be set to nl-shell's fixed value (§1.2).
++
++   Each degrade carries a fixed code naming the check that fired: `malformed`,
++   `out-of-order`, `missing-record` (a snapshot record, or the prompt rule's missing
++   `D`/`E`), `control-closed`, `baseline-invalid`, `h-changed`, `exited`,
++   `proc-unreadable`, `not-at-prompt`, `timeout`, `undelimited`, `outside-check`,
++   `stopped`, `tiocsti` and `prompt-not-fixed`.
+ 3. In degraded mode nl-shell MUST NOT send the session any further command until it is
+    restarted. The user MUST be told why, and nl-shell MUST offer to restart the session.
+ 4. **Session recovery.** When bash exits unexpectedly or the user accepts a restart,
+@@ -320,6 +415,8 @@ the others are untested.
+ 
+ ## Open questions
+ 
+-- `set -o vi` or other readline settings in `~/.bashrc` that change bracketed paste
+-  handling: probably force `enable-bracketed-paste on` in the rcfile; to verify.
++- Closed: `set -o vi` or other readline settings in `~/.bashrc` that change bracketed
++  paste handling. The rcfile forces `enable-bracketed-paste on` after `~/.bashrc` (§1.2;
++  #101 decision 6 and Table A's readline row), and a confirmed change to any readline
++  setting degrades (§3).
+ - Whether to send the `F` list as a hash plus a diff instead of in full when it changes.
+diff --git a/src/nl_shell/pty_protocol.py b/src/nl_shell/pty_protocol.py
+index 86b4848..318fcbf 100644
+--- a/src/nl_shell/pty_protocol.py
++++ b/src/nl_shell/pty_protocol.py
+@@ -29,6 +29,14 @@ _NUMERIC = {
+     "D": re.compile(rf"{_NUM} {_NUM}(?: {_NUM})*"),
+     "J": re.compile(_NUM),
+ }
++# Degrade codes (§4.2), one per check, so a caller can tell which check fired.
++CODE_MALFORMED = "malformed"
++CODE_OUT_OF_ORDER = "out-of-order"
++CODE_MISSING_RECORD = "missing-record"
++CODE_CONTROL_CLOSED = "control-closed"
++CODE_BASELINE_INVALID = "baseline-invalid"
++CODE_H_CHANGED = "h-changed"
++
+ # The one reversible free-text encoding (§2).
+ _ESCAPES = {"\\": "\\", "n": "\n", "r": "\r"}
+ 
+@@ -151,7 +159,8 @@ def check_command(command: str | bytes) -> bytes:
+ class ProtocolTracker:
+     """The §4 state machine. ``feed`` takes raw pipe bytes and returns the events they
+     completed: ``("S", n)``, ``("D", Done)``, ``("E", Snapshot)``. Degraded mode is sticky
+-    and keeps the first reason. Unknown record types are ignored (§Versioning)."""
++    and keeps the first reason and its code. Unknown record types are ignored
++    (§Versioning)."""
+ 
+     def __init__(self, on_record: Callable[[bytes], None] | None = None):
+         self.phase = Phase.BASELINE
+@@ -161,6 +170,7 @@ class ProtocolTracker:
+         self.done: Done | None = None
+         self.started = False  # an `S` came for the command in flight
+         self.degraded_reason: str | None = None
++        self.degraded_code: str | None = None
+         self._on_record = on_record
+         self._buf = bytearray()
+         self._fields: dict[str, str] = {}
+@@ -169,10 +179,11 @@ class ProtocolTracker:
+     def degraded(self) -> bool:
+         return self.phase is Phase.DEGRADED
+ 
+-    def degrade(self, reason: str) -> None:
++    def degrade(self, reason: str, code: str) -> None:
+         if self.phase is not Phase.DEGRADED:
+             self.phase = Phase.DEGRADED
+             self.degraded_reason = reason
++            self.degraded_code = code
+ 
+     def command_sent(self) -> None:
+         if self.phase is not Phase.IDLE:
+@@ -182,7 +193,7 @@ class ProtocolTracker:
+         self.phase = Phase.SENT
+ 
+     def eof(self) -> None:
+-        self.degrade("the control channel closed")
++        self.degrade("the control channel closed", CODE_CONTROL_CLOSED)
+ 
+     def feed(self, data: bytes) -> list[tuple[str, object]]:
+         events: list[tuple[str, object]] = []
+@@ -193,7 +204,7 @@ class ProtocolTracker:
+             end = self._buf.find(b"\n")
+             if end < 0:
+                 if len(self._buf) > MAX_RECORD:
+-                    self.degrade("malformed control record: record is too long")
++                    self.degrade("malformed control record: record is too long", CODE_MALFORMED)
+                 break
+             line = bytes(self._buf[: end + 1])
+             del self._buf[: end + 1]
+@@ -208,7 +219,7 @@ class ProtocolTracker:
+         try:
+             return self._sequence(parse_record(line))
+         except (ProtocolError, ValueError) as exc:
+-            self.degrade(f"malformed control record: {exc}")
++            self.degrade(f"malformed control record: {exc}", CODE_MALFORMED)
+             return None
+ 
+     def _sequence(self, record: Record) -> tuple[str, object] | None:
+@@ -258,7 +269,9 @@ class ProtocolTracker:
+         return ("D", done)
+ 
+     def _out_of_order(self, rtype: str, where: str) -> None:
+-        self.degrade(f"control record '{rtype}' arrived out of order ({where})")
++        self.degrade(
++            f"control record '{rtype}' arrived out of order ({where})", CODE_OUT_OF_ORDER
++        )
+         return None
+ 
+     @staticmethod
+@@ -270,7 +283,9 @@ class ProtocolTracker:
+         fields, self._fields = self._fields, {}
+         missing = [t for t in SNAPSHOT_TYPES if t not in fields]
+         if missing:
+-            self.degrade(f"snapshot is missing record(s) {', '.join(missing)}")
++            self.degrade(
++                f"snapshot is missing record(s) {', '.join(missing)}", CODE_MISSING_RECORD
++            )
+             return None
+         text = {t: decode_field(v) for t, v in fields.items() if t != "J"}
+         snapshot = Snapshot(
+@@ -288,14 +303,18 @@ class ProtocolTracker:
+         self.snapshot = snapshot
+         if self.baseline is None:
+             if snapshot.hooks.count(_seq_line(snapshot.seq)) != 1:
+-                self.degrade("the baseline's H does not report the sequence counter")
++                self.degrade(
++                    "the baseline's H does not report the sequence counter", CODE_BASELINE_INVALID
++                )
+                 return None
+             self.baseline = snapshot
+         elif snapshot.hooks != expected_hooks(self.baseline, snapshot.seq):
+             self.degrade(
+-                "nl-shell's hooks changed (PROMPT_COMMAND, PS0, PS1/PS2, TERM, promptvars,"
+-                " the hook functions, their state variables or the saved user hook):"
+-                " the snapshot's H differs from the baseline"
++                "nl-shell's hooks or what they depend on changed (PROMPT_COMMAND, PS0,"
++                " PS1/PS2, TERM, the hook functions and their state, DEBUG/RETURN traps,"
++                " shell options, xtrace settings, the hook builtins, readline settings or"
++                " key bindings): the snapshot's H differs from the baseline",
++                CODE_H_CHANGED,
+             )
+             return None
+         self.seq = snapshot.seq
+diff --git a/src/nl_shell/session.py b/src/nl_shell/session.py
+index 3d6b62f..371684e 100644
+--- a/src/nl_shell/session.py
++++ b/src/nl_shell/session.py
+@@ -2,13 +2,19 @@
+ 
+ ``Session.start()`` runs ``bash --noprofile --rcfile <rcfile> -i`` on a PTY (ptyprocess,
+ ADR-0021 §2) with a pipe as fd 3, the control channel (spec
+-``docs/design/specs/pty-protocol/v1.md`` §1, ADR-0014). ``Session.run()`` pastes one
+-confirmed command (§5) and returns its status, ``PIPESTATUS``, output and snapshot. Status
++``docs/design/specs/pty-protocol/v1.md`` §1, ADR-0014), and a pipe as fd 4 on which
++nl-shell answers each ``D`` record once it has read the terminal settings (§1, §3).
++``Session.run()`` pastes one confirmed command (§5) and returns its status,
++``PIPESTATUS``, output and snapshot. Status
+ and completion come only from control-channel records, never from text on the PTY.
+ 
+ A protocol violation puts the session in degraded mode (§4.2) until ``restart()``; while
+-degraded nothing more is written to the PTY (§4.3). Terminal ownership (§6) and the REPL
+-are later work (#102, #78). The prompt rule reads Linux ``/proc``.
++degraded nothing more is written to the PTY (§4.3). Every degrade carries a fixed code
++(``degraded_code``, ``SessionDegraded.code``) naming the check that fired. Besides the
++records, nl-shell checks bash from outside (§3): the PTY's termios, bash's fds 0-2 and
++whether bash is stopped, and at start that TIOCSTI is off. Terminal ownership (§6) and the
++REPL are later work (#102, #78). The prompt rule and the outside checks read Linux
++``/proc``.
+ """
+ 
+ from __future__ import annotations
+@@ -17,18 +23,22 @@ import dataclasses
+ import fcntl
+ import os
+ import platform
++import re
+ import secrets
+ import select
+ import shutil
+ import stat
+ import struct
+ import tempfile
++import termios
+ import time
+ from typing import Callable
+ 
+ import ptyprocess
+ 
+ from nl_shell.pty_protocol import (
++    CODE_H_CHANGED,
++    CODE_MISSING_RECORD,
+     PASTE_END,
+     PASTE_START,
+     CommandRefused,
+@@ -40,8 +50,15 @@ from nl_shell.pty_protocol import (
+ )
+ 
+ __all__ = [
++    "CODE_H_CHANGED",
++    "CODE_MISSING_RECORD",
++    "CODE_OUTSIDE_CHECK",
++    "CODE_STOPPED",
++    "CODE_TIOCSTI",
+     "CommandRefused",
+     "CommandResult",
++    "HOOK_BUILTINS",
++    "HOOK_BUILTINS_WITHOUT_RECORDS",
+     "HOOK_STATE_VARS",
+     "RCFILE",
+     "Session",
+@@ -62,6 +79,7 @@ HOOK_STATE_VARS = (
+     "__nls_done",
+     "__nls_ea",
+     "__nls_enc",
++    "__nls_k",
+     "__nls_n",
+     "__nls_pre",
+     "__nls_ps",
+@@ -71,14 +89,58 @@ HOOK_STATE_VARS = (
+     "__nls_st",
+     "__nls_user_pc",
+     "__nls_v",
++    "__nls_x",
+ )
+ 
++# Every builtin the hooks call (PS0, PROMPT_COMMAND, the hook functions). H carries whether
++# each is enabled, so `enable -n` of one degrades at that command's snapshot; `enable -n`
++# of any other builtin is only reported in B (spec §3).
++HOOK_BUILTINS = (
++    ":",
++    "alias",
++    "bind",
++    "builtin",
++    "compgen",
++    "declare",
++    "enable",
++    "eval",
++    "jobs",
++    "printf",
++    "return",
++    "set",
++    "shopt",
++    "trap",
++    "read",  # last: the rcfile variable scan in the tests reads `read <word>` as a variable
++)
++
++# Of HOOK_BUILTINS, those without which the hooks write no record at all: every record is
++# written by `\builtin printf`. With one of these disabled no D comes, so the session
++# degrades by the prompt rule (code "missing-record") instead of at the snapshot.
++HOOK_BUILTINS_WITHOUT_RECORDS = ("builtin", "printf")
++
++# The readline keymaps whose bindings (functions, macros, shell commands) H carries.
++# `emacs` includes its meta and Ctrl-X maps; `vi` is `vi-command`.
++_KEYMAPS = "emacs vi-insert vi-command"
++
+ # The pager and loader variables of policy-gate v1 §7.5, reported in V.
+ _V_VARS = (
+     "PAGER MANPAGER SYSTEMD_PAGER GIT_PAGER LESSOPEN LESSCLOSE LD_PRELOAD LD_LIBRARY_PATH"
+     " BASH_ENV ENV"
+ )
+ 
++# Machine-checkable degrade codes (spec §4.2). The tracker's own (malformed, out-of-order,
++# missing-record, control-closed, baseline-invalid, h-changed) are in pty_protocol; the
++# prompt rule (no D or E, bash at a prompt) also uses missing-record.
++CODE_EXITED = "exited"
++CODE_PROC_UNREADABLE = "proc-unreadable"
++CODE_NOT_AT_PROMPT = "not-at-prompt"
++CODE_TIMEOUT = "timeout"
++CODE_UNDELIMITED = "undelimited"
++CODE_OUTSIDE_CHECK = "outside-check"
++CODE_STOPPED = "stopped"
++CODE_TIOCSTI = "tiocsti"
++CODE_PROMPT_NOT_FIXED = "prompt-not-fixed"
++
+ # The rcfile: the spec's reference (§1.3, which explains it; H and V are §3). In short:
+ # - PS0 writes S for every line bash reads, with no guard variable. nl-shell's hook is the
+ #   last PROMPT_COMMAND element (element 0 is empty, so `PROMPT_COMMAND=:` leaves the hook
+@@ -90,8 +152,20 @@ _V_VARS = (
+ # - only builtins and parameter expansion (no `PATH` lookup). Each `$( … )` is parsed
+ #   again when it runs, so `__nls_snap` turns `expand_aliases` off first (back on after E
+ #   if it was on) and PS0/PROMPT_COMMAND quote their command words (`\builtin`).
+-# - what this protects is the closed list in spec §1.3; nothing else is claimed yet
+-#   (#141, #145).
++# - every command substitution in the hooks captures stderr (`2>&1`), so a failing or
++#   disabled builtin never yields an empty value that matches the baseline.
++# - H also holds the Table A "detect" rows (spec §3): DEBUG/RETURN traps (read at the top
++#   level of PROMPT_COMMAND, as a function does not see them), extdebug, functrace,
++#   history expansion, emacs/vi, whether xtrace was on (`__nls_x`; the hooks turn it off
++#   for their own body and back on as their last command), PS4, BASH_XTRACEFD, whether
++#   each of HOOK_BUILTINS is enabled, every readline variable and every key binding.
++# - PS4 is readonly after ~/.bashrc: with xtrace on, bash expands PS4 for the hooks' first
++#   traced commands, before `__nls_done` can turn xtrace off, so a PS4 set by a command
++#   would run code before the snapshot.
++# - after writing D, `__nls_done` waits (up to 5 s) for nl-shell's answer on fd 4, so
++#   nl-shell reads the terminal settings while bash is still in the hooks, not in readline
++#   (spec §3). `__nls_k` holds the wait's status and is in H.
++# - what this protects is the closed list in spec §1.3; nothing else is claimed.
+ RCFILE = (
+     r"""# nl-shell session rcfile (pty-protocol v1 §1.3). Written by nl-shell; do not edit.
+ [ -f ~/.bashrc ] && . ~/.bashrc
+@@ -102,8 +176,9 @@ shopt -s promptvars
+ __nls_ea=$(shopt -p expand_aliases); shopt -u expand_aliases
+ __nls_user_pc=()
+ if declare -p PROMPT_COMMAND >/dev/null 2>&1; then __nls_user_pc=("${PROMPT_COMMAND[@]}"); fi
+-__nls_seq=-1 __nls_st=0 __nls_ps=() __nls_v= __nls_c= __nls_n=0 __nls_pre=
+-PS0='$(\\builtin printf "S %s\\n" "$((__nls_seq + 1))" >&3)'
++readonly PS4
++__nls_seq=-1 __nls_st=0 __nls_ps=() __nls_v= __nls_c= __nls_n=0 __nls_pre= __nls_x=0 __nls_k=0
++PS0='$(\\builtin printf "S %s\\n" "$((__nls_seq + 1))" 2>&1 >&3)'
+ __nls_ret() { \builtin return "$1"; }
+ __nls_enc() {
+   __nls_v=$2
+@@ -113,30 +188,36 @@ __nls_enc() {
+   \builtin printf '%s %s\n' "$1" "$__nls_v" >&3
+ }
+ __nls_done() {
+-  \builtin set -- "$?" "${PIPESTATUS[@]}"
+-  __nls_pre=$(\builtin declare -p __nls_pre __nls_c __nls_n __nls_ps __nls_st __nls_v 2>&1) ||
+-    \builtin :
+-  __nls_st=$1
+-  \builtin shift
+-  __nls_ps=("$@")
+-  \builtin printf '\033]7700;@NLS_END@\007'
+-  __nls_seq=$((__nls_seq + 1))
+-  \builtin printf -v __nls_v ' %s' "${__nls_ps[@]}"
+-  \builtin printf 'D %s %s%s\n' "$__nls_seq" "$__nls_st" "$__nls_v" >&3
+-  for __nls_c in "${__nls_user_pc[@]}"; do
+-    if __nls_ret "$__nls_st"; then
+-      \builtin eval "$__nls_c" || \builtin :
+-    else
+-      \builtin eval "$__nls_c" || \builtin :
+-    fi
+-  done
+-  __nls_st=0 __nls_ps=() __nls_v= __nls_c= __nls_n=0
++  # One builtin first: with `builtin` or `printf` disabled no record can be written, and
++  # every further call could run a command_not_found_handle; stop here instead.
++  \builtin printf '' && {
++    __nls_pre=$(\builtin declare -p __nls_pre __nls_c __nls_k __nls_n __nls_ps __nls_st __nls_v \
++      __nls_x 2>&1) || \builtin :
++    __nls_x=0
++    if [[ -o xtrace ]]; then __nls_x=1; \builtin set +x; fi
++    __nls_st=$1
++    __nls_ps=("${@:2}")
++    \builtin printf '\033]7700;@NLS_END@\007'
++    __nls_seq=$((__nls_seq + 1))
++    \builtin printf -v __nls_v ' %s' "${__nls_ps[@]}"
++    \builtin printf 'D %s %s%s\n' "$__nls_seq" "$__nls_st" "$__nls_v" >&3
++    \builtin read -r -t 5 -u 4 __nls_v
++    __nls_k=$?
++    for __nls_c in "${__nls_user_pc[@]}"; do
++      if __nls_ret "$__nls_st"; then
++        \builtin eval "$__nls_c" || \builtin :
++      else
++        \builtin eval "$__nls_c" || \builtin :
++      fi
++    done
++    __nls_st=0 __nls_ps=() __nls_v= __nls_c= __nls_n=0
++    (( 1 ))
++  }
+ }
+ __nls_snap() {
+-  \builtin set -- "$1" "${BASHOPTS-}"
+   \builtin shopt -u expand_aliases
+   for __nls_c in PS1 PS2; do
+-    __nls_v=$(\builtin declare -p "$__nls_c" 2>/dev/null) || __nls_v=
++    __nls_v=$(\builtin declare -p "$__nls_c" 2>&1) || __nls_v=
+     if [[ -z $__nls_v || ${__nls_v%%=*} == "declare -"[-x]" $__nls_c" ]]; then
+       if [[ $__nls_c == PS1 ]]; then PS1='\$ '; else PS2='> '; fi
+     fi
+@@ -144,37 +225,58 @@ __nls_snap() {
+   __nls_v= __nls_c=
+   __nls_enc H "$( {
+     \builtin declare -p PS0 PROMPT_COMMAND __nls_user_pc TERM PS1 PS2
+-    \builtin shopt -p promptvars
+-    for __nls_c in """
++    \builtin shopt -p promptvars extdebug
++    \builtin shopt -po functrace histexpand emacs vi
++    \builtin printf 'DEBUG/RETURN traps: %s\n' "$2"
++    for __nls_c in PS4 BASH_XTRACEFD """
+     + " ".join(HOOK_STATE_VARS)
+     + r"""; do
+-      \builtin declare -p "$__nls_c" 2>/dev/null || \builtin printf '%s unset\n' "$__nls_c"
++      \builtin declare -p "$__nls_c" 2>&1 || \builtin printf '%s unset\n' "$__nls_c"
+     done
+     \builtin declare -f __nls_done __nls_snap __nls_enc __nls_ret
++    __nls_v=$(\builtin enable -a 2>&1)
++    for __nls_c in """
++    + " ".join(HOOK_BUILTINS)
++    + r"""; do
++      case $'\n'$__nls_v$'\n' in
++        *$'\n'"enable $__nls_c"$'\n'*) \builtin printf 'builtin %s enabled\n' "$__nls_c" ;;
++        *) \builtin printf 'builtin %s not enabled\n' "$__nls_c" ;;
++      esac
++    done
++    \builtin bind -v
++    for __nls_c in """
++    + _KEYMAPS
++    + r"""; do
++      \builtin printf 'keymap %s\n' "$__nls_c"
++      \builtin bind -m "$__nls_c" -p
++      \builtin bind -m "$__nls_c" -s
++      \builtin bind -m "$__nls_c" -X
++    done
+   } 2>&1 )"
+   __nls_enc V "$(
+     for __nls_c in """
+     + _V_VARS
+     + r"""; do
+-      \builtin declare -p "$__nls_c" 2>/dev/null || \builtin printf '%s unset\n' "$__nls_c"
++      \builtin declare -p "$__nls_c" 2>&1 || \builtin printf '%s unset\n' "$__nls_c"
+     done
+   )"
+-  __nls_enc F "$(\builtin compgen -A function)"
+-  __nls_enc L "$(\builtin alias -p)"
++  __nls_enc F "$(\builtin compgen -A function 2>&1)"
++  __nls_enc L "$(\builtin alias -p 2>&1)"
+   __nls_enc T "$1"
+-  __nls_enc B "$(\builtin enable -n)"
+-  __nls_enc X "$(\builtin shopt -p extdebug)"
++  __nls_enc B "$(\builtin enable -n 2>&1)"
++  __nls_enc X "$(\builtin shopt -p extdebug 2>&1)"
+   __nls_enc P "${PATH-}"
+-  __nls_v=$(\builtin jobs -ps) __nls_n=0
++  __nls_v=$(\builtin jobs -ps 2>&1) __nls_n=0
+   if [[ -n $__nls_v ]]; then __nls_c=${__nls_v//[!$'\n']/}; __nls_n=$((${#__nls_c} + 1)); fi
+   \builtin printf 'J %s\n' "$__nls_n" >&3
+   __nls_st=0 __nls_ps=() __nls_v= __nls_c= __nls_n=0 __nls_pre=
+   \builtin printf 'E\n' >&3
+   PS1='\$ ' PS2='> '
+-  if [[ :$2: == *:expand_aliases:* ]]; then \builtin shopt -s expand_aliases; fi
++  if [[ :$3: == *:expand_aliases:* ]]; then \builtin shopt -s expand_aliases; fi
++  if [[ $__nls_x == 1 ]]; then __nls_x=0; \builtin set -x; fi
+ }
+ \builtin unset PROMPT_COMMAND
+-PROMPT_COMMAND=('' '\__nls_done; \__nls_snap "$(\builtin trap -p)"')
++PROMPT_COMMAND=('' '\__nls_done "$?" "${PIPESTATUS[@]}" && \__nls_snap "$(\builtin trap -p 2>&1)" "$(\builtin trap -p DEBUG RETURN 2>&1)" "${BASHOPTS-}"')
+ builtin eval "$__nls_ea"; builtin unset __nls_ea
+ """
+ )
+@@ -217,19 +319,44 @@ _POLL = 0.02
+ 
+ _DEV_TTY = os.makedev(5, 0)
+ 
++# Where the kernel says whether TIOCSTI (pushing input into a terminal) is allowed.
++TIOCSTI_PATH = "/proc/sys/dev/tty/legacy_tiocsti"
++
++# What readline changes in the terminal settings while it waits for a line, and restores
++# before a command runs; the outside check ignores these (ISIG is checked separately).
++_RL_IFLAG = (
++    termios.ICRNL | termios.INLCR | termios.IXON | termios.IXANY | termios.ISTRIP
++    | termios.INPCK
++)
++_RL_LFLAG = termios.ICANON | termios.ECHO | termios.ISIG
++_RL_CC = tuple(
++    getattr(termios, name) for name in ("VMIN", "VTIME", "VDISCARD", "VLNEXT")
++    if hasattr(termios, name)
++)
++
++# PS1 and PS2 as the rcfile sets them, in `declare -p` text.
++_FIXED_PROMPTS = {"PS1": r'"\\\$ "', "PS2": '"> "'}
++
+ 
+ class SessionError(Exception):
+     """The session cannot do what was asked."""
+ 
+ 
+ class SessionDegraded(SessionError):
+-    """The session is in degraded mode (§4.2); ``reason`` says why. ``result`` is the
+-    command's result when its own snapshot degraded the session (``H`` changed)."""
++    """The session is in degraded mode (§4.2); ``reason`` says why and ``code`` names the
++    check that fired. ``result`` is the command's result when the session degraded at its
++    own snapshot (``H`` changed, or an outside check when its ``E`` arrived)."""
+ 
+-    def __init__(self, reason: str, result: "CommandResult | None" = None):
++    def __init__(
++        self,
++        reason: str,
++        result: "CommandResult | None" = None,
++        code: str | None = None,
++    ):
+         super().__init__(f"session degraded: {reason}")
+         self.reason = reason
+         self.result = result
++        self.code = code
+ 
+ 
+ class SessionTimeout(SessionError, TimeoutError):
+@@ -237,7 +364,16 @@ class SessionTimeout(SessionError, TimeoutError):
+ 
+ 
+ class _ProcUnreadable(Exception):
+-    """``/proc/<pid>/syscall`` could not be read: the prompt rule cannot be applied."""
++    """A ``/proc/<pid>/…`` file could not be read: the prompt rule or an outside check
++    cannot be applied."""
++
++
++@dataclasses.dataclass(frozen=True)
++class _OutsideBaseline:
++    """What the outside checks compare against, read at the first prompt."""
++
++    termios: tuple
++    fds: tuple[tuple[int, int, int, int], ...]  # bash's fds 0, 1, 2: type, dev, ino, rdev
+ 
+ 
+ @dataclasses.dataclass(frozen=True)
+@@ -334,16 +470,20 @@ class Session:
+         on_record: Callable[[bytes], None] | None = None,
+         max_output: int = MAX_OUTPUT,
+         proc_root: str = "/proc",
++        tiocsti_path: str = TIOCSTI_PATH,
+     ):
+         """Prefer :meth:`start`. ``on_record`` sees every control record.
+ 
+-        ``proc_root`` is where bash's ``<pid>/syscall`` is read for the prompt rule (§4.2);
+-        if it cannot be read the session degrades with a reason naming the file.
++        ``proc_root`` is where bash's ``<pid>/syscall``, ``<pid>/stat`` and ``<pid>/fd``
++        are read for the prompt rule and the outside checks (§4.2); if one cannot be read
++        the session degrades with a reason naming the file. ``tiocsti_path`` is read (only)
++        at start: unless it holds ``0`` the session starts degraded.
+         """
+         if max_output < 1:
+             raise ValueError("max_output must be at least 1")
+         self.max_output = max_output
+         self.proc_root = proc_root
++        self.tiocsti_path = tiocsti_path
+         self._env = dict(os.environ if env is None else env)
+         if self._env.get("TERM", "dumb") == "dumb":
+             # Readline turns bracketed paste off on a dumb terminal (§5.1 needs it).
+@@ -354,10 +494,13 @@ class Session:
+         self._proc: ptyprocess.PtyProcess | None = None
+         self._ctl: int | None = None
+         self._ctl_open = False
++        self._ack: int | None = None  # write end of bash's fd 4 (the answer to each D)
++        self._ctl_tail = b""  # start of a control line not yet complete
+         self._rcdir: str | None = None
+         self._tracker = ProtocolTracker(on_record)
+         self._end = b""  # this start's end-of-output marker (_end_marker)
+         self._tty_rdev: int | None = None  # device number of the PTY slave (bash's fd 0)
++        self._outside: _OutsideBaseline | None = None
+ 
+     # ----- lifecycle --
+ 
+@@ -395,6 +538,9 @@ class Session:
+         if self._ctl is not None:
+             os.close(self._ctl)
+             self._ctl = None
++        if self._ack is not None:
++            os.close(self._ack)
++            self._ack = None
+         self._ctl_open = False
+         self._remove_rcfile()
+ 
+@@ -405,6 +551,7 @@ class Session:
+         self.close()
+ 
+     def _spawn(self, timeout: float) -> None:
++        self._outside = None
+         self._rcdir = tempfile.mkdtemp(prefix="nl-shell-session-")
+         rcfile = os.path.join(self._rcdir, "rc.bash")
+         token = secrets.token_hex(16)
+@@ -412,11 +559,14 @@ class Session:
+         with open(rcfile, "w", encoding="utf-8") as fh:
+             fh.write(RCFILE.replace(_END_TOKEN, token))
+         ctl_read, ctl_write = os.pipe()
+-
+-        def wire_fd3() -> None:  # runs in the child, after fork
+-            high = fcntl.fcntl(ctl_write, fcntl.F_DUPFD, 10)
+-            os.dup2(high, 3)  # a dup2 copy is inheritable
+-            for fd in {high, ctl_write} - {3}:
++        ack_read, ack_write = os.pipe()
++
++        def wire_fds() -> None:  # runs in the child, after fork
++            high_ctl = fcntl.fcntl(ctl_write, fcntl.F_DUPFD, 10)
++            high_ack = fcntl.fcntl(ack_read, fcntl.F_DUPFD, 10)
++            os.dup2(high_ctl, 3)  # a dup2 copy is inheritable
++            os.dup2(high_ack, 4)
++            for fd in {high_ctl, high_ack, ctl_write, ack_read} - {3, 4}:
+                 os.close(fd)
+ 
+         try:
+@@ -425,15 +575,19 @@ class Session:
+                 cwd=self._cwd,
+                 env=self._env,
+                 dimensions=self._dimensions,
+-                pass_fds=(ctl_write,),
+-                preexec_fn=wire_fd3,
++                pass_fds=(ctl_write, ack_read),
++                preexec_fn=wire_fds,
+             )
+         except BaseException:
+             os.close(ctl_read)
++            os.close(ack_write)
+             raise
+         finally:
+             os.close(ctl_write)  # only bash (and what it starts) holds the write end
++            os.close(ack_read)  # and the read end of the answers
++        os.set_blocking(ack_write, False)
+         self._ctl, self._ctl_open = ctl_read, True
++        self._ack, self._ctl_tail = ack_write, b""
+         self._tty_rdev = _pty_slave_rdev(self._proc.fd)
+ 
+         deadline = time.monotonic() + timeout
+@@ -446,10 +600,59 @@ class Session:
+             if self._ctl in ready:
+                 self._read_control()
+             if self._tracker.degraded:
+-                raise SessionDegraded(self._tracker.degraded_reason or "unknown")
++                self._raise_if_degraded()
+         self._remove_rcfile()  # bash has read it
+         # Fail closed at start if the prompt rule cannot be applied (§4.2 third trigger).
+-        self._wait_for_prompt()
++        if not self._wait_for_prompt():
++            return
++        self._check_fixed_prompts()
++        self._check_tiocsti()
++        if self._tracker.degraded:
++            return
++        attrs = self._termios()
++        if attrs is None:
++            self._degrade("outside check: cannot read the terminal settings", CODE_OUTSIDE_CHECK)
++            return
++        try:
++            self._outside = _OutsideBaseline(attrs, self._fds())
++        except _ProcUnreadable as exc:
++            self._degrade(str(exc), CODE_PROC_UNREADABLE)
++
++    def _check_fixed_prompts(self) -> None:
++        """PS1/PS2 must hold nl-shell's fixed values in the baseline. One that ``~/.bashrc``
++        made readonly (or gave another attribute) would be expanded at every prompt, after
++        the snapshot, so its code could change what the next paste runs (I3)."""
++        hooks = self._tracker.baseline.hooks if self._tracker.baseline else ""
++        for name, value in _FIXED_PROMPTS.items():
++            found = re.findall(rf"^declare -(\S+) {name}=(.*)$", hooks, flags=re.MULTILINE)
++            if not (len(found) == 1 and set(found[0][0]) <= set("-rx") and found[0][1] == value):
++                self._degrade(
++                    f"{name} from ~/.bashrc cannot be set to nl-shell's fixed value (it has"
++                    " attributes such as readonly), so its expansion at every prompt could"
++                    " change what a later command runs",
++                    CODE_PROMPT_NOT_FIXED,
++                )
++                return
++
++    def _check_tiocsti(self) -> None:
++        """Start degraded unless ``tiocsti_path`` reads ``0`` (TIOCSTI is off)."""
++        path = self.tiocsti_path
++        try:
++            with open(path, encoding="ascii") as fh:
++                value = fh.read().strip()
++        except (OSError, UnicodeDecodeError) as exc:
++            self._degrade(
++                f"cannot read {path} ({exc.__class__.__name__}), so TIOCSTI may be allowed:"
++                " a command could push input into the session's terminal",
++                CODE_TIOCSTI,
++            )
++            return
++        if value != "0":
++            self._degrade(
++                f"{path} is {value!r}, not '0': TIOCSTI is allowed, so a command could push"
++                " input into the session's terminal",
++                CODE_TIOCSTI,
++            )
+ 
+     def _remove_rcfile(self) -> None:
+         if self._rcdir is not None:
+@@ -470,6 +673,11 @@ class Session:
+     def degraded_reason(self) -> str | None:
+         return self._tracker.degraded_reason
+ 
++    @property
++    def degraded_code(self) -> str | None:
++        """Which check degraded the session (the ``CODE_*`` constants), None if healthy."""
++        return self._tracker.degraded_code
++
+     @property
+     def baseline(self) -> Snapshot | None:
+         return self._tracker.baseline
+@@ -511,13 +719,21 @@ class Session:
+         # Paste only into readline: bash must be waiting for a line.
+         self._wait_for_prompt()
+         self._raise_if_degraded()
++        # The outside checks, immediately before the paste (§3).
++        self._check_outside(at_prompt=True)
++        self._raise_if_degraded()
+         self._tracker.command_sent()
+         _write_all(self._proc.fd, PASTE_START + data + PASTE_END + b"\r")
+         return self._wait_for_result(timeout)
+ 
+     def _raise_if_degraded(self) -> None:
+         if self._tracker.degraded:
+-            raise SessionDegraded(self._tracker.degraded_reason or "unknown")
++            raise SessionDegraded(
++                self._tracker.degraded_reason or "unknown", code=self._tracker.degraded_code
++            )
++
++    def _degrade(self, reason: str, code: str) -> None:
++        self._tracker.degrade(reason, code)
+ 
+     def _wait_for_result(self, timeout: float | None) -> CommandResult:
+         assert self._proc is not None and self._ctl is not None
+@@ -539,6 +755,7 @@ class Session:
+                         done = value  # type: ignore[assignment]
+                     elif kind == "E":
+                         finished = value  # type: ignore[assignment]
++                        self._check_outside(at_prompt=False)
+                         if self._tracker.started and not self._tracker.degraded:
+                             self._await_output_end(output)
+                 if finished is not None:
+@@ -549,7 +766,9 @@ class Session:
+                 snapshot = self._tracker.snapshot
+                 if done is not None and snapshot is not None and snapshot.seq == done.seq:
+                     result = self._result(done, snapshot, output)
+-                raise SessionDegraded(self._tracker.degraded_reason or "unknown", result)
++                raise SessionDegraded(
++                    self._tracker.degraded_reason or "unknown", result, self._tracker.degraded_code
++                )
+             if finished is not None:
+                 assert done is not None
+                 return self._result(done, finished, output)
+@@ -558,23 +777,28 @@ class Session:
+             # §4.2 third trigger; until E, as a snapshot cut short also ends at a prompt.
+             try:
+                 reading = self._reading_terminal()
++                stopped = self._stopped()
+             except _ProcUnreadable as exc:
+-                self._tracker.degrade(str(exc))
++                self._degrade(str(exc), CODE_PROC_UNREADABLE)
++                continue
++            if stopped:
++                self._degrade_stopped()
+                 continue
+             if reading:
+                 if waiting_since is None:
+                     waiting_since = now
+                 elif now - waiting_since >= PROMPT_GRACE:
+-                    self._tracker.degrade(
++                    self._degrade(
+                         "no done record after the shell returned to a prompt"
+                         if done is None
+-                        else "the snapshot did not finish after the shell returned to a prompt"
++                        else "the snapshot did not finish after the shell returned to a prompt",
++                        CODE_MISSING_RECORD,
+                     )
+                     continue
+             else:
+                 waiting_since = None
+             if deadline is not None and now > deadline:
+-                self._tracker.degrade("no done record within the caller's timeout")
++                self._degrade("no done record within the caller's timeout", CODE_TIMEOUT)
+                 raise SessionTimeout(f"command did not finish within {timeout} s")
+ 
+     def _await_output_end(self, output: _Output) -> None:
+@@ -590,9 +814,10 @@ class Session:
+         if self._tracker.degraded:
+             return
+         if not output.delimited:
+-            self._tracker.degrade(
++            self._degrade(
+                 "the command's output could not be delimited (readline did not end a"
+-                " bracketed paste, or the end marker before D never reached the terminal)"
++                " bracketed paste, or the end marker before D never reached the terminal)",
++                CODE_UNDELIMITED,
+             )
+ 
+     def _result(self, done: Done, snapshot: Snapshot, output: _Output) -> CommandResult:
+@@ -619,10 +844,10 @@ class Session:
+                 if self._reading_terminal():
+                     return True
+             except _ProcUnreadable as exc:
+-                self._tracker.degrade(str(exc))
++                self._degrade(str(exc), CODE_PROC_UNREADABLE)
+                 return False
+             if time.monotonic() > deadline:
+-                self._tracker.degrade("the shell did not return to its prompt")
++                self._degrade("the shell did not return to its prompt", CODE_NOT_AT_PROMPT)
+                 return False
+             self._drain_control()
+             if self._tracker.degraded:
+@@ -690,6 +915,114 @@ class Session:
+         # `/dev/tty` (5, 0) is bash's controlling terminal, which is this PTY too.
+         return stat.S_ISCHR(info.st_mode) and info.st_rdev in (self._tty_rdev, _DEV_TTY)
+ 
++    # ----- the outside checks (spec §3, Table B) --
++
++    def _check_outside(self, *, at_prompt: bool) -> None:
++        """Degrade if bash is stopped, or its terminal settings or fds 0-2 differ from the
++        baseline. ``at_prompt``: bash waits in readline, so its fds must be exactly the
++        baseline's; otherwise (when ``E`` arrives) fd 1 may be the control pipe for an
++        instant, while a hook writes a record."""
++        if self._tracker.degraded or self._outside is None:
++            return
++        try:
++            if self._stopped():
++                self._degrade_stopped()
++                return
++            fds = self._fds()
++        except _ProcUnreadable as exc:
++            self._degrade(str(exc), CODE_PROC_UNREADABLE)
++            return
++        for n, (now, then) in enumerate(zip(fds, self._outside.fds)):
++            if now != then and not (n == 1 and not at_prompt and self._is_control_pipe(now)):
++                self._degrade(
++                    f"outside check: bash's fd {n} is no longer the session's terminal",
++                    CODE_OUTSIDE_CHECK,
++                )
++                return
++        self._check_termios()
++
++    def _check_termios(self, *, in_hooks: bool = False) -> None:
++        """Degrade if the PTY's terminal settings differ from the baseline in anything
++        readline does not change, or if ISIG is off while readline is not running.
++
++        ``in_hooks``: called for a ``D`` record, while bash waits in ``__nls_done`` for
++        the answer on fd 4, so readline cannot hold the terminal and these are the settings
++        the next command runs with. Readline turns ISIG on while it waits for a line, so
++        this is the one time ``stty -isig`` is visible. Settings that look like readline's
++        (ICANON and ECHO off) fail closed then, as ISIG cannot be judged from them."""
++        if self._tracker.degraded or self._outside is None:
++            return
++        attrs = self._termios()
++        if attrs is None:
++            self._degrade("outside check: cannot read the terminal settings", CODE_OUTSIDE_CHECK)
++            return
++        if _termios_view(attrs) != _termios_view(self._outside.termios):
++            self._degrade(
++                "outside check: the session terminal's settings changed (stty)",
++                CODE_OUTSIDE_CHECK,
++            )
++        elif in_hooks and _readline_prepped(attrs):
++            self._degrade(
++                "outside check: when the command ended the terminal had ICANON and ECHO off"
++                " (stty -icanon -echo), so whether signals are on cannot be checked",
++                CODE_OUTSIDE_CHECK,
++            )
++        elif not _readline_prepped(attrs) and not attrs[3] & termios.ISIG:
++            self._degrade(
++                "outside check: signals from the session's terminal are off (stty -isig)",
++                CODE_OUTSIDE_CHECK,
++            )
++
++    def _degrade_stopped(self) -> None:
++        self._degrade("the shell is stopped", CODE_STOPPED)
++
++    def _termios(self):
++        assert self._proc is not None
++        try:
++            # On the master, Linux reads (and sets) the slave's settings.
++            return termios.tcgetattr(self._proc.fd)
++        except termios.error:
++            return None
++
++    def _fds(self) -> tuple[tuple[int, int, int, int], ...]:
++        """What bash's fds 0, 1 and 2 are; raises :class:`_ProcUnreadable`."""
++        assert self._proc is not None
++        out = []
++        for n in (0, 1, 2):
++            path = os.path.join(self.proc_root, str(self._proc.pid), "fd", str(n))
++            try:
++                info = os.stat(path)
++            except OSError as exc:
++                raise _ProcUnreadable(
++                    f"cannot read {path} ({exc.__class__.__name__}), so the outside check"
++                    " of bash's fds cannot be applied"
++                ) from exc
++            out.append(_file_identity(info))
++        return tuple(out)
++
++    def _is_control_pipe(self, identity: tuple[int, int, int, int]) -> bool:
++        if self._ctl is None or not self._ctl_open:
++            return False
++        return identity == _file_identity(os.fstat(self._ctl))
++
++    def _stopped(self) -> bool:
++        """bash is stopped (``/proc/<pid>/stat`` state ``T`` or ``t``); raises
++        :class:`_ProcUnreadable`."""
++        assert self._proc is not None
++        path = os.path.join(self.proc_root, str(self._proc.pid), "stat")
++        try:
++            with open(path, encoding="ascii", errors="replace") as fh:
++                text = fh.read()
++        except OSError as exc:
++            raise _ProcUnreadable(
++                f"cannot read {path} ({exc.__class__.__name__}), so whether the shell is"
++                " stopped cannot be checked"
++            ) from exc
++        fields = text[text.rfind(")") + 1 :].split()
++        if not fields:
++            raise _ProcUnreadable(f"cannot parse {path}")
++        return fields[0] in ("T", "t")
++
+     # ----- helpers --
+ 
+     def _read_pty(self) -> bytes:
+@@ -699,7 +1032,7 @@ class Session:
+         except OSError:
+             chunk = b""  # EIO: bash has exited and the slave side is gone
+         if not chunk:
+-            self._tracker.degrade("the shell exited")
++            self._degrade("the shell exited", CODE_EXITED)
+         return chunk
+ 
+     def _drain_pty(self) -> None:
+@@ -721,7 +1054,25 @@ class Session:
+             self._ctl_open = False
+             self._tracker.eof()
+             return []
+-        return self._tracker.feed(data)
++        # Every D line is answered, also one the tracker rejects or the baseline's.
++        lines = (self._ctl_tail + data).split(b"\n")
++        self._ctl_tail = lines.pop()[:2]  # only a line's start matters here
++        dones = sum(1 for line in lines if line[:2] == b"D ")
++        records = self._tracker.feed(data)
++        for _ in range(dones):
++            # bash waits in `__nls_done` until answered: read the settings first (§3).
++            self._check_termios(in_hooks=True)
++            self._answer_done()
++        return records
++
++    def _answer_done(self) -> None:
++        """Let ``__nls_done`` go on (it reads one line from fd 4), even when degraded."""
++        if self._ack is None:
++            return
++        try:
++            os.write(self._ack, b"\n")
++        except OSError:
++            pass  # bash is gone, or not reading (its 5 s wait ends; H shows the status)
+ 
+ 
+ def _pty_slave_rdev(master_fd: int) -> int | None:
+@@ -737,6 +1088,28 @@ def _pty_slave_rdev(master_fd: int) -> int | None:
+         return None
+ 
+ 
++def _file_identity(info: os.stat_result) -> tuple[int, int, int, int]:
++    return (stat.S_IFMT(info.st_mode), info.st_dev, info.st_ino, info.st_rdev)
++
++
++def _cc_int(value) -> int:
++    return value[0] if isinstance(value, bytes) else int(value)
++
++
++def _termios_view(attrs) -> tuple:
++    """Terminal settings without what readline changes while it waits for a line."""
++    iflag, oflag, cflag, lflag, ispeed, ospeed, cc = attrs
++    chars = [_cc_int(c) for c in cc]
++    for index in _RL_CC:
++        chars[index] = 0
++    return (iflag & ~_RL_IFLAG, oflag, cflag, lflag & ~_RL_LFLAG, ispeed, ospeed, tuple(chars))
++
++
++def _readline_prepped(attrs) -> bool:
++    """readline has the terminal (it turns off ICANON and ECHO, and turns ISIG on)."""
++    return not attrs[3] & (termios.ICANON | termios.ECHO)
++
++
+ def _select(fds: list[int], timeout: float) -> list[int]:
+     ready, _, _ = select.select(fds, [], [], timeout)
+     return ready
+diff --git a/tests/test_session.py b/tests/test_session.py
+index 377e95a..4b58807 100644
+--- a/tests/test_session.py
++++ b/tests/test_session.py
+@@ -808,7 +808,12 @@ def test_fake_programs_cannot_change_the_snapshot(start_session, tmp_path, setup
+ # ---- (m, first half) the user's ~/.bashrc --
+ 
+ 
+-_NLS_HOOK = '\\__nls_done; \\__nls_snap "$(\\builtin trap -p)"'
++def _nls_hook() -> str:
++    """nl-shell's PROMPT_COMMAND element, as the rcfile in use sets it."""
++    prefix = "PROMPT_COMMAND=('' '"
++    line = next(line for line in _session_module().RCFILE.split("\n") if line.startswith(prefix))
++    assert line.endswith("')"), line
++    return line[len(prefix) : -2]
+ 
+ 
+ def _prompt_settings(hooks: str) -> tuple[str, str, list[str]]:
+@@ -855,7 +860,7 @@ def test_bashrc_alias_and_prompt_command_run_before_the_snapshot(start_session):
+     for snap in snapshots:
+         ps1, ps2, elements = _prompt_settings(snap.hooks)
+         assert (ps1, ps2) == ("\\$ ", "> "), snap.seq
+-        assert elements[-1] == _NLS_HOOK, snap.seq
++        assert elements[-1] == _nls_hook(), snap.seq
+         assert all(element == "" for element in elements[:-1]), elements
+     assert not session.degraded
+ 
+@@ -1000,3 +1005,339 @@ def test_captured_output_is_bounded_and_keeps_the_tail(start_session):
+     assert len(result.output) <= 1000
+     assert result.text.endswith("END_MARK\n")
+     assert not _run(session, "echo small").output_truncated
++
++
++# ---- #141: tamper checks. Section letters are the parent brief's (#101): (h) (i) (j) (m,
++# second half) (p) (r) (s). "Marker" is a file the injected code would create.
++
++
++def _assert_degraded_with(session, caught, code):
++    """The session is degraded and the check that fired is ``code``."""
++    assert session.degraded
++    assert session.degraded_code == code, (session.degraded_code, session.degraded_reason)
++    assert caught.code == code, (caught.code, caught.reason)
++
++
++# Table A rows: each degrades at its own snapshot, code h-changed. Table B (fds): code
++# outside-check. `exec </dev/null` only "raises without writing" (bash reads EOF and
++# exits, so `exited` or `outside-check` may fire first).
++_TAMPER = {
++    "debug-trap": ("trap ':' DEBUG", "h-changed"),
++    "return-trap": ("trap ':' RETURN", "h-changed"),
++    "functrace": ("set -o functrace", "h-changed"),
++    "extdebug": ("shopt -s extdebug", "h-changed"),
++    "history-expansion": ("set -H", "h-changed"),
++    "vi-mode": ("set -o vi", "h-changed"),
++    "readline-off": ("set +o emacs", "h-changed"),
++    "cr-macro": ("bind '\"\\r\": \" ; touch {mark}\\n\"'", "h-changed"),
++    "cr-shell-command": ("bind -x '\"\\C-m\": \"touch {mark}\"'", "h-changed"),
++    "paste-start-prefix": ("bind '\"\\e[2\": \"touch {mark}\\n\"'", "h-changed"),
++    "bracketed-paste-off": ("bind 'set enable-bracketed-paste off'", "h-changed"),
++    "convert-meta": ("bind 'set convert-meta on'", "h-changed"),
++    "stdout-null": ("exec >/dev/null", "outside-check"),
++    "stderr-null": ("exec 2>/dev/null", "outside-check"),
++    "stdin-null": ("exec </dev/null", None),
++}
++
++
++@pytest.mark.parametrize("change", sorted(_TAMPER))
++def test_h_tamper_degrades_and_the_next_paste_is_not_written(start_session, monkeypatch,
++                                                             tmp_path, change):
++    pty_writes = _spy_on_pty_writes(monkeypatch)
++    session_mod = _session_module()
++    marker = tmp_path / "MARK"
++    command, code = _TAMPER[change]
++    session, _ = start_session()
++    began = time.monotonic()
++    with pytest.raises(session_mod.SessionDegraded) as caught:
++        _run(session, command.format(mark=marker))
++    assert time.monotonic() - began < 5.0
++    if code == "h-changed":
++        # Found in the snapshot that followed this command's D.
++        assert caught.value.result is not None, session.degraded_reason
++        assert caught.value.result.seq == 1
++    if code is not None:
++        _assert_degraded_with(session, caught.value, code)
++    _assert_refused_unsent(session, pty_writes, "echo hello", marker)
++    assert not marker.exists()
++
++
++def test_h_snapshot_carries_the_table_a_rows(start_session):
++    session, _ = start_session()
++    hooks = session.baseline.hooks.split("\n")
++    keymaps = [line for line in hooks if line.startswith("keymap ")]
++    assert keymaps == ["keymap emacs", "keymap vi-insert", "keymap vi-command"]
++    for line in ("set +o functrace", "set +o histexpand", "set -o emacs", "shopt -u extdebug",
++                 "set enable-bracketed-paste on", "builtin printf enabled",
++                 "DEBUG/RETURN traps: ", 'declare -- __nls_x="0"', 'declare -- __nls_k="0"'):
++        assert line in hooks, line
++    assert any(line.startswith("declare -r PS4=") for line in hooks)
++
++
++# ---- (i) I3: code that runs at the prompt, after the snapshot
++
++
++def test_i_bashrc_prompt_command_rebinding_cr_degrades_before_a_paste(start_session,
++                                                                     monkeypatch, tmp_path):
++    marker = tmp_path / "MARK"
++    _write_bashrc(
++        r"""__evil() {
++  __evil_n=$((${__evil_n:-0} + 1))
++  if [ "$__evil_n" -eq 2 ]; then bind '"\r": " ; touch MARK\n"'; fi
++}
++PROMPT_COMMAND=__evil
++""".replace("MARK", str(marker))
++    )
++    pty_writes = _spy_on_pty_writes(monkeypatch)
++    session_mod = _session_module()
++    session, _ = start_session()
++    assert not session.degraded
++    with pytest.raises(session_mod.SessionDegraded) as caught:
++        _run(session, "true")  # the user's hook runs a second time, before this snapshot
++    _assert_degraded_with(session, caught.value, "h-changed")
++    assert caught.value.result is not None and caught.value.result.seq == 1
++    _assert_refused_unsent(session, pty_writes, "echo hello", marker)
++    assert not marker.exists()
++
++
++_PS1_REBIND = r"""__evil_ps1() { bind '"\r": " ; touch MARK\n"'; }
++{declare}PS1='${ __evil_ps1; }\$ '
++"""
++
++
++def test_i_bashrc_ps1_that_would_rebind_cr_degrades_before_a_paste(start_session, monkeypatch,
++                                                                  tmp_path):
++    # Readonly, nl-shell cannot replace it: it would be expanded at every prompt, after the
++    # snapshot, and `${ …; }` runs in the shell itself.
++    marker = tmp_path / "MARK"
++    _write_bashrc(_PS1_REBIND.replace("MARK", str(marker)).replace("{declare}", "declare -r "))
++    pty_writes = _spy_on_pty_writes(monkeypatch)
++    session_mod = _session_module()
++    session, _ = start_session()
++    assert session.degraded
++    assert session.degraded_code == "prompt-not-fixed", session.degraded_reason
++    with pytest.raises(session_mod.SessionDegraded):
++        _run(session, "echo hello")
++    _assert_refused_unsent(session, pty_writes, "echo hello", marker)
++    assert not marker.exists()
++
++
++def test_i_bashrc_plain_ps1_is_replaced_before_it_is_ever_expanded(start_session, tmp_path):
++    marker = tmp_path / "MARK"
++    _write_bashrc(_PS1_REBIND.replace("MARK", str(marker)).replace("{declare}", ""))
++    session, _ = start_session()
++    for _ in range(2):
++        assert _run(session, "echo hello").text == "hello\n"
++    assert not session.degraded
++    time.sleep(0.2)
++    assert not marker.exists()
++
++
++# ---- (j) Table B outside checks: termios, TIOCSTI, a stopped shell
++
++
++def test_j_changed_interrupt_character_degrades(start_session, monkeypatch, tmp_path):
++    pty_writes = _spy_on_pty_writes(monkeypatch)
++    session_mod = _session_module()
++    marker = tmp_path / "MARK"
++    session, _ = start_session()
++    with pytest.raises(session_mod.SessionDegraded) as caught:
++        _run(session, "stty intr '|'")
++    _assert_degraded_with(session, caught.value, "outside-check")
++    _assert_refused_unsent(session, pty_writes, f"true || touch {marker}", marker)
++    assert not marker.exists()
++
++
++@pytest.mark.parametrize(
++    "command", ["stty -isig", "stty -icanon -echo -isig"], ids=["isig", "isig-as-readline"]
++)
++def test_j_signals_off_degrades_before_the_next_paste(start_session, monkeypatch, command):
++    # The second looks like readline's own settings (ICANON and ECHO off), which the
++    # outside check must not take as "readline holds the terminal".
++    pty_writes = _spy_on_pty_writes(monkeypatch)
++    session_mod = _session_module()
++    session, _ = start_session()
++    outcome = _try_run(session, command)
++    if isinstance(outcome, session_mod.SessionDegraded):
++        _assert_degraded_with(session, outcome, "outside-check")
++    pty_writes.clear()
++    with pytest.raises(session_mod.SessionDegraded) as caught:
++        _run(session, "echo hello")
++    assert pty_writes == []
++    _assert_degraded_with(session, caught.value, "outside-check")
++
++
++def _slow_termios_check(monkeypatch, delay=0.15):
++    """Make nl-shell slow to read the terminal settings, as on a loaded machine: the real
++    check still runs, ``delay`` seconds late (long after bash's hooks would have ended)."""
++    session_cls = _session_module().Session
++    real = session_cls._check_termios
++
++    def slow(self, *args, **kwargs):
++        time.sleep(delay)
++        return real(self, *args, **kwargs)
++
++    monkeypatch.setattr(session_cls, "_check_termios", slow)
++
++
++def test_j_signals_off_degrades_even_when_the_check_at_d_is_late(start_session, monkeypatch):
++    session_mod = _session_module()
++    session, _ = start_session()
++    _slow_termios_check(monkeypatch)
++    pty_writes = _spy_on_pty_writes(monkeypatch)
++    with pytest.raises(session_mod.SessionDegraded) as caught:
++        _run(session, "stty -isig")
++    _assert_degraded_with(session, caught.value, "outside-check")
++    _assert_refused_unsent(session, pty_writes, "echo hello")
++
++
++def test_j_late_check_at_d_still_reads_the_command_s_settings(start_session, monkeypatch):
++    # bash waits in its hook until nl-shell has read the settings, so a slow nl-shell
++    # neither misses a change nor sees readline's settings and degrades for nothing.
++    session, _ = start_session()
++    _slow_termios_check(monkeypatch)
++    for _ in range(3):
++        assert _run(session, "echo hello").text == "hello\n"
++    assert not session.degraded, session.degraded_reason
++
++
++@pytest.mark.parametrize("content", ["1\n", None], ids=["allowed", "missing"])
++def test_j_tiocsti_not_off_starts_degraded(start_session, monkeypatch, tmp_path, content):
++    pty_writes = _spy_on_pty_writes(monkeypatch)
++    path = tmp_path / "legacy_tiocsti"
++    if content is not None:
++        path.write_text(content, encoding="ascii")
++    session, _ = start_session(tiocsti_path=str(path))
++    assert session.degraded
++    assert session.degraded_code == "tiocsti"
++    assert str(path) in session.degraded_reason
++    _assert_refused_unsent(session, pty_writes, "echo hello")
++
++
++def test_j_tiocsti_off_starts_healthy(start_session, tmp_path):
++    path = tmp_path / "legacy_tiocsti"
++    path.write_text("0\n", encoding="ascii")
++    session, _ = start_session(tiocsti_path=str(path))
++    assert not session.degraded
++    assert _run(session, "echo ok").text == "ok\n"
++
++
++def test_j_stopped_shell_degrades_instead_of_hanging(start_session):
++    session_mod = _session_module()
++    session, _ = start_session()
++    began = time.monotonic()
++    outcome = _run_default_timeout(session, "(sleep 0.3; kill -STOP $$) & sleep 2")
++    assert time.monotonic() - began < 5.0
++    assert isinstance(outcome, session_mod.SessionDegraded), outcome
++    _assert_degraded_with(session, outcome, "stopped")
++
++
++# ---- (m, second half) bracketed paste is forced on after ~/.bashrc, vi mode works
++
++
++def test_m_bashrc_vi_mode_and_bracketed_paste_off_still_paste_exactly(start_session):
++    _write_bashrc("bind 'set enable-bracketed-paste off'\nset -o vi\n")
++    session, records = start_session()
++    # A TAB would complete, and a second line run separately, if the paste were not
++    # bracketed.
++    command = "printf '%s|' 'x  y' 'a\tb'\necho ' z'"
++    result = _run(session, command)
++    assert result.text == "x  y|a\tb| z\n"
++    assert _pairs(records.for_command(1)) == (1, 1)
++    assert not session.degraded
++    # ~/.bashrc took effect (vi mode), and the rcfile forced bracketed paste back on.
++    shown = _run(session, "set -o | grep -w '^vi'; bind -v | grep -w enable-bracketed-paste")
++    assert shown.text.split() == ["vi", "on", "set", "enable-bracketed-paste", "on"]
++    assert not session.degraded
++
++
++# ---- (p) a paste readline did not bracket never looks like empty output
++
++
++@pytest.mark.parametrize(
++    "change",
++    ["bind 'set enable-bracketed-paste off'", "set +o emacs", "set -o vi"],
++    ids=["bracketed-paste-off", "readline-off", "vi-mode"],
++)
++def test_p_echo_after_readline_change_is_never_empty_and_healthy(start_session, change):
++    session_mod = _session_module()
++    session, _ = start_session()
++    _try_run(session, change)
++    outcome = _try_run(session, "echo hello")
++    if isinstance(outcome, session_mod.CommandResult):
++        assert not (outcome.output == b"" and not session.degraded), outcome
++    assert session.degraded  # each is a Table A row: degraded at its own snapshot
++
++
++# ---- (r) xtrace, PS4, BASH_XTRACEFD (decision 13)
++
++
++def test_r_ps4_payload_degrades_and_never_runs_for_a_later_command(start_session,
++                                                                   monkeypatch, tmp_path):
++    pty_writes = _spy_on_pty_writes(monkeypatch)
++    session_mod = _session_module()
++    marker = tmp_path / "MARK"
++    session, _ = start_session()
++    command = f"exec 9>/dev/null; BASH_XTRACEFD=9; PS4='$(echo x >> {marker})'; set -x"
++    with pytest.raises(session_mod.SessionDegraded) as caught:
++        _run(session, command)
++    _assert_degraded_with(session, caught.value, "h-changed")
++    assert caught.value.result is not None and caught.value.result.seq == 1
++    _assert_refused_unsent(session, pty_writes, "true", marker)
++    time.sleep(0.3)
++    # bash traces PROMPT_COMMAND, so a PS4 the command set would run before the snapshot.
++    assert not marker.exists()
++
++
++# ---- (s) disabled hook builtins (decision 12)
++
++
++def test_s_every_hook_builtin_disabled_degrades(start_session, monkeypatch):
++    session_mod = _session_module()
++    pty_writes = _spy_on_pty_writes(monkeypatch)
++    names = session_mod.HOOK_BUILTINS
++    silencing = session_mod.HOOK_BUILTINS_WITHOUT_RECORDS
++    assert set(silencing) <= set(names)
++    assert {"trap", "printf", "read", "declare", "bind", "shopt", "compgen", "alias", "jobs",
++            "enable", "eval", "set", "builtin"} <= set(names)
++    for name in names:
++        assert re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", session_mod.RCFILE), name
++        session, _ = start_session()
++        began = time.monotonic()
++        with pytest.raises(session_mod.SessionDegraded) as caught:
++            _run(session, f"enable -n {name}")
++        assert time.monotonic() - began < 5.0, name
++        expected = "missing-record" if name in silencing else "h-changed"
++        assert caught.value.code == expected, (name, caught.value.reason)
++        assert session.degraded_code == expected, name
++        _assert_refused_unsent(session, pty_writes, "echo hello")
++        session.close()
++
++
++def test_s_other_disabled_builtins_are_only_reported(start_session):
++    session, _ = start_session()
++    result = _run(session, "enable -n echo")
++    assert "enable -n echo" in result.snapshot.disabled_builtins
++    assert not session.degraded
++    assert _run(session, "printf ok").text == "ok"
++
++
++@pytest.mark.parametrize(
++    "setup, later",
++    [
++        ("trap '[[ $BASH_COMMAND == \"echo later\" ]] && : > {mark}' DEBUG; enable -n trap",
++         "echo later"),
++        ("alias ls='touch {mark} #'; enable -n alias", "ls"),
++    ],
++    ids=["hidden-debug-trap", "hidden-alias"],
++)
++def test_s_v5_disabled_builtin_reproducers(start_session, monkeypatch, tmp_path, setup, later):
++    pty_writes = _spy_on_pty_writes(monkeypatch)
++    session_mod = _session_module()
++    marker = tmp_path / "MARK"
++    session, _ = start_session()
++    _try_run(session, setup.format(mark=marker))
++    assert session.degraded
++    assert session.degraded_code == "h-changed", session.degraded_reason
++    _assert_refused_unsent(session, pty_writes, later, marker)
++    assert not marker.exists()

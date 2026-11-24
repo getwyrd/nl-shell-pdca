@@ -1,0 +1,24 @@
+# Advisory security review — persistent-bash-session-tamper-checks (#141, round 3)
+
+**Attacker-reachable inputs this diff touches:** threat model item 4, session state (traps, shell options, `enable -n`, readline variables and key bindings, `PS4`/`BASH_XTRACEFD`, terminal settings and fds 0-2 changed by a confirmed command or a background job it starts, and `~/.bashrc` hooks); and item 1, command output, but only through the new fd 4 answer pipe and the D-line counting in `_read_control`. Rubric: `.oss-scanner/threat_model.md` ("What must hold": *what the user confirms is exactly what runs*; severity: Critical "the command that runs differs", Medium "the session doesn't enter degraded mode when its hooks were changed").
+
+## Findings
+
+No new finding. I checked the items below live against the patched tree in `$PDCA_TARGET` (bash 5.3.9, `legacy_tiocsti = 0`) with small `Session` scripts in my scratch dir. None of them leaves the session healthy with altered paste bytes or a marker file created.
+
+- **Carry-forward items from rounds 1-2 are fixed and covered by tests.**
+  - `stty -icanon -echo -isig` fails closed at D (`src/nl_shell/session.py:978-983`). Test row `tests/test_session.py:1153`.
+  - A late D-time check is covered (`tests/test_session.py:1212`, `:1223`). The fd 4 handshake (`session.py:204-205` in the rcfile; `_read_control` and `_answer_done` at `session.py:1064-1090`) makes bash wait while nl-shell reads termios.
+  - A background job that sets `istrip`/`icrnl`/`inlcr`/`-isig` while readline holds the terminal is caught by the full compare before the paste (`session.py:967`). Test `tests/test_session.py:1171`.
+  - (r) is now split: the brief's line plus a readonly-`PS4` assertion (`tests/test_session.py:1310`, `:1333`), and one test per xtrace row (`:1357`). `set -x` is now a `_TAMPER` row (`:1037`).
+- **Key bindings in sub-keymaps.** `bind -m emacs-meta '"[200~": "touch MARK\n"'`, `bind -m emacs-meta -x '"[200~": …'`, `bind -m emacs-standard -x '"\C-m": …'` and `bind -m vi-move '"x": "y"'` each degrade `h-changed` at their own snapshot. No marker was created. So `bind -m <map> -p/-s/-X` over `_KEYMAPS` (`session.py:123`, rcfile `session.py:247-254`) does include the ESC-prefix and alias maps.
+- **Replacing or draining fd 4.** `exec 4<<<$'\n\n…'` stays healthy and lets `__nls_done` skip the wait (`__nls_k` = 0). It then fails closed: `exec 4<<<…; stty -isig` degrades `outside-check`, because a D-time read that finds readline's settings degrades (`session.py:978`). A child that reads fd 4 and steals the answer makes bash's `read -t 5` time out. `__nls_k` then becomes non-zero and H changes. A fake `D` line on fd 3 only adds an extra answer, which is the same as pre-filling fd 4 (known gap #135). No finding.
+- **ERR trap inside the hooks.** `set -E; trap '…' ERR` fires 3 times per snapshot inside `__nls_snap`, at `shopt -p` (twice inside the H capture, once in X), and the session stays healthy. All three firings run in command-substitution subshells. They cannot change bash's own state. Their only shared lever is the terminal. `stty -isig` from that point degrades 5 of 5 runs (`outside-check`). `stty istrip` stays healthy, but the next paste still arrives exactly (`printf é | od` → `c3 a9`), the same as a plain confirmed `stty istrip`, because readline clears ISTRIP while it reads the paste. The trap itself is reported in `T` for the gate, so per the brief's scope (rows "reported for the gate") it is not this diff's concern.
+- **Point-in-time check before the paste.** A background job that flips `stty istrip`/`-istrip` in a loop, with SIGTTOU ignored, gave correct bytes (`c3 a9`) for 5 pastes. The 6th degraded `outside-check`. The gap between `tcgetattr` and the line discipline taking in the paste is too short to hit in practice. Not a finding. The brief's own bar is "an outside check … immediately before the paste".
+- **Other options against the hook code.** `set -o nounset`, `shopt -s nocasematch` and `IFS=x` leave the hooks working: the next `echo hello` is exact and no marker is created. `set -o posix` degrades `h-changed`. The builtin-enabled scan (`session.py:237-245`) reads `enable -a` with stderr captured, so a disabled `enable`/`builtin` gives "not enabled" lines, not an empty match (covered by `tests/test_session.py:1387`).
+- **`/proc` parsing and TIOCSTI.** `_stopped` splits after the last `)` (`session.py:1035`), so a `comm` containing `)` cannot fake the state field. `tiocsti_path` is read once at start, and a missing, unreadable or non-`0` value fails closed (`session.py:639-657`). Changing it later needs root.
+- **Docs.** The threat model's new Known-gaps bullets have no catch-all sentence and do not cover `enable -n`, as the brief requires.
+
+Gate evidence: C4 is red without the fix (41 of 140 tests fail) and green with it. T3 suite passes. T2 shows the threat model was updated.
+
+<!-- pdca:leaf-complete -->

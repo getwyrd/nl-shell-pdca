@@ -1,0 +1,19 @@
+The split agreed at v3 was never filed: v4 built child A (engine + table) inside the #197
+parent bundle, still 173 KB against the 100 KB backstop. In Plan, run
+`nl-shell-pdca split 197` then `--accept` so child A/B/C become their own issues and bundles;
+do not rebuild #197 as a whole.
+Carry into child A's brief as regressions (all in-class bypasses found in v4):
+- ANSI-C NUL truncation: `$'sudo\0ignored' -i` must be rejected, and `$'rm\0ignored' -rf build`
+  must be destructive (bash cuts at the NUL; the decoder marks the word nonliteral and skips lookup).
+  Also `foo $'sudo\0ignored'` (decision A).
+- Elevation must reach inner commands: `sudo bash $x`, `sudo env $x bash`, `sudo nice $x bash`,
+  `sudo xargs -o bash`, `sudo busybox --pdca` rejected as proposals (an unreadable word or
+  undeclared option under an elevating row rejects).
+- `script` needs a row (no command opens $SHELL; `-c` is runs-text bash): `sudo script` rejected.
+- xargs replace strings (`-I%`, `-i`, `--replace=@`) may become options at run time:
+  `xargs -I% sudo % true`, `xargs -o -I% sudo %` rejected; `xargs -I% git reset %`,
+  `xargs -I% chown % bob /` at least destructive. Add these tests.
+Still open for the human at the re-plan: wrappers with no row hiding a root shell
+(`sudo strace bash`, `sudo setpriv bash`, `sudo runuser -u root bash`, ...) — pick (a) treat an
+opens-shell argument under elevation as a root shell, (b) widen the inventory to wrappers,
+or (c) follow-up issue.

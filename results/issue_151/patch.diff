@@ -1,0 +1,1478 @@
+diff --git a/src/nl_shell/backend.py b/src/nl_shell/backend.py
+index 9667d0d..a5ab834 100644
+--- a/src/nl_shell/backend.py
++++ b/src/nl_shell/backend.py
+@@ -2,9 +2,13 @@
+ 
+ A backend gets the model input (the ordered message list ``nl_shell.prompts.build``
+ makes) and returns the response text, unparsed; the REPL parses it
+-(``nl_shell.proposal``). #77 adds the HTTP client to the local model server. Until then
+-the only backend is ``RecordingStub``, for tests (#13, #78): it returns the responses the
++(``nl_shell.proposal``). ``nl_shell.teacher_client`` is the HTTP client to the local model
++server; ``RecordingStub`` is the backend for tests (#13, #78): it returns the responses the
+ test gives it, in order, and records every model input it was sent.
++
++A backend that cannot get an answer raises ``BackendError``; the REPL shows one fixed reply
++for it and keeps running. Its text is shown to the user, so a backend escapes any text
++that came from the server (``nl_shell.render.escape``) when it builds the error.
+ """
+ 
+ from __future__ import annotations
+@@ -21,6 +25,10 @@ class Backend(Protocol):
+         ...
+ 
+ 
++class BackendError(Exception):
++    """The backend could not get a model answer. The text says why."""
++
++
+ class StubExhausted(Exception):
+     """The stub was sent more requests than it was given responses."""
+ 
+diff --git a/src/nl_shell/repl.py b/src/nl_shell/repl.py
+index 6fbfae4..f7b20c8 100644
+--- a/src/nl_shell/repl.py
++++ b/src/nl_shell/repl.py
+@@ -36,6 +36,11 @@ NO_BACKEND = (
+     "the model client arrives with #77."
+ )
+ NO_USABLE_PROPOSAL = "No usable proposal came back from the model."
++# The replies when the backend raises `BackendError`. Interim: ADR-0018 §7's "model
++# unavailable" state is deferred, and the issue that builds it owns changing these texts
++# and the tests that pin them (tests/test_teacher_client.py).
++SERVER_NOT_RUNNING = "The model server isn't running ({detail})."
++SERVER_UNUSABLE = "The model server could not be used: {reason}."
+ NOTHING_RUNS_YET = (
+     "Nothing runs yet: running a proposal arrives with the policy gate (#12, #78)."
+ )
+@@ -66,6 +71,15 @@ def show_proposal(result: object) -> str:
+     return NO_USABLE_PROPOSAL
+ 
+ 
++def backend_failure(exc: Exception) -> str:
++    """The reply when the backend could not get an answer (``BackendError``)."""
++    from nl_shell.teacher_client import ServerNotRunning
++
++    if isinstance(exc, ServerNotRunning):
++        return SERVER_NOT_RUNNING.format(detail=exc)
++    return SERVER_UNUSABLE.format(reason=exc)
++
++
+ class Repl:
+     """One REPL session. ``read`` returns the next line or raises EOFError."""
+ 
+@@ -85,7 +99,7 @@ class Repl:
+         # This session's own `:status` lines, after the version line
+         # (see the `StatusLine` comment in nl_shell.input_modes).
+         self._status_lines = tuple(status_lines)
+-        # No backend is the interactive default until #77 adds the model client.
++        # No backend is the interactive default until the CLI builds the model client.
+         self._backend = backend
+         self._prompts = prompts
+         # The model input of the last request, for `:context`.
+@@ -145,9 +159,14 @@ class Repl:
+             return NO_BACKEND
+         from nl_shell import prompts, proposal
+ 
++        from nl_shell.backend import BackendError
++
+         messages = prompts.build(self._prompts, request)
+         self._last_input = messages
+-        raw = self._backend.complete(messages)
++        try:
++            raw = self._backend.complete(messages)
++        except BackendError as exc:
++            return backend_failure(exc)
+         return show_proposal(proposal.parse(raw))
+ 
+     def _model_input_text(self) -> str | None:
+diff --git a/src/nl_shell/teacher_client.py b/src/nl_shell/teacher_client.py
+new file mode 100644
+index 0000000..0763c14
+--- /dev/null
++++ b/src/nl_shell/teacher_client.py
+@@ -0,0 +1,501 @@
++"""The HTTP client to the local model server: a ``Backend`` that speaks chat-completions.
++
++``TeacherClient`` posts one model input (the message list ``nl_shell.prompts.build``
++makes) to an OpenAI-compatible ``/v1/chat/completions`` endpoint, as served by llama.cpp's
++``llama-server`` or by vLLM, and returns ``choices[0].message.content`` as raw text. It
++never parses, repairs or retries the answer: the REPL hands it to the one strict
++``proposal/v1`` parser (``nl_shell.proposal``, ADR-0018 §3). The request asks for
++constrained decoding with ``proposal.SCHEMA`` itself, never a copy. No API key is sent.
++
++The endpoint is a Unix socket (``Endpoint("unix", path)``; ``path=None`` means there is no
++default socket, so every request fails as "isn't running") or an ``http://`` /
++``https://`` URL. A URL's path is the base the client posts under, with a trailing ``/v1``
++dropped: ``http://h:8080``, ``http://h:8080/`` and ``http://h:8080/v1`` all post to
++``/v1/chat/completions``. A URL with no port uses the scheme's default (80 or 443). A URL
++holding a space, a control character or a non-ASCII character, user info
++(``user@host``), a query or a fragment is refused.
++
++The transport is the standard library's ``http.client``, not ``urllib``: it reads no
++``HTTP(S)_PROXY`` variable and follows no redirect (a 3xx is an error, read before the
++body). ``https://`` checks the certificate and the host name: the client builds its
++context with ``ssl.create_default_context()`` for each request and keeps
++``verify_mode = CERT_REQUIRED`` and ``check_hostname = True``; it never falls back to
++plain HTTP.
++
++One total deadline, ``timeout_s`` from the start of ``complete``, covers everything: for a
++TCP endpoint the name lookup (``socket.getaddrinfo``, which has no timeout of its own),
++each connect attempt, the TLS handshake, sending the request and reading the response. The
++whole exchange runs in a worker thread; the calling thread waits for it only until the
++deadline, then shuts the exchange's sockets down (which wakes any read the worker is
++blocked in, including one inside ``http.client``'s chunked reader) and raises. The worker
++also bounds each socket wait by the time left and checks the deadline and the size cap
++(``max_response_bytes``) after every chunk it reads. Every wait value is clamped to
++``MAX_WAIT_S``, so a huge ``timeout_s`` cannot overflow ``settimeout`` or a timer.
++
++Every failure is a ``nl_shell.backend.BackendError`` subclass whose text says why; any text
++that came from the server (a reason phrase, a body excerpt, an exception message such as
++``http.client``'s ``BadStatusLine``, which holds the raw status line) is folded to one line,
++cut to ``EXCERPT_CHARS`` and passed through ``nl_shell.render.escape`` when the error is
++built, so it can never carry a terminal escape sequence, a line break or a long run of its
++own text to the screen.
++"""
++
++from __future__ import annotations
++
++import http.client
++import json
++import math
++import socket
++import ssl
++import threading
++import time
++from collections.abc import Sequence
++from dataclasses import dataclass
++from typing import Any, Literal
++from urllib.parse import urlsplit
++
++from nl_shell import proposal, render
++from nl_shell.backend import BackendError
++from nl_shell.prompts import Message
++
++MAX_RESPONSE_BYTES = 64 * 1024
++# The longest single wait handed to `settimeout` or `Event.wait`. The deadline itself is
++# not clamped: a longer `timeout_s` just means more waits of this length.
++MAX_WAIT_S = 24 * 60 * 60.0
++CHAT_PATH = "/v1/chat/completions"
++DEFAULT_PORTS = {"http": 80, "https": 443}
++SCHEMA_NAME = "proposal_v1"
++# How much of an error body goes into the error text.
++EXCERPT_CHARS = 200
++_READ_CHUNK = 16 * 1024
++
++Kind = Literal["unix", "http", "https"]
++
++
++@dataclass(frozen=True)
++class Endpoint:
++    """Where the model server listens: a Unix socket path or an http(s) URL."""
++
++    kind: Kind
++    address: str | None
++
++
++@dataclass(frozen=True)
++class HttpTarget:
++    """What an http(s) endpoint resolves to: the host and port connected to, the path."""
++
++    tls: bool
++    host: str
++    port: int
++    path: str
++
++
++class ServerNotRunning(BackendError):
++    """Nothing answers at the endpoint (no socket path, no socket, connection refused)."""
++
++
++class BadEndpoint(BackendError):
++    """The endpoint or the client's settings cannot be used."""
++
++
++class DeadlineExceeded(BackendError):
++    """The server did not answer in full within ``timeout_s``."""
++
++
++class HttpStatusError(BackendError):
++    """The server answered with an error status."""
++
++
++class RedirectRefused(BackendError):
++    """The server answered with a redirect; the client never follows one."""
++
++
++class ResponseTooLarge(BackendError):
++    """The response body is over ``max_response_bytes``."""
++
++
++class BadResponse(BackendError):
++    """The body is not chat-completions JSON with a string ``message.content``."""
++
++
++class TransportError(BackendError):
++    """Connecting, TLS, sending or reading failed."""
++
++
++def _quote(text: str) -> str:
++    """Server text, made safe to show: every hidden character escaped."""
++    return render.escape(text)
++
++
++def _excerpt(text: str) -> str:
++    """Server text, made short and safe to show: one line, at most ``EXCERPT_CHARS``.
++
++    Runs of whitespace (LF and CR included) fold to one space and the text is cut before
++    it is escaped, so a server cannot print lines of its own or a long run of text into
++    the REPL's reply through a reason phrase, a body or an exception message.
++    """
++    return _quote(" ".join(text.split())[:EXCERPT_CHARS])
++
++
++def _describe(exc: BaseException) -> str:
++    text = str(exc)
++    name = type(exc).__name__
++    return _excerpt(f"{name}: {text}" if text else name)
++
++
++def http_target(endpoint: Endpoint) -> HttpTarget:
++    """The host, port and request path for an ``http`` / ``https`` endpoint."""
++    url = endpoint.address
++    if url is None:
++        raise BadEndpoint(f"no URL for the {endpoint.kind} endpoint")
++    if not url.isascii() or any(ord(char) <= 0x20 or ord(char) == 0x7F for char in url):
++        raise BadEndpoint(
++            f"the URL {_quote(url)!r} holds a space, a control or a non-ASCII character"
++        )
++    try:
++        parts = urlsplit(url)
++        port = parts.port
++    except ValueError as exc:
++        raise BadEndpoint(f"the URL {_quote(url)!r} does not parse: {_describe(exc)}")
++    if parts.scheme != endpoint.kind:
++        raise BadEndpoint(f"the URL {url!r} is not an {endpoint.kind}:// URL")
++    if "@" in parts.netloc:
++        raise BadEndpoint(f"the URL {url!r} holds user info, which is refused")
++    if parts.query or parts.fragment or url.endswith(("?", "#")):
++        raise BadEndpoint(f"the URL {url!r} holds a query or a fragment")
++    host = parts.hostname
++    if not host:
++        raise BadEndpoint(f"the URL {url!r} names no host")
++    base = parts.path.rstrip("/")
++    if base.endswith("/v1"):
++        base = base[: -len("/v1")]
++    return HttpTarget(
++        tls=endpoint.kind == "https",
++        host=host,
++        port=DEFAULT_PORTS[endpoint.kind] if port is None else port,
++        path=base + CHAT_PATH,
++    )
++
++
++def _timeout(timeout_s: object) -> float:
++    """``timeout_s`` as a finite, positive float; ``BadEndpoint`` for anything else.
++
++    The value is converted before it is checked: a Python int of any size passes an
++    ``isinstance`` test, and one too big for a float (``10**400``) raises
++    ``OverflowError`` from ``float`` or ``math.isfinite``. The error text never holds the
++    value itself, whose ``repr`` can be huge or can fail for a very long int.
++    """
++    if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
++        raise BadEndpoint(
++            f"timeout_s must be a positive number, not a {type(timeout_s).__name__}"
++        )
++    try:
++        seconds = float(timeout_s)
++    except OverflowError:
++        raise BadEndpoint("timeout_s is too large to use") from None
++    if not math.isfinite(seconds) or seconds <= 0:
++        raise BadEndpoint("timeout_s must be a positive, finite number of seconds")
++    return seconds
++
++
++def _wait_for(seconds: float) -> float:
++    """A wait value ``settimeout`` and ``Event.wait`` accept: in [0, MAX_WAIT_S]."""
++    return max(0.0, min(seconds, MAX_WAIT_S))
++
++
++class _Exchange:
++    """One request's deadline and sockets, shared by the worker and the waiting caller."""
++
++    def __init__(self, timeout_s: float) -> None:
++        self.timeout_s = timeout_s
++        self.deadline = time.monotonic() + timeout_s
++        self._lock = threading.Lock()
++        self._sockets: list[socket.socket] = []
++        self._abandoned = False
++
++    def remaining(self) -> float:
++        """The wait left before the deadline; raises once it has passed."""
++        left = self.deadline - time.monotonic()
++        if left <= 0 or self._abandoned:
++            raise self.expired()
++        return _wait_for(left)
++
++    def expired(self) -> DeadlineExceeded:
++        return DeadlineExceeded(f"no full answer within {self.timeout_s:g} s")
++
++    def adopt(self, sock: socket.socket) -> None:
++        """Track ``sock`` so ``abandon`` can wake it; refuse it once abandoned."""
++        with self._lock:
++            if self._abandoned:
++                sock.close()
++                raise self.expired()
++            self._sockets.append(sock)
++
++    def arm(self) -> None:
++        """Bound the next blocking socket call by the time left."""
++        left = self.remaining()
++        with self._lock:
++            sockets = list(self._sockets)
++        for sock in sockets:
++            if sock.fileno() != -1:
++                sock.settimeout(left)
++
++    def abandon(self) -> None:
++        """Shut every socket down, waking whatever the worker is blocked in."""
++        with self._lock:
++            self._abandoned = True
++            sockets = list(self._sockets)
++        for sock in sockets:
++            try:
++                sock.shutdown(socket.SHUT_RDWR)
++            except OSError:
++                pass
++
++    def close(self) -> None:
++        with self._lock:
++            sockets = list(self._sockets)
++        for sock in sockets:
++            try:
++                sock.close()
++            except OSError:
++                pass
++
++
++class _UnixConnection(http.client.HTTPConnection):
++    """HTTP over a Unix socket. The Host header is ``localhost``."""
++
++    def __init__(self, path: str, exchange: _Exchange) -> None:
++        super().__init__("localhost")
++        self._path = path
++        self._exchange = exchange
++
++    def connect(self) -> None:
++        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++        self._exchange.adopt(sock)
++        sock.settimeout(self._exchange.remaining())
++        sock.connect(self._path)
++        self.sock = sock
++
++
++class _TcpConnection(http.client.HTTPConnection):
++    """HTTP or HTTPS over TCP; lookup, connect and handshake bounded by the deadline."""
++
++    def __init__(self, target: HttpTarget, exchange: _Exchange) -> None:
++        super().__init__(target.host, target.port)
++        self._target = target
++        self._exchange = exchange
++        if target.tls:
++            # So the Host header leaves out the port only when it is 443.
++            self.default_port = DEFAULT_PORTS["https"]
++
++    def connect(self) -> None:
++        sock = self._open()
++        if self._target.tls:
++            context = ssl.create_default_context()
++            context.verify_mode = ssl.CERT_REQUIRED
++            context.check_hostname = True
++            sock.settimeout(self._exchange.remaining())
++            sock = context.wrap_socket(sock, server_hostname=self._target.host)
++            self._exchange.adopt(sock)
++        self.sock = sock
++
++    def _open(self) -> socket.socket:
++        infos = socket.getaddrinfo(
++            self._target.host, self._target.port, type=socket.SOCK_STREAM
++        )
++        last: OSError | None = None
++        for family, kind, proto, _, address in infos:
++            left = self._exchange.remaining()
++            sock = socket.socket(family, kind, proto)
++            self._exchange.adopt(sock)
++            try:
++                sock.settimeout(left)
++                sock.connect(address)
++                return sock
++            except OSError as exc:
++                last = exc
++                sock.close()
++        raise last if last is not None else OSError("the host name resolved to nothing")
++
++
++class TeacherClient:
++    """A ``Backend`` (``nl_shell.backend``) talking to an OpenAI-compatible model server."""
++
++    def __init__(
++        self,
++        endpoint: Endpoint,
++        *,
++        timeout_s: float,
++        max_response_bytes: int = MAX_RESPONSE_BYTES,
++        model: str | None = None,
++    ) -> None:
++        if endpoint.kind not in ("unix", "http", "https"):
++            raise BadEndpoint(f"unknown endpoint kind {_quote(str(endpoint.kind))!r}")
++        self.timeout_s = _timeout(timeout_s)
++        if (
++            isinstance(max_response_bytes, bool)
++            or not isinstance(max_response_bytes, int)
++            or max_response_bytes <= 0
++        ):
++            raise BadEndpoint("max_response_bytes must be a positive integer")
++        self.endpoint = endpoint
++        self.max_response_bytes = max_response_bytes
++        self.model = model
++
++    def request_body(self, messages: Sequence[Message]) -> dict[str, Any]:
++        """The JSON document posted for one model input."""
++        body: dict[str, Any] = {
++            "messages": [
++                {"role": message.role, "content": message.content}
++                for message in messages
++            ],
++            "response_format": {
++                "type": "json_schema",
++                "json_schema": {
++                    "name": SCHEMA_NAME,
++                    "strict": True,
++                    "schema": proposal.SCHEMA,
++                },
++            },
++        }
++        if self.model is not None:
++            body["model"] = self.model
++        return body
++
++    def complete(self, messages: Sequence[Message]) -> str:
++        """The raw ``message.content`` for one model input; a ``BackendError`` if none."""
++        exchange = _Exchange(self.timeout_s)
++        result: dict[str, Any] = {}
++        done = threading.Event()
++
++        def work() -> None:
++            try:
++                result["content"] = self._post(messages, exchange)
++            except BaseException as exc:  # handed to the caller, mapped there
++                result["error"] = exc
++            finally:
++                exchange.close()
++                done.set()
++
++        worker = threading.Thread(target=work, name="nl-shell-model-request", daemon=True)
++        finished = False
++        try:
++            worker.start()
++            while not done.wait(_wait_for(exchange.deadline - time.monotonic())):
++                if time.monotonic() >= exchange.deadline:
++                    raise exchange.expired()
++            finished = True
++        finally:
++            if not finished:
++                exchange.abandon()
++        if "error" in result:
++            raise self._as_backend_error(result["error"], exchange)
++        content: str = result["content"]
++        return content
++
++    def _as_backend_error(self, exc: BaseException, exchange: _Exchange) -> BaseException:
++        if isinstance(exc, BackendError):
++            return exc
++        if not isinstance(exc, Exception):
++            return exc  # KeyboardInterrupt and the like stay what they are
++        if isinstance(exc, TimeoutError) or time.monotonic() >= exchange.deadline:
++            return exchange.expired()
++        if self.endpoint.kind == "unix" and isinstance(
++            exc, (FileNotFoundError, ConnectionRefusedError)
++        ):
++            return ServerNotRunning(f"no answer at {_quote(str(self.endpoint.address))}")
++        if isinstance(exc, ConnectionRefusedError):
++            return ServerNotRunning(f"no answer at {_quote(str(self.endpoint.address))}")
++        if isinstance(exc, ssl.SSLError):
++            return TransportError(f"TLS failed: {_describe(exc)}")
++        return TransportError(_describe(exc))
++
++    def _post(self, messages: Sequence[Message], exchange: _Exchange) -> str:
++        """Connect, send, read and decode. Runs in the worker thread."""
++        conn: http.client.HTTPConnection
++        if self.endpoint.kind == "unix":
++            if self.endpoint.address is None:
++                raise ServerNotRunning("no socket path: XDG_RUNTIME_DIR is not set")
++            path = CHAT_PATH
++            conn = _UnixConnection(self.endpoint.address, exchange)
++        else:
++            target = http_target(self.endpoint)
++            path = target.path
++            conn = _TcpConnection(target, exchange)
++        payload = json.dumps(self.request_body(messages)).encode("utf-8")
++        try:
++            conn.connect()
++            exchange.arm()
++            conn.request(
++                "POST",
++                path,
++                body=payload,
++                headers={
++                    "Content-Type": "application/json",
++                    "Accept": "application/json",
++                    "Connection": "close",
++                },
++            )
++            exchange.arm()
++            response = conn.getresponse()
++            return self._content(response, exchange)
++        finally:
++            conn.close()
++
++    def _content(self, response: http.client.HTTPResponse, exchange: _Exchange) -> str:
++        status = response.status
++        reason = _excerpt(response.reason or "")
++        if 300 <= status < 400:
++            raise RedirectRefused(
++                f"the server answered {status} {reason}, a redirect, which is not followed"
++            )
++        if status != 200:
++            excerpt = self._read(response, exchange, EXCERPT_CHARS * 4, strict=False)
++            text = _excerpt(excerpt.decode("utf-8", errors="replace"))
++            detail = f": {text}" if text else ""
++            raise HttpStatusError(f"the server answered {status} {reason}{detail}")
++        if response.length is not None and response.length > self.max_response_bytes:
++            raise ResponseTooLarge(
++                f"the response is {response.length} bytes, over the "
++                f"{self.max_response_bytes}-byte limit"
++            )
++        body = self._read(response, exchange, self.max_response_bytes, strict=True)
++        return _message_content(body)
++
++    def _read(
++        self,
++        response: http.client.HTTPResponse,
++        exchange: _Exchange,
++        cap: int,
++        *,
++        strict: bool,
++    ) -> bytes:
++        """At most ``cap`` bytes of the body; over it, an error (``strict``) or a cut."""
++        data = bytearray()
++        while True:
++            exchange.arm()
++            chunk = response.read1(min(_READ_CHUNK, cap + 1 - len(data)))
++            if not chunk:
++                return bytes(data)
++            data += chunk
++            if len(data) > cap:
++                if strict:
++                    raise ResponseTooLarge(
++                        f"the response is over the {self.max_response_bytes}-byte limit"
++                    )
++                return bytes(data[:cap])
++
++
++def _message_content(body: bytes) -> str:
++    """``choices[0].message.content`` of a chat-completions body, which must be a string."""
++    try:
++        doc = json.loads(body.decode("utf-8"))
++    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
++        raise BadResponse(f"the response is not JSON: {_describe(exc)}")
++    try:
++        content = doc["choices"][0]["message"]["content"]
++    except (KeyError, IndexError, TypeError):
++        raise BadResponse("the response has no choices[0].message.content")
++    if not isinstance(content, str):
++        raise BadResponse("choices[0].message.content is not a string")
++    return content
+diff --git a/tests/test_teacher_client.py b/tests/test_teacher_client.py
+new file mode 100644
+index 0000000..024abaf
+--- /dev/null
++++ b/tests/test_teacher_client.py
+@@ -0,0 +1,877 @@
++"""The HTTP client to the local model server (``nl_shell.teacher_client``).
++
++Every test talks to a fake OpenAI-compatible server built on the standard library
++(``socketserver`` + ``http.server``), on ``127.0.0.1`` port 0 or on a Unix socket in a
++short temporary directory: no network, model or GPU. The fake writes raw bytes, so a test
++controls the status line, the headers and the pace of the body exactly.
++
++The nl_shell modules are imported inside the tests and fixtures, never at module level:
++the C4 gate re-runs this file with the production change reverted, and a module-level
++import of the new client would stop the file from loading instead of failing its tests.
++
++The TLS leg captures the ``ssl.SSLContext`` the client uses by wrapping
++``ssl.create_default_context`` with ``monkeypatch`` (the client builds its context with
++that function for each https request).
++"""
++
++from __future__ import annotations
++
++import http.server
++import io
++import json
++import os
++import shutil
++import socket
++import socketserver
++import ssl
++import tempfile
++import threading
++import time
++from dataclasses import dataclass, field
++from pathlib import Path
++
++import pytest
++
++VALID = '{"kind": "command", "command": "df -h", "risk": "read-only"}'
++# Every timing leg: the server stalls for at least this long, the client must give up
++# within BOUND_S. The wide gap keeps a loaded CI host from flipping the result.
++STALL_S = 5.0
++BOUND_S = 2.0
++DRIP_EVERY_S = 0.2
++
++
++# --- the fake server ----------------------------------------------------------------
++
++
++@dataclass
++class Seen:
++    method: str
++    path: str
++    headers: dict[str, str]
++    body: bytes
++
++    def json(self):
++        return json.loads(self.body)
++
++
++@dataclass
++class Fake:
++    """One fake server: what it answers (``script``) and every request it saw."""
++
++    script: object
++    requests: list[Seen] = field(default_factory=list)
++    stop: threading.Event = field(default_factory=threading.Event)
++    url: str = ""
++    path: str = ""
++    port: int = 0
++
++    def stall(self, seconds: float) -> None:
++        self.stop.wait(seconds)
++
++
++class _Handler(http.server.BaseHTTPRequestHandler):
++    protocol_version = "HTTP/1.1"
++    timeout = 10  # the server side never waits on a client forever
++
++    def do_POST(self) -> None:
++        self._answer()
++
++    def do_GET(self) -> None:
++        self._answer()
++
++    def _answer(self) -> None:
++        length = int(self.headers.get("Content-Length") or 0)
++        body = self.rfile.read(length)
++        seen = Seen(
++            self.command,
++            self.path,
++            {key.lower(): value for key, value in self.headers.items()},
++            body,
++        )
++        fake: Fake = self.server.fake  # type: ignore[attr-defined]
++        fake.requests.append(seen)
++        try:
++            fake.script(self.wfile, fake)
++        except OSError:
++            pass  # the client hung up, as it should on a stall
++        self.close_connection = True
++
++    def log_message(self, *args) -> None:
++        pass
++
++
++class _Quiet:
++    daemon_threads = True
++    block_on_close = False
++    allow_reuse_address = True
++
++    def handle_error(self, request, client_address) -> None:
++        pass
++
++
++class _TcpServer(_Quiet, socketserver.ThreadingMixIn, socketserver.TCPServer):
++    pass
++
++
++class _UnixServer(_Quiet, socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
++    pass
++
++
++def response(status: str = "200 OK", body: bytes = b"", headers=()) -> bytes:
++    head = [f"HTTP/1.1 {status}", f"Content-Length: {len(body)}", "Connection: close"]
++    head += [f"{name}: {value}" for name, value in headers]
++    return ("\r\n".join(head) + "\r\n\r\n").encode("latin-1") + body
++
++
++def completion(content) -> bytes:
++    doc = {"choices": [{"index": 0, "message": {"role": "assistant", "content": content}}]}
++    return json.dumps(doc).encode("utf-8")
++
++
++def answer(content=VALID):
++    def script(out, fake):
++        out.write(response(body=completion(content)))
++
++    return script
++
++
++def answers(*contents):
++    """Answer each request with the next content, in order."""
++    queue = list(contents)
++
++    def script(out, fake):
++        out.write(response(body=completion(queue.pop(0))))
++
++    return script
++
++
++@pytest.fixture
++def serve():
++    """``serve(script, unix=False)`` starts a fake server, shut down in teardown."""
++    started = []
++
++    def start(script, *, unix: bool = False) -> Fake:
++        fake = Fake(script)
++        if unix:
++            directory = tempfile.mkdtemp(prefix="nls-")
++            fake.path = os.path.join(directory, "s")
++            server = _UnixServer(fake.path, _Handler)
++        else:
++            directory = None
++            server = _TcpServer(("127.0.0.1", 0), _Handler)
++            fake.port = server.server_address[1]
++            fake.url = f"http://127.0.0.1:{fake.port}"
++        server.fake = fake  # type: ignore[attr-defined]
++        thread = threading.Thread(
++            target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
++        )
++        thread.start()
++        started.append((fake, server, thread, directory))
++        return fake
++
++    yield start
++    for fake, server, thread, directory in started:
++        fake.stop.set()
++        server.shutdown()
++        server.server_close()
++        thread.join(timeout=5)
++        if directory is not None:
++            shutil.rmtree(directory, ignore_errors=True)
++
++
++def messages():
++    from nl_shell.prompts import Message
++
++    return (
++        Message("system", "You turn requests into bash."),
++        Message("user", "show disk usage"),
++        Message("assistant", VALID),
++        Message("user", "list my files"),
++    )
++
++
++def client(url_or_path, *, kind="http", timeout_s=5.0, cap=None, model=None):
++    from nl_shell import teacher_client
++
++    kwargs = {"timeout_s": timeout_s, "model": model}
++    if cap is not None:
++        kwargs["max_response_bytes"] = cap
++    return teacher_client.TeacherClient(
++        teacher_client.Endpoint(kind, url_or_path), **kwargs
++    )
++
++
++def fails(make_and_call):
++    """Run ``make_and_call``; it must raise a BackendError. Returns (error, seconds)."""
++    from nl_shell.backend import BackendError
++
++    start = time.monotonic()
++    with pytest.raises(BackendError) as info:
++        make_and_call()
++    elapsed = time.monotonic() - start
++    assert str(info.value), "a BackendError must say why"
++    return info.value, elapsed
++
++
++# --- (a) the request ----------------------------------------------------------------
++
++
++def test_returns_the_content_and_sends_the_chat_completions_request(serve):
++    from nl_shell import proposal
++
++    fake = serve(answer())
++    sent = messages()
++
++    assert client(fake.url, model="m1").complete(sent) == VALID
++
++    assert len(fake.requests) == 1
++    seen = fake.requests[0]
++    assert (seen.method, seen.path) == ("POST", "/v1/chat/completions")
++    doc = seen.json()
++    assert doc["messages"] == [{"role": m.role, "content": m.content} for m in sent]
++    assert doc["response_format"] == {
++        "type": "json_schema",
++        "json_schema": {"name": "proposal_v1", "strict": True, "schema": proposal.SCHEMA},
++    }
++    assert doc["model"] == "m1"
++    assert "authorization" not in seen.headers
++    assert seen.headers["content-type"] == "application/json"
++
++
++def test_no_model_key_without_a_model(serve):
++    fake = serve(answer())
++    assert client(fake.url, model=None).complete(messages()) == VALID
++    assert "model" not in fake.requests[0].json()
++    assert "authorization" not in fake.requests[0].headers
++
++
++def test_unix_socket_request_sends_host_localhost(serve):
++    fake = serve(answer(), unix=True)
++    assert client(fake.path, kind="unix").complete(messages()) == VALID
++    assert len(fake.requests) == 1
++    seen = fake.requests[0]
++    assert (seen.method, seen.path) == ("POST", "/v1/chat/completions")
++    assert seen.headers["host"] == "localhost"
++    assert "authorization" not in seen.headers
++
++
++@pytest.mark.parametrize("suffix", ["/v1", "/v1/", "/", ""])
++def test_a_trailing_v1_is_dropped_from_the_base(serve, suffix):
++    fake = serve(answer())
++    assert client(fake.url + suffix).complete(messages()) == VALID
++    assert fake.requests[0].path == "/v1/chat/completions"
++
++
++def test_a_base_path_is_kept(serve):
++    fake = serve(answer())
++    assert client(fake.url + "/api/v1").complete(messages()) == VALID
++    assert fake.requests[0].path == "/api/v1/chat/completions"
++
++
++# --- (b) strict handling ------------------------------------------------------------
++
++
++def _settle(fake, count=1):
++    """Give a wrongly retrying client time to send again; return what the fake saw."""
++    time.sleep(0.3)
++    assert len(fake.requests) == count, "the client must not retry"
++    return fake.requests
++
++
++def test_an_error_status_fails_once(serve):
++    from nl_shell import teacher_client
++
++    def script(out, fake):
++        out.write(response("500 Internal Server Error", b"model exploded"))
++
++    fake = serve(script)
++    error, _ = fails(lambda: client(fake.url).complete(messages()))
++    assert isinstance(error, teacher_client.HttpStatusError)
++    assert "500" in str(error) and "model exploded" in str(error)
++    _settle(fake)
++
++
++def test_a_redirect_is_not_followed(serve):
++    from nl_shell import teacher_client
++
++    elsewhere = serve(answer())
++
++    def script(out, fake):
++        location = elsewhere.url + "/v1/chat/completions"
++        out.write(response("307 Temporary Redirect", b"", [("Location", location)]))
++
++    fake = serve(script)
++    error, _ = fails(lambda: client(fake.url).complete(messages()))
++    assert isinstance(error, teacher_client.RedirectRefused)
++    assert "307" in str(error)
++    _settle(fake)
++    assert elsewhere.requests == []
++
++
++def test_a_non_json_body_fails(serve):
++    from nl_shell import teacher_client
++
++    def script(out, fake):
++        out.write(response(body=b"<html>not json</html>"))
++
++    fake = serve(script)
++    error, _ = fails(lambda: client(fake.url).complete(messages()))
++    assert isinstance(error, teacher_client.BadResponse)
++    _settle(fake)
++
++
++@pytest.mark.parametrize(
++    "doc",
++    [
++        {},
++        [],
++        {"choices": []},
++        {"choices": {}},
++        {"choices": [{}]},
++        {"choices": [{"message": {}}]},
++        {"choices": [{"message": {"content": None}}]},
++        {"choices": [{"message": {"content": 5}}]},
++        {"choices": [{"message": {"content": {"kind": "command"}}}]},
++        {"choices": [{"message": "text"}]},
++    ],
++)
++def test_json_without_a_string_content_fails(serve, doc):
++    from nl_shell import teacher_client
++
++    def script(out, fake):
++        out.write(response(body=json.dumps(doc).encode()))
++
++    fake = serve(script)
++    error, _ = fails(lambda: client(fake.url).complete(messages()))
++    assert isinstance(error, teacher_client.BadResponse)
++    _settle(fake)
++
++
++def test_a_body_over_the_cap_stops_the_read(serve):
++    """The body never ends: a client that kept reading would hit the deadline instead."""
++    from nl_shell import teacher_client
++
++    def script(out, fake):
++        out.write(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
++        while not fake.stop.is_set():
++            out.write(b"x" * 4096)
++
++    fake = serve(script)
++    error, elapsed = fails(
++        lambda: client(fake.url, cap=1024, timeout_s=STALL_S).complete(messages())
++    )
++    assert isinstance(error, teacher_client.ResponseTooLarge)
++    assert elapsed < BOUND_S
++    _settle(fake)
++
++
++def test_a_declared_length_over_the_cap_fails(serve):
++    from nl_shell import teacher_client
++
++    def script(out, fake):
++        out.write(response(body=completion("x" * 4096)))
++
++    fake = serve(script)
++    error, _ = fails(lambda: client(fake.url, cap=1024).complete(messages()))
++    assert isinstance(error, teacher_client.ResponseTooLarge)
++
++
++def test_a_body_at_the_cap_is_read(serve):
++    body = completion(VALID)
++
++    def script(out, fake):
++        out.write(response(body=body))
++
++    fake = serve(script)
++    assert client(fake.url, cap=len(body)).complete(messages()) == VALID
++
++
++def _times_out(fake, **kwargs):
++    from nl_shell import teacher_client
++
++    error, elapsed = fails(
++        lambda: client(fake.url, timeout_s=0.5, **kwargs).complete(messages())
++    )
++    assert isinstance(error, teacher_client.DeadlineExceeded)
++    assert elapsed < BOUND_S, f"gave up after {elapsed:.2f} s"
++    return error
++
++
++def test_a_server_that_never_answers(serve):
++    def script(out, fake):
++        fake.stall(STALL_S)
++
++    _times_out(serve(script))
++
++
++def test_a_slow_drip_body(serve):
++    def script(out, fake):
++        out.write(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n")
++        end = time.monotonic() + STALL_S
++        while time.monotonic() < end and not fake.stop.is_set():
++            out.write(b" ")
++            fake.stall(DRIP_EVERY_S)
++
++    _times_out(serve(script))
++
++
++def test_a_chunked_slow_drip(serve):
++    """The chunk-size line never ends; http.client reads it off the response's socket."""
++
++    def script(out, fake):
++        out.write(
++            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
++        )
++        end = time.monotonic() + STALL_S
++        while time.monotonic() < end and not fake.stop.is_set():
++            out.write(b"0")
++            fake.stall(DRIP_EVERY_S)
++
++    _times_out(serve(script))
++
++
++def test_a_slow_drip_status_line(serve):
++    def script(out, fake):
++        end = time.monotonic() + STALL_S
++        for char in b"HTTP/1.1 200 OK" * 100:
++            if time.monotonic() >= end or fake.stop.is_set():
++                break
++            out.write(bytes([char]))
++            fake.stall(DRIP_EVERY_S)
++
++    _times_out(serve(script))
++
++
++def test_https_to_a_plain_http_server_is_a_tls_error(serve, monkeypatch):
++    from nl_shell import teacher_client
++
++    contexts = []
++    real = ssl.create_default_context
++
++    def recording(*args, **kwargs):
++        context = real(*args, **kwargs)
++        contexts.append(context)
++        return context
++
++    monkeypatch.setattr(ssl, "create_default_context", recording)
++
++    fake = serve(answer())
++    url = f"https://127.0.0.1:{fake.port}"
++    error, _ = fails(lambda: client(url, kind="https", timeout_s=3).complete(messages()))
++    assert isinstance(
++        error, (teacher_client.TransportError, teacher_client.DeadlineExceeded)
++    )
++    time.sleep(0.3)
++    assert fake.requests == [], "no plain-HTTP request may reach the server"
++
++    assert len(contexts) == 1, "the context must come from create_default_context"
++    assert contexts[0].verify_mode == ssl.CERT_REQUIRED
++    assert contexts[0].check_hostname is True
++
++
++def test_a_huge_timeout_is_clamped_and_works(serve):
++    fake = serve(answer())
++    assert client(fake.url, timeout_s=1e10).complete(messages()) == VALID
++
++
++def test_a_tiny_timeout_fails_cleanly(serve):
++    fake = serve(answer())
++    fails(lambda: client(fake.url, timeout_s=1e-5).complete(messages()))
++
++
++@pytest.mark.parametrize(
++    "timeout_s",
++    [0, -1, float("nan"), float("inf"), 10**400, -(10**400), 10**5000, "5", None],
++    ids=["0", "-1", "nan", "inf", "10**400", "-10**400", "10**5000", "str", "None"],
++)
++def test_an_unusable_timeout_is_refused(timeout_s):
++    """An int too big for a float (10**400) is a BackendError, never an OverflowError."""
++    fails(lambda: client("http://127.0.0.1:1", timeout_s=timeout_s))
++
++
++@pytest.mark.parametrize(
++    "url",
++    [
++        "http://bad host:8080/",
++        "http://bad\x01host:8080/",
++        "http://bad\nhost/",
++        "http://bad\thost/",
++        "http://bad\x7fhost/",
++        "http://127.0.0.1:8080/v1 /",
++        "http://127.0.0.1:notaport/",
++        "http://[::1/",
++        "http://user:pw@127.0.0.1:8080/",
++        "http://user@127.0.0.1:8080/",
++        "http://127.0.0.1:8080/?q=1",
++        "ftp://127.0.0.1:8080/",
++        "http:///v1",
++    ],
++)
++def test_a_bad_url_is_refused(url, monkeypatch):
++    from nl_shell import teacher_client
++
++    def no_lookup(*args, **kwargs):
++        raise AssertionError("a refused URL must not be looked up")
++
++    monkeypatch.setattr(socket, "getaddrinfo", no_lookup)
++    error, _ = fails(lambda: client(url).complete(messages()))
++    assert isinstance(error, teacher_client.BadEndpoint)
++
++
++def test_userinfo_never_reaches_the_server(serve):
++    fake = serve(answer())
++    url = f"http://user:pw@127.0.0.1:{fake.port}/"
++    fails(lambda: client(url).complete(messages()))
++    time.sleep(0.3)
++    assert fake.requests == []
++
++
++@pytest.mark.parametrize(
++    "kind, url, host, port, path",
++    [
++        ("http", "http://[::1]/", "::1", 80, "/v1/chat/completions"),
++        ("http", "http://localhost/", "localhost", 80, "/v1/chat/completions"),
++        ("http", "http://localhost", "localhost", 80, "/v1/chat/completions"),
++        ("https", "https://localhost/v1", "localhost", 443, "/v1/chat/completions"),
++        ("http", "http://[::1]:8080/", "::1", 8080, "/v1/chat/completions"),
++    ],
++)
++def test_the_address_connected_to(kind, url, host, port, path, monkeypatch):
++    from nl_shell import teacher_client
++
++    target = teacher_client.http_target(teacher_client.Endpoint(kind, url))
++    assert (target.host, target.port, target.path) == (host, port, path)
++    assert target.tls is (kind == "https")
++
++    looked_up = []
++
++    def lookup(name, number, *args, **kwargs):
++        looked_up.append((name, number))
++        raise socket.gaierror(socket.EAI_NONAME, "not in this test")
++
++    monkeypatch.setattr(socket, "getaddrinfo", lookup)
++    fails(lambda: client(url, kind=kind).complete(messages()))
++    assert looked_up == [(host, port)]
++
++
++def test_ipv6_loopback_with_a_port(serve):
++    try:
++        probe = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
++        probe.bind(("::1", 0))
++    except OSError:
++        pytest.skip("no IPv6 loopback here")
++    probe.listen(1)
++    port = probe.getsockname()[1]
++
++    def accept_one():
++        conn, _ = probe.accept()
++        with conn:
++            conn.settimeout(5)
++            data = b""
++            while b"\r\n\r\n" not in data:
++                data += conn.recv(4096)
++            head, _, rest = data.partition(b"\r\n\r\n")
++            fields = dict(
++                line.lower().split(b":", 1) for line in head.split(b"\r\n")[1:]
++            )
++            length = int(fields[b"content-length"])
++            while len(rest) < length:
++                rest += conn.recv(4096)
++            conn.sendall(response(body=completion(VALID)))
++
++    thread = threading.Thread(target=accept_one, daemon=True)
++    thread.start()
++    try:
++        assert client(f"http://[::1]:{port}/").complete(messages()) == VALID
++    finally:
++        thread.join(timeout=5)
++        probe.close()
++
++
++# --- (c) one deadline covers lookup and connect ---------------------------------------
++
++
++def test_a_hanging_name_lookup_is_abandoned(monkeypatch):
++    from nl_shell import teacher_client
++
++    def slow_lookup(*args, **kwargs):
++        time.sleep(STALL_S)
++        raise socket.gaierror(socket.EAI_AGAIN, "too slow")
++
++    monkeypatch.setattr(socket, "getaddrinfo", slow_lookup)
++    error, elapsed = fails(
++        lambda: client("http://model.invalid:8080", timeout_s=0.5).complete(messages())
++    )
++    assert isinstance(error, teacher_client.DeadlineExceeded)
++    assert elapsed < BOUND_S
++
++
++def test_hanging_connects_share_one_deadline(monkeypatch):
++    from nl_shell import teacher_client
++
++    addresses = [
++        (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (f"127.0.0.{n}", 9))
++        for n in (2, 3, 4, 5)
++    ]
++    attempts = []
++
++    def lookup(*args, **kwargs):
++        return addresses
++
++    def hanging_connect(sock, address):
++        attempts.append(address)
++        time.sleep(STALL_S)  # ignores the socket's own timeout, like a stuck SYN
++        raise TimeoutError("connect hung")
++
++    monkeypatch.setattr(socket, "getaddrinfo", lookup)
++    monkeypatch.setattr(socket.socket, "connect", hanging_connect)
++    error, elapsed = fails(
++        lambda: client("http://model.example:9", timeout_s=0.5).complete(messages())
++    )
++    assert isinstance(error, teacher_client.DeadlineExceeded)
++    assert elapsed < BOUND_S, f"{elapsed:.2f} s: one deadline in total, not per address"
++    assert attempts, "the client must have tried to connect"
++
++
++def test_a_hanging_connect_without_a_patch_is_bounded():
++    """A real listener whose accept queue is full: the SYN is dropped, connect hangs."""
++    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++    listener.bind(("127.0.0.1", 0))
++    listener.listen(0)
++    port = listener.getsockname()[1]
++    fillers = []
++    try:
++        for _ in range(8):
++            filler = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++            filler.settimeout(0.2)
++            fillers.append(filler)
++            try:
++                filler.connect(("127.0.0.1", port))
++            except (TimeoutError, OSError):
++                break
++        else:
++            pytest.skip("this kernel never fills the accept queue")
++        start = time.monotonic()
++        url = f"http://127.0.0.1:{port}"
++        fails(lambda: client(url, timeout_s=0.5).complete(messages()))
++        assert time.monotonic() - start < BOUND_S
++    finally:
++        for filler in fillers:
++            filler.close()
++        listener.close()
++
++
++# --- (d) through the REPL -----------------------------------------------------------
++
++
++@pytest.fixture
++def loaded_prompts(tmp_path):
++    from nl_shell import prompts
++
++    folder = tmp_path / "target"
++    (folder / "prompts").mkdir(parents=True)
++    (folder / "prompts" / "prompts.yaml").write_text(
++        "system: You turn one request into one bash command.\n"
++        "examples:\n"
++        "  - request: show disk usage\n"
++        "    response: '" + VALID + "'\n"
++        "request_template: |-\n"
++        "  State:\n"
++        "  {state}\n"
++        "  Request: {request}\n",
++        encoding="utf-8",
++    )
++    return prompts.load(folder)
++
++
++def run_repl(backend, prompts, *lines):
++    """Run a REPL over ``lines``; return its output and how many lines it read."""
++    from nl_shell.repl import Repl
++
++    queue = list(lines)
++    reads = []
++
++    def read(prompt):
++        reads.append(prompt)
++        if not queue:
++            raise EOFError
++        return queue.pop(0)
++
++    out = io.StringIO()
++    assert Repl(read, out, backend=backend, prompts=prompts).run() == 0
++    assert len(reads) == len(lines) + 1, "every line must be read, then end of input"
++    return out.getvalue()
++
++
++def test_repl_shows_the_framed_proposal(serve, loaded_prompts):
++    fake = serve(answer())
++    out = run_repl(client(fake.url), loaded_prompts, "show disk usage")
++    assert out.startswith("Proposed command (risk: read-only, 1 line):\n  | df -h\n")
++    assert fake.requests[0].json()["messages"][-1]["content"].endswith("show disk usage")
++
++
++REJECTS = {
++    "extra property": '{"kind": "command", "command": "ls", "risk": "read-only", "x": 1}',
++    "missing risk": '{"kind": "command", "command": "ls"}',
++    "command with reason": (
++        '{"kind": "command", "command": "ls", "risk": "read-only", '
++        '"reason": "unclear-request"}'
++    ),
++    "command over 2000 code points": json.dumps(
++        {"kind": "command", "command": "é" * 2001, "risk": "read-only"}
++    ),
++    "invalid JSON": '{"kind": "command", ',
++    "a JSON array": '[{"kind": "command", "command": "ls", "risk": "read-only"}]',
++}
++
++
++@pytest.mark.parametrize("raw", REJECTS.values(), ids=REJECTS.keys())
++def test_repl_rejects_a_bad_proposal_and_reads_on(serve, loaded_prompts, raw):
++    fake = serve(answers(raw, VALID))
++    out = run_repl(client(fake.url), loaded_prompts, "list files", "show disk usage")
++    first, _, rest = out.partition("\n")
++    assert first == "No usable proposal came back from the model."
++    assert rest.startswith("Proposed command (risk: read-only, 1 line):")
++
++
++def test_repl_with_no_socket_says_the_server_is_not_running(loaded_prompts):
++    directory = tempfile.mkdtemp(prefix="nls-")
++    try:
++        path = os.path.join(directory, "missing.sock")
++        backend = client(path, kind="unix")
++        out = run_repl(backend, loaded_prompts, "show disk usage", "list files")
++        line = f"The model server isn't running (no answer at {path})."
++        assert out == f"{line}\n{line}\n"
++    finally:
++        shutil.rmtree(directory, ignore_errors=True)
++
++
++def test_repl_with_no_socket_path_says_the_server_is_not_running(
++    loaded_prompts, monkeypatch
++):
++    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
++    backend = client(None, kind="unix")
++    out = run_repl(backend, loaded_prompts, "show disk usage", "list files")
++    line = "The model server isn't running (no socket path: XDG_RUNTIME_DIR is not set)."
++    assert out == f"{line}\n{line}\n"
++
++
++def test_repl_catches_any_backend_error(loaded_prompts):
++    """A stub backend, no teacher_client: only the catch in Repl._propose can pass this."""
++    from nl_shell import backend
++
++    class Failing:
++        def __init__(self):
++            self.calls = 0
++
++        def complete(self, messages):
++            self.calls += 1
++            raise backend.BackendError("boom")
++
++    failing = Failing()
++    out = run_repl(failing, loaded_prompts, "show disk usage", "list files")
++    line = "The model server could not be used: boom."
++    assert out == f"{line}\n{line}\n"
++    assert failing.calls == 2
++
++
++HOSTILE_STATUS = b"HTTP/1.1 500 \x1b]52;c;ZWNobyBwd25lZA==\x07\x1b[2K\rnl> fake\r\n"
++
++
++def test_a_hostile_status_line_never_reaches_the_terminal(serve, loaded_prompts):
++    def script(out, fake):
++        body = b"\x1b[31merror\x07\r\x1b]0;title\x07"
++        out.write(
++            HOSTILE_STATUS
++            + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
++            + body
++        )
++
++    fake = serve(script)
++    error, _ = fails(lambda: client(fake.url).complete(messages()))
++    reason = str(error)
++    for char in ("\x1b", "\x07", "\r"):
++        assert char not in reason
++
++    out = run_repl(client(fake.url), loaded_prompts, "show disk usage", "list files")
++    for char in ("\x1b", "\x07", "\r"):
++        assert char not in out
++    first, second, end = out.split("\n")
++    assert first == f"The model server could not be used: {reason}."
++    assert first.startswith("The model server could not be used: the server answered 500")
++    assert second == first and end == ""
++
++
++LONG_SPOOF = b"Proposed command (risk: read-only) " + b"A" * 5000
++
++
++@pytest.mark.parametrize(
++    "status_line",
++    [
++        # Does not parse: http.client raises BadStatusLine holding the whole raw line.
++        b"HTTP/1.1 " + LONG_SPOOF + b"\x1b[2K\r\n",
++        # Parses: a 500 whose reason phrase is the long text.
++        b"HTTP/1.1 500 " + LONG_SPOOF + b"\x1b[2K\r\n",
++    ],
++    ids=["malformed", "long-reason"],
++)
++def test_a_long_status_line_is_cut_to_one_short_line(serve, loaded_prompts, status_line):
++    from nl_shell import teacher_client
++
++    def script(out, fake):
++        out.write(status_line + b"Content-Length: 0\r\nConnection: close\r\n\r\n")
++
++    fake = serve(script)
++    error, _ = fails(lambda: client(fake.url).complete(messages()))
++    reason = str(error)
++    assert "\n" not in reason and "\x1b" not in reason and "\r" not in reason
++    assert reason.count("A") <= teacher_client.EXCERPT_CHARS
++
++    out = run_repl(client(fake.url), loaded_prompts, "show disk usage")
++    assert out == f"The model server could not be used: {reason}.\n"
++    assert out.count("\n") == 1
++    # The fixed prefix plus at most one cut, escaped excerpt (each hidden character
++    # becomes at most 10 characters), not the server's 5000-character line.
++    assert len(out) < 600
++    for char in ("\x1b", "\x07", "\r"):
++        assert char not in out
++
++
++def test_any_other_failure_is_shown_with_its_reason(serve, loaded_prompts):
++    def script(out, fake):
++        out.write(response("503 Service Unavailable", b"loading model"))
++
++    fake = serve(script)
++    backend = client(fake.url)
++    error, _ = fails(lambda: backend.complete(messages()))
++    out = run_repl(backend, loaded_prompts, "show disk usage")
++    assert out == f"The model server could not be used: {error}.\n"
++    assert "503" in out and "loading model" in out
++
++
++def test_a_tcp_server_that_refuses_is_not_running(loaded_prompts):
++    probe = socket.socket()
++    probe.bind(("127.0.0.1", 0))
++    port = probe.getsockname()[1]
++    probe.close()  # nothing listens there now
++    url = f"http://127.0.0.1:{port}"
++    out = run_repl(client(url), loaded_prompts, "show disk usage")
++    assert out == f"The model server isn't running (no answer at {url}).\n"
++
++
++def test_backend_error_is_the_base_of_every_client_error():
++    from nl_shell import backend, teacher_client
++
++    for name in (
++        "ServerNotRunning",
++        "BadEndpoint",
++        "DeadlineExceeded",
++        "HttpStatusError",
++        "RedirectRefused",
++        "ResponseTooLarge",
++        "BadResponse",
++        "TransportError",
++    ):
++        assert issubclass(getattr(teacher_client, name), backend.BackendError)
++    assert teacher_client.MAX_RESPONSE_BYTES == 64 * 1024
++    assert Path(teacher_client.__file__).name == "teacher_client.py"

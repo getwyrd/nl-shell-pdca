@@ -1,0 +1,23 @@
+Review issue #204: replace the command-classification stub with a reviewed command table and generic argv engine, including fail-closed handling of unreadable command words.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The v3 contract defines unreadable-command rejection, accepted path/text gaps and the boundary with later children; target/docs/design/specs/policy-gate/v1.md:186. |
+| C2 Reproduction (red pre-fix) | PASS | Frozen execution demonstrates the missing behavior with 203 assertion failures, alongside 12 expected missing-loader setup errors; gate-logs/C4-verify.log:9500. |
+| C3 Change | PASS | Command semantics are confined to reviewed data and the command engine, retaining shell-layer literal handling; target/src/nl_shell/gate/rules.py:116 and target/src/nl_shell/gate/commands.py:297. |
+| C4 Verification (red→green) | PASS | Log establishes 453 green tests and a reverted-production red leg; local rerun is unavailable because pytest and tree-sitter-bash are absent, so this verdict rests on captured execution, not independent reproduction; gate-logs/C4-verify.log:10 and gate-logs/C4-verify.log:9500. |
+| C5 Causal adequacy | PASS | Replacing the stub supplies the missing classification cause, and the common unreadable-word path applies elevation rejection through nested argv; no optional-capability probe/load-time guard smell found; target/src/nl_shell/gate/rules.py:329. |
+| T1 Structure | PASS | One table loader and one generic engine separate reviewed meanings from argv interpretation; changed Python files parse successfully and git diff --check is clean; target/src/nl_shell/gate/commands.py:347 and target/src/nl_shell/gate/rules.py:321. |
+| T2 Shape | PASS | Security semantics and accepted gaps are documented alongside the engine; the frozen threat-model scanner confirms the required touch; gate-logs/T2-threat-model.log:10 and target/docs/design/specs/policy-gate/v1.md:211. |
+| T3 Runtime | PASS | Captured full-suite execution reports 1,586 passed, one skipped and five forkpty warnings; local pytest is unavailable, so no independent runtime claim is made; gate-logs/T3-suite.log:44. |
+| T4 Contribution | N/A | Contribution artifacts are intentionally drafted after Check; the substantive audit must rerun at publish; gate-logs/T4-contribution.log:10. |
+| T5 Judgment | NEEDS-HUMAN | Adjudicate reference-host inventory drift (mount.cifs and mount.smb3 have no rows), and confirm affected-path merged/closed/rejected prior art beyond the single supplied base commit — coverage completeness and duplication remain unsettled; target/scripts/harvest_inventory.py:26 and target/targets/ubuntu-26.04/commands.toml:999. |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Accept the user-facing rejection cost and documented residual path/text risks for this release — typed variable commands can be rejected while unknown symlink paths remain accepted; target/docs/design/specs/policy-gate/v1.md:200 and target/docs/design/specs/policy-gate/v1.md:211. |
+
+Independent checks: ran `python3 target/scripts/harvest_inventory.py --output inventory-review.toml` successfully on Ubuntu 26.04.1 LTS. Comparing it with the checked-in inventory found exactly two additional entries: setuid `/usr/sbin/mount.cifs` and its same-file alias `/usr/sbin/mount.smb3`. Neither matches a command-table name or pattern. The generated inventory is retained as `inventory-review.toml`; drift is explicitly human-adjudicated by the contract, not treated here as a demonstrated privilege bypass.
+
+Prior art: ran `git log --all --oneline -- src/nl_shell/gate/rules.py targets/ubuntu-26.04/commands.toml scripts/harvest_inventory.py` in the supplied target. It returns only `a2d1efe pre-fix base 1a1e980...`; the bundle's brief records an affected-path and PR-state check (brief.md:365), but original merged history and closed/rejected work are unavailable for independent confirmation.
+
+Verification limits: `python3 -m pytest -q tests/test_gate_commands.py tests/test_policy_gate.py tests/test_targets.py` fails before collection with `No module named pytest`; importing `tree_sitter_bash` also fails locally. Consequently I did not stash the patch for a redundant unavailable red leg. All four frozen gate logs were readable and inspected. Their recorded runs exercise the parser dependency rather than substitute a code-read or shim; the missing local packages are a reviewer-host limitation, not a patch defect. Target source was readable and matched the patch; no stale-target caveat was needed. No target source was changed.
+
+<!-- pdca:leaf-complete -->

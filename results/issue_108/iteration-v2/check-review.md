@@ -1,0 +1,21 @@
+Review issue #108: route command-prefixed English sentences and qualifying unbalanced apostrophes as natural language while preserving explicit shell syntax.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The deterministic rule, quote precedence, exclusions and twelve required vectors define an assessable scope; implementation matches those choices at target/src/nl_shell/router.py:86. |
+| C2 Reproduction (red pre-fix) | PASS | Independently executing the git-base router confirms all six intended English examples incorrectly return COMMAND; the frozen REPL run also records six assertion failures, not setup failures (gate-logs/C4-verify.log:16). |
+| C3 Change | PASS | The three changed files stay within routing, regression tests and architecture documentation; first_token is independently confirmed unchanged, preserving its other caller's contract (target/src/nl_shell/router.py:53; target/docs/design/architecture/05-building-block-view.md:75). |
+| C4 Verification (red→green) | PASS | Independent base-versus-patched execution confirms all six route transitions; frozen evidence shows 6 failed/35 passed before and 41 passed after. Local pytest rerun was unavailable (No module named pytest), so REPL integration confirmation rests on the captured run (gate-logs/C4-verify.log:12). |
+| C5 Causal adequacy | PASS | The first-token-only decision is replaced at the routing decision point; 5,324 independent comparisons against the specified predicate passed. No capability probe or load-time symptom guard is added (target/src/nl_shell/router.py:91; target/src/nl_shell/router.py:115). |
+| T1 Structure | PASS | Pure routing helpers retain the module boundary and avoid REPL coupling or new dependencies; command resolution still reads PATH per call (target/src/nl_shell/router.py:107). |
+| T2 Shape | PASS | Exact quote exclusions, word splitting and function-word membership match the specification; only the three scoped files change, and the frozen threat-model scanner reports no security-relevant path touched (target/src/nl_shell/router.py:75; gate-logs/T2-threat-model.log:11). |
+| T3 Runtime | PASS | Frozen full-suite output records 1,120 passed, one skipped and one forkpty warning; local pytest is absent, so this is log-supported rather than a repeated full-suite result (gate-logs/T3-suite.log:28; gate-logs/T3-suite.log:33). |
+| T4 Contribution | N/A | Contribution artifacts are absent by design; the captured deferred gate explicitly requires the substantive contribution audit at publish (gate-logs/T4-contribution.log:11). |
+| T5 Judgment | NEEDS-HUMAN | Confirm the path-specific merged-history and closed/rejected-work search remains sufficient — the brief records searches for router.py and test_repl.py, but this disposable target exposes only one synthetic base commit and cannot independently establish remote or rejected-work history (brief.md:58). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Accept the deliberate usability tradeoff that sentence-shaped commands may invoke natural-language handling and short/metacharacter-containing English remains a command — the prescribed examples pass, but real-user suitability requires maintainer judgment (target/src/nl_shell/router.py:15; target/src/nl_shell/router.py:22). |
+
+Independent checks used only the supplied disposable target: the base router was loaded from git show without changing the tree, and patched/base routes were exercised with command lookup controlled. This confirms predicate behavior, not a substitute for the REPL integration run in the gate log. The fake PATH in the actual regression tests contains every external command used; kill, echo and printf resolve as builtins (target/tests/test_repl.py:49; target/src/nl_shell/router.py:42).
+
+The previous iteration's missing coverage is addressed: isolated negative vectors cover option words, metacharacters, absence of function words, and both exclusions on the apostrophe signal (target/tests/test_repl.py:115). No implementation defect was identified. The repository snapshot contains no INTEGRATION.md; no additional human-only checklist was available in the supplied evidence.
+
+<!-- pdca:leaf-complete -->

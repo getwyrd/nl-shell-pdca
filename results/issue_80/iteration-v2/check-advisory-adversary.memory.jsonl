@@ -1,0 +1,3 @@
+{"event": "spawn", "bound": "16G"}
+{"ts": "2026-11-15T01:01:17", "elapsed": 15.0, "unit": "run-p1483570-i106300182.scope", "memory": 168808448, "peak": 253550592, "procs": 1, "top": [{"cmd": "/home/eddie/.local/bin/claude -p --agent adversary --permission-mode acceptEdits --allowedTools Read,Bash,Grep,Glob --output-format stream-json --verbose", "n": 1, "rss": 280199168}]}
+{"ts": "2026-11-15T01:01:32", "elapsed": 30.0, "unit": "run-p1483570-i106300182.scope", "memory": 167800832, "peak": 253550592, "procs": 1, "top": [{"cmd": "/home/eddie/.local/bin/claude -p --agent adversary --permission-mode acceptEdits --allowedTools Read,Bash,Grep,Glob --output-format stream-json --verbose", "n": 1, "rss": 279531520}]}

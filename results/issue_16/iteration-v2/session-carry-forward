@@ -1,0 +1,5 @@
+Rejected for the three display/hidden-character gaps the adversary and security reviewers found; the rest of the build is fine — keep it and change only these:
+1. Widen the hidden-character set (render.is_hidden, shared by the parser and escaping): also reject/escape Unicode format characters (category Cf, e.g. U+200B, U+200D, U+2060, U+FEFF, U+00AD), U+2028/U+2029, and tag characters U+E0000–U+E007F. Add test vectors for each (at least U+200B, U+FEFF, U+2028, U+E0041) in both the parser-reject and :context-escape paths.
+2. Make the :context escaping one-to-one: escape a literal backslash too, so a real ESC and the typed four characters `\x1b` print differently. Pin the backslash's escaped form in a test.
+3. Frame multi-line commands so a command can't fake nl-shell's own header or risk line (e.g. prefix or indent each command line, or show a line count). Test with the reviewer's vector: a command whose later lines contain "Proposed command (risk: read-only):" must not print as a bare header line.
+Note: items 1 and 3 go beyond the brief's criterion (e) as written (which pins the smaller set and shows LF as-is); treat this rationale as the updated requirement.

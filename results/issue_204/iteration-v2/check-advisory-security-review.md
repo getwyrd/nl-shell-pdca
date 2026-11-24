@@ -1,0 +1,29 @@
+# Security review — gate-command-table-engine (#204)
+
+**Attacker-reachable inputs this diff touches:** the model's proposal text (threat model "Where untrusted input enters" item 5) and typed or retrieved command text. Both reach `nl_shell.gate.classify`, then `rules.classify` (`src/nl_shell/gate/__init__.py:196`), and from there the new engine (`src/nl_shell/gate/rules.py`) and the table loader (`src/nl_shell/gate/commands.py`).
+
+I ran about 200 crafted commands against the patched tree through the public `classify(cmd, origin=...)` (harness venv, tree-sitter-bash present). One finding. It is High on the threat model's scale ("a privileged … step is classed lower"), but it comes from a floor the spec already sets, so a human has to decide what to do with it.
+
+## Findings
+
+- NEEDS-HUMAN [human] — **High** — `src/nl_shell/gate/rules.py:312-322` (with `docs/design/specs/policy-gate/v1.md:90-92` and `:162-163`). **Input:** the command word of a model proposal. **What goes wrong:** when the command word is a glob, a variable or a find/xargs placeholder that bash turns into `sudo` at run time, the engine classes it `mutating` or `destructive`. The proposal is **not rejected** and the §5 sudo rules never run. Results seen on the patched tree:
+  - `/usr/bin/sud? -i` → `mutating`, proposal accepted (bash globs it to `/usr/bin/sudo -i`, a root shell).
+  - `/usr/bin/s*do -S true` → `mutating`, accepted for both `proposal` and `typed`. This gets around §5's `sudo -S` rejection. The threat model's "What must hold" says the gate rejects `sudo -S`. Passthrough starts only for privileged commands, so the password prompt for this command would come up outside passthrough.
+  - `/usr/*/sudo -i` → `mutating`, accepted. `x=sudo; $x -i` → `mutating`, accepted.
+  - `find /usr/bin -name 'sud?' -exec {} -i \;` and `ls /usr/bin/sud? | xargs -o -I% % -i` → `destructive`, accepted.
+
+  The patch fails closed on the same risk elsewhere. An undecodable `$'…'` word "may spell any command, `sudo` included" and is made `privileged` and rejected (`rules.py:305-311`). A glob or variable in the command word may spell `sudo` just as easily, but stays at the `mutating` floor. That floor is older than this patch: spec §2 (`v1.md:90`) and the new §4.1 decision A text (`v1.md:162-163`, "whose command word the gate cannot read … is at least `mutating`"). So this is a scope or spec decision, not a builder slip. Options: (a) for a command word whose only non-literal part is a glob, match its last path part with `fnmatch` against row names and apply the elevating/destroying rows (`sud?` and `s*do` match `sudo`, `r?` matches `rm`), and reject proposals whose command word is a variable or placeholder; (b) reject every proposal whose command word the gate cannot read; (c) write the case into the threat model's "Known gaps" so it is accepted on purpose. Neither the patch's tests nor `gate-vectors.toml` cover a glob command word that resolves to `sudo`. Reproducer: `classify("/usr/bin/sud? -i", origin="proposal")` should come back `privileged`, rejected. Today it gives `mutating`, not rejected.
+
+## Checked, no finding
+
+- **Sudo family and §5:** `-S`/`-A`/`-p` in every spelling I tried (`-nS`, `-Sn`, `"-S"`, `$'-\x53'`, `-$'S'`, `--stdin`, `--prompt=x`, the `--pro` and `--stdi` prefixes on `sudo`, `sudo.ws` and `sudo-rs`, and `sudoedit-rs -S`) are all rejected. Pipes, here-docs and here-strings into sudo are rejected. `sudo -- -S true` is `privileged` and not rejected, which is correct: after `--`, `-S` is the name of the program to run.
+- **Elevation reaching inner commands:** `sudo` + `bash`/`zsh`/`python3.14`/`perl5.40.1`/`awk`/`tclsh`/`gjs`/`gdb`/`screen`/`tmux`/`busybox`/`at`/`crontab`/`./bash`/`/bin/bash`, `sudo env -S bash`, `sudo xargs bash`, `sudo systemd-run bash`, `sudo sudo -i` and `sudo -u root -s` are all rejected as proposals.
+- **Wrappers:** `env` (`-C`, `-u`, `--chdir=`, `-P`, `-`), `nice --`, `nohup --`, `timeout -k`/`--signal=`, `stdbuf`, `setsid -w`, `time -p`, `watch -x`, `command -p`, `exec -c`/`-l`, `builtin`, `find -exec`/`-execdir`/`-ok`/`-okdir`, `strace`/`ltrace`, `chrt`/`taskset` (decision A), and `busybox env` each followed by `sudo -i` are all `privileged` and rejected.
+- **xargs replace strings:** `-I sudo`, `-Isudo`, `--replace`, `-i … {}` and `-I"$r"` before `sudo` are rejected. `-I$'s' s -i` is `destructive`; that is the placeholder part of the finding above.
+- **ANSI-C decoding** (`rules.py:106-228`): `\u`, `\U`, octal, `\x{…}` (including more than 2 digits and an 8000-digit body) and the NUL cut-off all decode to the expected command name. Double-quoted `$'` gives no readable word and fails closed.
+- **Decision B:** `x | sh`, `sh < f`, `bash -c "$v"`, `eval "$v"`, `. ./f`, `source f`, `python3 -m`/`-c`/file, `perl -M`, `ruby -e`, `node -e`/`--eval=`, `awk -f /dev/stdin`, `env -S`, `flock -c`, `script -c`, `watch 'text'` and `enable -f` are all at least `destructive`. `awk '<program>'` stays `mutating`; that is the documented class-7 gap in the threat model.
+- **Loader** (`commands.py:305-330`): one fixed path, resolved and kept under `TARGETS_ROOT`. No environment variable, cwd or `HOME` lookup. The harvester (`scripts/harvest_inventory.py:98,109`) calls `subprocess.run` without a shell and is run only by a developer, so no attacker input reaches it.
+- **Resource limits:** 40 nested `env`s, 1500 `nice`s and 500 nested `find -exec`s all hit `MAX_NESTING` and become decision C ("could not class", rejected) in about 10 ms. 700 nested `xargs -I%` and an 8 KB argv take under 0.1 s. Nothing raised or hung.
+
+Not a security issue, but worth a look: `sudo find . -name x` is rejected as a proposal because the operand `.` matches the `.` (source) builtin row ("runs a shell or interpreter under sudo: ."). This over-rejects. It never classes anything lower.
+<!-- pdca:leaf-complete -->

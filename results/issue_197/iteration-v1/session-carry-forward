@@ -1,0 +1,10 @@
+Human overrode the size backstop: keep this as one bundle, no split. Design and plan-review answers are accepted; rebuild to close these confirmed bypasses (each needs a full-pipeline regression case in tests/test_gate_commands.py, as a proposal where the finding concerns rejection):
+- sudo family is missing the names shipped on Ubuntu 26.04: add sudo-rs, sudo.ws, sudoedit-rs to the sudo/sudoedit row and su-rs to the su row (cases: `sudo-rs -i`, `sudo.ws -i`, `su-rs`, `/usr/bin/sudo-rs -i`, `echo pw | sudo-rs -S true`, `foo sudo-rs` via decision A, `sudoedit-rs /etc/shadow`).
+- `env -S` text uses env's split-string syntax, not bash: `env -S 'sudo\_-i'` must be rejected and `env -S 'rm\_-rf\_/'` at least destructive (treat `\_`, `${` and other env-only escapes as unreadable text under decision B, or translate the string to bash words before classing it).
+- `getopts -- x SUDO_PROMPT` must be rejected: the raw getopts row counts `--` as an operand.
+- Non-literal inner command (`find -exec {}`, `xargs -I% %`): also run decision A over the row's literal args, so `find /usr/bin -name sudo -exec {} -i \;` is privileged and rejected.
+- Root-shell rejection gaps: `sudo bash -s x`, `sudo bash -is x`, `sudo dash -s x`, `sudo env bash -s x`, `pkexec bash -s x`, `sudo bash /dev/stdin` (opens-shell on -s; mark opens_shell when stdin is the terminal), plus `sudo chroot /` and `sudo unshare` (opens-shell when no command is given).
+- `mapfile`/`readarray -C '<text>'`: add a runs-text effect (in_shell) on -C.
+- `wait -p NAME`: add a wait row with sets-variable from option -p (`wait -p SUDO_PROMPT` rejected).
+- `enable -f x.so`: runs-file-as-code on -f (at least destructive); split enable out of the shared raw row.
+Not in this rebuild unless the human says otherwise: interpreters python3/perl/busybox (left for #198) and assignments with no simple command such as `(( X=1 ))` and `for X in` (walker, #196).

@@ -1,0 +1,24 @@
+# Security review (advisory): charsafety-uts39-policy, iteration 4
+
+**Attacker-reachable inputs this diff touches:** the proposal `command` string (threat model "Where untrusted input enters" item 5, the model's own output, which a text-only attacker can steer). It reaches `proposal._parse` (`src/nl_shell/proposal.py:133-138`) and every display path through `render.escape` (`src/nl_shell/render.py`). Typed requests shown in `:context` reach `escape` too; those are trusted input, so they only matter for display.
+
+Rubric: `.oss-scanner/threat_model.md`, the "What the user confirms is exactly what runs" bullet (`:127-141`), and the new known gap at `:184-188`. I read `AGENTS.md` and it has no reviewer protocol to follow. I did not re-raise the human's sign-off decisions from iteration 3: the named blank list, the move to Highly Restrictive, and same-script look-alikes going to #74.
+
+## What I checked (no finding)
+
+- **Hidden set.** I ran crafted commands against the patched tree. U+3164, U+FFA0, U+2001, U+1680 and `rm -rf /⠀` are all flagged by `has_hidden`. Lone surrogates, tags, bidi, Cf, Co and Cn come from the vendored tables, and the static test at `tests/test_charsafety.py:200-208` closes the `from unicodedata import ...` hole from iteration 3. The checks run on the whole `command`, quoted or not, and come before the rule-2 checks, so no path to a `Command` skips them.
+- **Mark limit.** The parser (`render.py` `too_many_marks`) and `escape` count runs the same way: Mn/Me only, and any other character resets the count. So what is rejected and what is escaped match. Two marks on each of several letters (`à̀b̀̀`) is accepted, which matches the brief.
+- **Mixed script.** `сurl` with a Cyrillic letter and Inherited/Common characters inside (`с́url`, `сurl҅`) is still rejected. `cat iPhone用.txt` and `cat 2024年report.txt` are accepted, as the human decided.
+- **Generator** (`scripts/gen_unicode_tables.py`). It reads Script_Extensions over Scripts.txt, strips Zyyy/Zinh only after that override (so U+0485 keeps `Cyrl Latn`), and fails on a UCD version mismatch. It is build-time only and nothing at runtime reads attacker data through it.
+- **Resource use.** Each check is a linear pass with a binary search per character, over a `command` whose length is already capped (`proposal.py`, the length check just above line 133). There is no way to make it blow up.
+- **Tests vs. the attacker case.** `tests/test_charsafety.py` feeds every vector as a stub model response through `Repl`, which is the attacker-reachable path, not only the easy one. C4 was red without the fix (50 of 58 failed), and C4 and T3 (539 passed) are green with it (`gate-logs/C4-verify.log`, `gate-logs/T3-suite.log`).
+
+## Findings
+
+- NEEDS-HUMAN [impl] — **Low**, `src/nl_shell/render.py:139-143,190` against `.oss-scanner/threat_model.md:184-188`. **Input:** a proposal `command`, controlled by the model or a text-only attacker steering it. **What goes wrong:** Highly Restrictive (the human's decision) lets Latin mix with Han, Hangul or Bopomofo inside one word. Some letters in those scripts look like Latin letters or ASCII punctuation, and they pass every check and print raw. On the patched tree, `render.mixed_script_word` returns `None` and `has_hidden`/`too_many_marks` return `False` for: `curㅣ example.com` (U+3163 HANGUL LETTER I, looks like `curl`), `ech〇 hi` (U+3007 IDEOGRAPHIC NUMBER ZERO, looks like `echo`), `ls 一la` (U+4E00, looks like `ls -la`) and `cat ㄧetc` (U+3127 BOPOMOFO LETTER I). Bash still runs the same bytes that are shown, so this is a look-alike problem, not a byte mismatch. The policy allows it by design. The gap is that the new known-gap bullet only lists look-alikes "within one script or in Common". These cross-script look-alikes are neither, and the bullet does not name them. A reviewer reading the threat model would expect `curㅣ` to be rejected as mixed script. **Fix (docs only, no change to the rule):** widen the known-gap bullet at `threat_model.md:184` to say that look-alikes from Han, Hangul or Bopomofo mixed with Latin, which Highly Restrictive allows, are also left to #74. Optionally, add `"curㅣ example.com"` as an accepted vector in `tests/test_charsafety.py` so the documented behaviour has a test. If the human would rather close the gap than document it (for example, allow Latin+Hangul or Latin+Bopomofo only when the word also has Han), that is a scope decision and goes back to them. It is filed as `[impl]` because the minimum fix is the doc sentence.
+
+## Not a finding (for the harness)
+
+`gate-logs/T2-threat-model.log` reports "no security-relevant path touched", even though this patch changes `src/nl_shell/render.py` and `proposal.py` and does update the threat model. The patch meets T2 either way. The T2 path list probably does not include `render.py`/`proposal.py`, and that belongs to the harness, not to this patch.
+
+<!-- pdca:leaf-complete -->

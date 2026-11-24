@@ -1,0 +1,29 @@
+Ship a pinned, attributed tldr snapshot for offline reference
+
+nl-shell promises that reference knowledge works with the network unplugged,
+and the design already counts on a vendored tldr snapshot as part of it. No
+such snapshot existed, so the future reference harvest (#23) had nothing to
+read, and the license review (#34) had nothing to look at.
+
+This adds every English page under pages/common/ and pages/linux/ from
+tldr-pages/tldr at eacda7020c4102729187c38c35ce28fac00365c9 (6,837 pages,
+4,050,595 bytes), with original paths and text kept as is. The pages are
+stored as one sorted path/content JSONL file in data/tldr/. Next to it are
+the source metadata (repository, revision, per-page hashes), the upstream
+LICENSE.md byte for byte, a NOTICE.md crediting the tldr-pages team and
+contributors under CC BY 4.0, and a README with the rebuild steps.
+
+scripts/tldr_snapshot.py export is a standard-library-only reader for the
+harvest to call. It checks the license, the metadata and the whole page set
+against fixed pinned hashes before it prints anything. It then writes each
+page as JSONL tagged with the revision, language "en" and provenance
+"local-reference". It uses only local files and never starts a process.
+
+The threat model now gives the tldr snapshot its own local-reference
+paragraph instead of listing it under Trusted, matching ADR-0016. Man pages
+and --help keep their local-reference label.
+
+The page data stays CC BY 4.0, separate from the Apache-2.0 code license.
+Whether generated datasets or weights may be released is still for #34.
+
+Fixes #80

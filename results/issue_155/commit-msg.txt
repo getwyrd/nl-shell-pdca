@@ -1,0 +1,30 @@
+Classify failed commands by exit code, without a model
+
+When a command fails, nl-shell had no fixed first step that says what kind
+of failure it was. Every failure would go the same way: to a model, with the
+command's output. That is wrong for a Ctrl-C (not an error at all), for a
+missing program (a fixed hint is enough), and above all for a command that
+may have run sudo or another privilege program, whose output must never be
+read and which must never be offered a correction.
+
+Add failure_classes.classify(). It looks only at trusted facts: the exit
+status, pipestatus and shell snapshot from the session's done record, and
+the command text the user confirmed. It never reads the command's output.
+It returns one of: no failure, interrupted (130), privilege, not found
+(127, with an optional package hint from an injected lookup), not
+executable (126), killed by a signal (129-192, with an out-of-memory hint
+for SIGKILL), or other. Each class has a fixed message. Only "other" is
+marked as eligible for the reader.
+
+The privilege check is text-only and keeps no state. A command counts as
+privileged when a privilege program's name appears anywhere, when the text
+holds a code-running or quoting marker such as $( or a backslash, when the
+first word of any command is not a plain name, or when a word names a shell
+function or an alias whose value is privileged. It errs on the safe side:
+some ordinary commands, such as echo $(date), lose the correction offer.
+The misses it still has are listed under "Known gaps" in the threat model,
+and the parser-based policy gate (#12) closes them.
+
+This builds on the persistent session's CommandResult (#140, PR #146).
+
+Fixes #155

@@ -1,0 +1,29 @@
+Scope OS details in the architecture to the active target
+
+The architecture docs still read as if Ubuntu 26.04 were the only system
+nl-shell could ever run on. Reference data, the reference VM, dpkg/apt lookups
+and sudo-rs behavior were described as global facts. The target folder from
+ADR-0023 (targets/<id>/) was missing from the building blocks. The model
+manifest rules were missing too: weights are checked against model.toml, the
+REPL refuses weights that do not match, and adapters are tied to the target
+and base-weight hash. A reader could not tell what is shared, what belongs to
+one target, or what is built today.
+
+Chapter 05 now shows the target folder and the parts that read it: REPL
+start-up, gate, reader, installer and pipeline. Each is marked built or
+planned to match the code. Section 5.3 lists the target modules that exist,
+and still marks PTY session, state capture, gate integration, confirm UI and
+the session log as planned. Chapter 07 describes the planned package of
+per-target runtime files, weights downloaded only at install or explicit
+update and verified by SHA-256, the required refusal on a hash mismatch, and
+adapter compatibility. All of these are marked as requirements awaiting
+implementation. Both open distribution questions stay open: the weight URL
+host and the package channel. Chapter 08 and the other chapters name dpkg,
+apt, sudo-rs and 26.04 facts as belonging to the ubuntu-26.04 target, the
+first and only target today.
+
+No ADR, spec or runtime code changes. tests/test_architecture_targets.py
+reads the real chapters and checks these relationships and their status
+wording.
+
+Fixes #94

@@ -1,0 +1,26 @@
+Review wiring the REPL to the local model socket by default, with explicit per-session opt-in for developer teacher URLs and configurable request deadlines.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | Endpoint consent and timeout expectations are concrete and consistent with the governing endpoint rule; target/docs/design/adr/0020-configuration-and-file-locations.md:32 and brief.md:4. |
+| C2 Reproduction (red pre-fix) | PASS | Frozen red output shows assertion failures for missing selection, rejected flag, missing timeout and zero Unix connections, rather than collection errors; gate-logs/C4-verify.log:17 and target/tests/test_teacher_endpoint.py:632. |
+| C3 Change | PASS | The diff stays within endpoint selection, configuration and CLI wiring, with status-only adjustments in existing tests; target/src/nl_shell/cli.py:83 and target/tests/test_backend.py:544. |
+| C4 Verification (red→green) | PASS | Captured gate execution reports 243 green tests and 110 red failures without production changes, including the new file's own assertions; independent pytest execution was unavailable because this sandbox has no pytest; gate-logs/C4-verify.log:10. |
+| C5 Causal adequacy | PASS | The missing backend is supplied at the actual REPL construction point, and the end-to-end assertion requires a received Unix request plus a rendered proposal; no optional-capability probe masks a load-time cause; target/src/nl_shell/cli.py:98 and target/tests/test_teacher_endpoint.py:634. |
+| T1 Structure | PASS | Pure selection is separated from connection execution and CLI presentation; the existing transport implementation remains intact; target/src/nl_shell/teacher_client.py:213 and target/src/nl_shell/cli.py:88. |
+| T2 Shape | PASS | Default selection refuses configured TCP URLs before client creation and the test checks both connection families and server receipt; the scanner log only asserts no recognized security path, not a substantive security audit; target/tests/test_teacher_endpoint.py:600 and gate-logs/T2-threat-model.log:10. |
+| T3 Runtime | PASS | Frozen full-suite evidence records 753 passing tests with one forkpty deprecation warning; independent timeout checks passed, but this sandbox lacks pytest for a suite re-run; gate-logs/T3-suite.log:23 and target/src/nl_shell/config.py:93. |
+| T4 Contribution | N/A | Contribution artifacts are absent by design at Check; the substantive contribution audit must run at publish; gate-logs/T4-contribution.log:10. |
+| T5 Judgment | NEEDS-HUMAN | Confirm affected-path prior art across merged history and closed/rejected work before treating this as new work — the brief records only cli.py/config.py history and parent attempts, while the supplied target has one synthetic commit and no remotes; brief.md:22. |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Decide whether local fake-server evidence suffices for the intended deployment and whether refusal followed by local fallback is acceptable — no real LAN teacher/model was exercised; target/tests/test_teacher_endpoint.py:98 and brief.md:27. |
+
+Evidence and limits:
+
+- Target source was readable and contained the applied patch with the required prerequisite client and REPL interface. Citations beginning `target/` refer to that supplied target, not another checkout. No target-state mismatch was found.
+- Attempted `python3 -m pytest tests/test_teacher_endpoint.py -q` from the target: `/usr/bin/python3: No module named pytest`. Therefore no stash/red/pop cycle was attempted: the same missing runner would prevent either leg. C2/C4/T3 verdicts rely explicitly on the complete frozen logs, not on an independently reproduced pytest run. The logs show actual tests executing, including YAML-backed prompt fixtures; there is no evidence of an undischarged PyYAML dependency in the gate environment.
+- Independently ran `git -C target diff --check` successfully and eight direct config timeout checks covering 0.5, booleans, zero, negative values, NaN, infinity, an excessive value and a string. No product source was modified.
+- Read all four supplied gate logs. Wrapper absence in this artifact sandbox is expected. T2's narrow path classification does not establish that this endpoint change is security-irrelevant; source review and the no-TCP regression test provide the substantive basis above.
+- Prior-art investigation: `git -C target remote -v` returned no remotes; `git -C target log --all --oneline -- src/nl_shell/cli.py src/nl_shell/config.py src/nl_shell/teacher_client.py tests/test_teacher_endpoint.py` returned only `09b25de pre-fix base`. No closed/rejected-work evidence or INTEGRATION.md was supplied. The human must supply or confirm the broader affected-path search.
+- Deployment validation: with a matching installed OS target and a running compatible model server, run `nl-shell --dev-teacher http://TEACHER_HOST:PORT`, enter `:status`, then `show disk usage`; confirm endpoint/backend, the non-loopback HTTP warning, and a usable proposal without accepting execution. Repeat without the flag while that URL is configured: confirm the refusal, local-socket status and absence of requests at the teacher. This checks the real service/topology beyond the captured local fixtures.
+
+<!-- pdca:leaf-complete -->

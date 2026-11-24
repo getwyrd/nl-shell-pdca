@@ -1,0 +1,113 @@
+{
+  "issue_dir": "issue_196",
+  "overall": "pass",
+  "rows": [
+    {
+      "check": "C1 Spec",
+      "result": "none",
+      "oracle": "brief.md",
+      "rule_id": "",
+      "path_line": "",
+      "gating": false,
+      "element": "C1"
+    },
+    {
+      "check": "C2 Reproduction (red pre-fix)",
+      "result": "none",
+      "oracle": "(no gate configured)",
+      "rule_id": "",
+      "path_line": "",
+      "gating": false,
+      "element": "C2"
+    },
+    {
+      "check": "C3 Change",
+      "result": "none",
+      "oracle": "patch.diff",
+      "rule_id": "",
+      "path_line": "",
+      "gating": false,
+      "element": "C3"
+    },
+    {
+      "check": "C4 fix verified: bundle test red pre-fix, green post-fix (pytest)",
+      "result": "pass",
+      "oracle": "./engine/scripts/run-verify.sh",
+      "rule_id": "C4-verify",
+      "path_line": "C4 PASS \u2014 red without the fix (169 of 169 failed), green with it",
+      "gating": true,
+      "element": "C4",
+      "duration_secs": 5.75,
+      "log": "gate-logs/C4-verify.log"
+    },
+    {
+      "check": "C5 Causal adequacy",
+      "result": "none",
+      "oracle": "reviewer + human sign-off",
+      "rule_id": "",
+      "path_line": "",
+      "gating": false,
+      "element": "C5"
+    },
+    {
+      "check": "T1 Structure",
+      "result": "none",
+      "oracle": "(no gate configured)",
+      "rule_id": "",
+      "path_line": "",
+      "gating": false,
+      "element": "T1"
+    },
+    {
+      "check": "T2 security-relevant change also updates the threat model",
+      "result": "pass",
+      "oracle": "./engine/scripts/check-threat-model-touch.sh",
+      "rule_id": "T2-threat-model",
+      "path_line": "security-relevant paths touched and the threat model updated: src/nl_shell/gate/__init__.py src/nl_shell/gate/live.py sr",
+      "gating": false,
+      "element": "T2",
+      "duration_secs": 0.01,
+      "log": "gate-logs/T2-threat-model.log"
+    },
+    {
+      "check": "T3 runtime: the whole nl-shell pytest suite on the patched worktree",
+      "result": "pass",
+      "oracle": "./engine/scripts/run-suite.sh",
+      "rule_id": "T3-suite",
+      "path_line": "T3 PASS \u2014 nl-shell suite green",
+      "gating": true,
+      "element": "T3",
+      "duration_secs": 174.89,
+      "log": "gate-logs/T3-suite.log"
+    },
+    {
+      "check": "T4 PR body has a user-impact opener + tracker id in both artifacts",
+      "result": "deferred",
+      "oracle": "./scripts/pdca contribcheck",
+      "rule_id": "T4-contribution",
+      "path_line": "pr-description.md not drafted yet \u2014 the substantive T4 audit of the contribution artifacts runs at publish",
+      "gating": true,
+      "element": "T4",
+      "duration_secs": 0.07,
+      "log": "gate-logs/T4-contribution.log"
+    },
+    {
+      "check": "T5 Judgment",
+      "result": "none",
+      "oracle": "reviewer + human sign-off",
+      "rule_id": "",
+      "path_line": "",
+      "gating": false,
+      "element": "T5"
+    },
+    {
+      "check": "Validation \u2014 fitness-to-purpose",
+      "result": "none",
+      "oracle": "human at sign-off",
+      "rule_id": "",
+      "path_line": "",
+      "gating": false,
+      "element": "V"
+    }
+  ]
+}

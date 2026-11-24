@@ -1,0 +1,26 @@
+Review the relative Markdown link checker and CI step, including the fence, escape, paragraph, and reference-definition regression coverage requested in iteration 2.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The fixed parsing rule and explicit exclusions give a falsifiable scope; iteration 2 identifies concrete regression cases rather than requiring CommonMark conformance (brief.md:23; brief.md:59). |
+| C2 Reproduction (red pre-fix) | PASS | Independently stashing the production script made all 38 fixture invocations fail with missing-script exit 2; the frozen pytest red leg separately records 39 assertion failures and no collection errors (gate-logs/C4-verify.log:699; target/tests/test_docs_links.py:118). |
+| C3 Change | PASS | Changes stay within the checker, its tests, and the existing workflow; the prerequisite freeze step remains intact and the link step follows it (target/.github/workflows/docs-checks.yml:32; target/.github/workflows/docs-checks.yml:47). |
+| C4 Verification (red→green) | PASS | Independent direct execution passed 38 fixtures and the live scan; stash/restoration confirmed script absence causes red and restoration returns the live scan to green; frozen pytest evidence shows 39 green and 39 red (gate-logs/C4-verify.log:10; gate-logs/C4-verify.log:699). |
+| C5 Causal adequacy | PASS | Checking tracked destinations addresses the missing validation directly; ordered masking and explicit destination checks implement the agreed rule without a capability probe masking a load-time cause (target/scripts/docs_links.py:243; target/scripts/docs_links.py:318). |
+| T1 Structure | PASS | The checker is stdlib-only tooling outside the shipped package; subprocess fixtures isolate Git repositories and provide their own identity (target/scripts/docs_links.py:48; target/tests/test_docs_links.py:21; target/tests/test_docs_links.py:36). |
+| T2 Shape | PASS | Read-only pull-request permissions and isolated Python execution are retained; the frozen threat-model scanner reports no security-relevant path touched (target/.github/workflows/docs-checks.yml:10; target/.github/workflows/docs-checks.yml:48; gate-logs/T2-threat-model.log:10). |
+| T3 Runtime | PASS | Frozen full-suite output reports 145 passing tests; independent execution confirms 60 relative links across 53 Markdown files with zero broken links; local pytest is unavailable, so full-suite confidence rests on the captured run (gate-logs/T3-suite.log:11; target/tests/test_docs_links.py:181). |
+| T4 Contribution | N/A | Contribution artifacts are intentionally drafted after Check; their substantive audit is deferred to the mandatory publish rerun (gate-logs/T4-contribution.log:10). |
+| T5 Judgment | NEEDS-HUMAN | Confirm prior-art review by affected path against merged history and closed/rejected work — this bundle exposes only a synthetic base commit and no closed-work evidence, so duplication or a previously rejected approach cannot be ruled out (target/scripts/docs_links.py:1; target/tests/test_docs_links.py:1; target/.github/workflows/docs-checks.yml:47). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Confirm that decision 5's deliberately limited syntax and making existing broken links fail code PRs are acceptable, and inspect the draft PR's docs job — local checks validate behavior but do not establish hosted workflow execution or maintainer acceptance (brief.md:19; brief.md:47; target/scripts/docs_links.py:32). |
+
+Verification details:
+
+- All source citations were grounded in the supplied `$PDCA_TARGET`, which contains the prerequisite workflow and the applied patch. No stale-target caveat was needed.
+- Python 3 is available, but `python3 -m pytest --version` reports `No module named pytest`. The instance-scoped wrappers are not part of this bundle. C4, T2, T3, and T4 were adjudicated from their captured logs; this local host limitation is not a patch defect or an unmet dependency in the original gate run.
+- Independently evaluated the test file's literal fixture data using the standard library, created Git-indexed fixture repositories inside this review sandbox, and invoked the actual checker with `python3 -I`. All 36 parametrized fixtures plus the escaped-destination and comment-ordering cases passed. The separate live checkout scan also passed. These direct checks supplement, rather than claim to reproduce, the pytest runner and its isolation fixtures.
+- Stashed only `scripts/docs_links.py` with untracked files included, observed missing-script failures for all 38 fixture invocations, then restored the stash and reran the live scan successfully. The original patch remains restored. The red leg establishes the absence of the checker, not a pre-existing parser regression.
+- `git diff --check` passed. A path-scoped `git log --all` for all three affected files returned only `6c27276 pre-fix base a972610a6ed1f9dc2c7571258120402d398a9f56`. No `INTEGRATION.md` was supplied, so additional project-specific human-only items could not be enumerated.
+- For hosted validation, open the draft PR's Actions run, inspect the `Docs checks` workflow's `Relative links resolve` step, and confirm successful execution and zero broken links. No GUI behavior is changed.
+
+<!-- pdca:leaf-complete -->

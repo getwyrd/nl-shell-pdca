@@ -1,0 +1,5 @@
+Rebuild the same slice; fix these reproduced defects, each with a regression test:
+- Frozen status: keep merge-base..head for the diff, but treat a path as frozen if it is frozen at the merge-base OR at the supplied base tip (git show <base>:<path>). Add a diverged-history test (ADR accepted on main after the PR branched, PR edits its body -> must fail).
+- Byte-exact comparison: read blobs as bytes, no text-mode newline normalization (docs_checks.py:134). Add an LF->CRLF regression on an Accepted ADR -> must fail.
+- Link parser false failures (must-pass cases): skip [^...]: footnote definitions; handle balanced parentheses in link destinations (file(v1).md); skip inline code spans that cross lines, indented code blocks, and <!-- --> HTML comments.
+Scope, rules r1-r6 and the workflow shape stay as in the brief. Running the base copy of the script / CODEOWNERS and the stale-result (require up-to-date branches) concerns are maintainer calls, not part of this rebuild.

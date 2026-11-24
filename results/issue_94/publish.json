@@ -1,0 +1,11 @@
+{
+  "mode": "new-pr",
+  "branch": "fix/94-architecture-os-targets",
+  "pr_url": "",
+  "base": "main",
+  "repo": "getwyrd/nl-shell",
+  "by": "Eduard Ralph",
+  "date": "2026-11-14",
+  "id_pending": false,
+  "host_ci_base": "e854e503e1bc1ce9a8f053ef9b1f349ec0bcaab8"
+}

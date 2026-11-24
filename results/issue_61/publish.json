@@ -1,0 +1,10 @@
+{
+  "mode": "new-pr",
+  "branch": "enhancement/61-quarantined-reader-error-diagnosis",
+  "pr_url": "https://github.com/eduralph/nl-shell/pull/201",
+  "base": "main",
+  "repo": "eduralph/nl-shell",
+  "by": "Eduard Ralph",
+  "date": "2026-10-23",
+  "id_pending": false
+}

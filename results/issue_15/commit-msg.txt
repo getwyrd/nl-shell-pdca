@@ -1,0 +1,23 @@
+Tell shell commands apart from natural-language requests
+
+Until now nl-shell gave the same "can't run anything yet" reply to every
+line, so a user typing `ls -la` and a user typing `show disk usage` got no
+sign that the shell knew the difference.
+
+Add a small input router, nl_shell.router, and route every non-empty,
+non-exit line through it. If the first word is a bash builtin, an
+executable on $PATH, or a path to an executable file, the line is treated
+as a shell command; anything else is natural language. The REPL now
+answers with one of two fixed replies, each saying which milestone brings
+the real behaviour (bash session in M0.2, model backend in M0.8).
+
+$PATH is read on every line, not cached, and input with unbalanced quotes
+(e.g. "what's using port 80") never raises. This is a placeholder: English
+that starts with a command name ("find large files in my home") still
+routes as a command, and the M3 intent classifier replaces this heuristic
+while keeping it as its fallback. The router is its own module with no
+REPL dependency so that later work can reuse it unchanged.
+
+The architecture doc's code-layout table gains the new module.
+
+Fixes #15

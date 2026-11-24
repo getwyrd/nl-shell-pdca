@@ -1,0 +1,17 @@
+# Security review — issue 108 / router-english-sentence-rule
+
+Attacker-reachable inputs this diff touches: **none**. The only input is the line the user types at the prompt, and the threat model lists "what the user types" as trusted (`target/.oss-scanner/threat_model.md`, "Trusted"). The router never sees command output, file names, env values, model output or history.
+
+## What I checked
+
+- **Where the routed text comes from.** `route()` is called only from `Repl._reply` on the user's own stripped line, and only when there is no prefix (`target/src/nl_shell/repl.py:141-146`). `\cmd` input skips the router, as before (`repl.py:147-151`). No untrusted text reaches `_reads_like_english` or `_has_unbalanced_single_quote` (`target/src/nl_shell/router.py:87-104`).
+- **What a wrong route can cause.** A COMMAND route still ends at the gate (today it shows `COMMAND_NOT_YET`; the gate comes with #78). A NATURAL_LANGUAGE route goes to `_propose`, and the proposal still goes through the strict parser, with the gate and confirm to follow. The threat model's scale rates "the intent classifier routing input to the wrong mode" as the lowest band, and lists the classifier as lower priority because "a wrong route still goes through the gate". The patch moves no trust boundary and does not touch the gate, PTY/sudo, taint, logging or rendering. Gate T2 agrees: "no security-relevant path touched" (`gate-logs/T2-threat-model.log`).
+- **Typed secrets reaching model context.** The new rule sends more typed lines to the model than before. I looked for a command line holding a secret that would now go to the model instead of bash. Rule 3 rejects any word starting with `-` and any of `=`, `$`, `/`, `"` (`router.py:100-103`), so `-pSECRET`, `TOKEN=…`, `$VAR` and URLs all stay commands. A line that reaches the model has to be 4+ plain words with an English function word, or hold an odd `'` with no `"` or `\`. Either way it is the user's own typed request, sent to the local model (or to the dev teacher only behind `--dev-teacher`). This is the same exposure any natural-language request already has. Rule 1's quote signal overriding rule 3 (`find . -name it's`, `find what's in ~/src`) only affects lines bash would leave hanging at an open quote anyway. No finding.
+- **First-token resolution.** `_is_command_name` (`router.py:107-112`) is the old logic moved into a helper with no change in behaviour: builtin set, `is_executable_file` for tokens holding `/`, else `shutil.which`. `$PATH` is still read on every call. `first_token` is unchanged, so its second caller (`failure_classes.py`, whose privilege check is text-only) is not affected.
+- **Crash or hang.** The new helpers only use `str.count`, `str.split`, set lookups and one pass over the characters: linear time, no regex, no lexer. They cannot raise on unbalanced quotes or odd Unicode. The existing `what's using port 80` vector and the new `find what's using port 80`, `grep it\'s x y` and `git commit -m "wip` vectors exercise the unlexable cases (`target/tests/test_repl.py:99-125`). C4 and T3 are green (`gate-logs/C4-verify.log`, `gate-logs/T3-suite.log`).
+- **Test coverage of an attacker case.** This change is about usability, not security, so it needs no attacker-path test.
+
+## Findings
+
+No security findings. The diff touches no input the threat model calls untrusted. The worst outcome of a bug here is a misroute, which the threat model rates lowest, and the gate still sees every command.
+<!-- pdca:leaf-complete -->

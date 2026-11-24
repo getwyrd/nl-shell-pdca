@@ -1,0 +1,5541 @@
+diff --git a/.oss-scanner/threat_model.md b/.oss-scanner/threat_model.md
+index 8de5b07..934f1cd 100644
+--- a/.oss-scanner/threat_model.md
++++ b/.oss-scanner/threat_model.md
+@@ -191,8 +191,26 @@ Trusted:
+   `/dev/fd` or `/proc/*/fd` path, or a non-literal target. (5) Input over 8 KiB is
+   decision C before it is parsed, and the walk has a node and depth budget; any internal
+   error is decision C, and `classify` never raises. (6) No reason string carries a raw
+-  control or hidden character from the input. The command layer, §7 and §8 are still
+-  stubs that fail closed: every simple command is at least `mutating`.
++  control or hidden character from the input. The command layer (#204) gets every
++  per-command meaning from one reviewed table, `targets/ubuntu-26.04/commands.toml`,
++  read from that fixed path only (no environment variable, cwd or `HOME`), by one engine
++  (spec `policy-gate/v1` §4.1). A command with no row is at least `mutating`, and is
++  `privileged` (a proposal rejected) when an argument word names an elevating row, or
++  at least `destructive` when one names a destroying row (decision A); words are read
++  after quote removal with ANSI-C `$'…'` decoded as bash does. Every name of an
++  elevating, shell or interpreter binary on the reference host has a row
++  (`inventory.toml`; drift is a review finding). A row parses its argv: an option it does
++  not declare is at least `destructive`. Wrappers are classed by their inner command
++  through any nesting; under an elevating row a proposal is rejected when a later word
++  names a shell or interpreter row, when code or a shell would run, or when a word or
++  option the gate cannot read appears. `sudo -S`/`-A`/`-p` (also quoted), a word the
++  gate cannot read in `sudo`'s options, and stdin from a pipe, here-doc or here-string
++  into an elevating command are rejected. Every text effect (`bash -c`, `python3`,
++  `eval`, `. f`, `x | sh`) is at least `destructive`, "runs code the gate cannot read":
++  the text itself is not read. A missing or invalid table is decision C. Accepted gap:
++  an unknown command given command text as one quoted word (`foo 'sudo -i'`), and
++  `git -c`/`--config-env`/`--exec-path`, `tar --to-command` and `ssh -o`, stay
++  `mutating`. §7 and §8 are still stubs that fail closed.
+ - **The command model and the reader have no network**; the model server listens only on
+   a `0600` Unix socket (ADR-0018).
+ - **Locally complete**: no telemetry and no outbound connection in the default config.
+diff --git a/docs/design/specs/policy-gate/v1.md b/docs/design/specs/policy-gate/v1.md
+index a75a121..aa7d340 100644
+--- a/docs/design/specs/policy-gate/v1.md
++++ b/docs/design/specs/policy-gate/v1.md
+@@ -108,27 +108,115 @@ class produced by any step:
+ 
+ ### 4. Destructive and privileged
+ 
+-- `privileged`: command word `sudo`, `su`, `pkexec`, `doas`, `run0`, `machinectl shell`.
+-  The inner command of `sudo`/`doas` is classed too, and the result is never below
+-  `privileged`.
++Each command below is a row of the target's command table (§4.1); the table is where
++the gate gets these meanings, and the lists here are the floor it MUST hold.
++
++- `privileged`: command word `sudo`, `su`, `pkexec`, `doas`, `run0`, `machinectl shell`,
++  and every other name of the same files (`sudo-rs`, `sudo.ws`, `sudoedit`,
++  `sudoedit-rs`, `su-rs` on `ubuntu-26.04`), also when written as a path
++  (`/usr/bin/sudo-rs`, `//usr/bin/sudo`). The inner command of `sudo`/`doas` is classed
++  too, and the result is never below `privileged`.
+ - `destructive` (at least): `rm` with `-r`/`-R`/`--recursive` or a glob operand; `dd`;
+   `mkfs*`; `wipefs`; `shred`; `truncate`; `fdisk`/`sfdisk`/`parted`/`gdisk`; `chmod`/`chown`
+   with `-R`; `find … -delete`; `git clean`; `git reset --hard`; `git push --force`;
+   `systemctl` `disable|mask|stop|kill|isolate|poweroff|reboot|halt`; `kill -9 -1`;
+   redirection that truncates an existing file (`>`) outside the cwd.
++  `rm` with an operand that is not a literal (an expansion, or `{}` under `find -exec`)
++  is classed like `rm` with a glob; so Conformance row 9 (`find . -exec rm {} \;`) is
++  `destructive`.
+ - Wrappers MUST be classed by their inner command: `env [assignments] cmd`, `nice`,
+   `nohup`, `timeout`, `time`, `xargs`, `find -exec/-execdir/-ok/-okdir`, `bash -c`,
+   `sh -c`, `watch`. Each is at least `mutating` itself; `xargs` and `find -exec` with a
+-  non-literal inner command are at least `destructive`.
++  non-literal inner command are at least `destructive`. The inner command of a wrapper
++  is argv (its words), and is classed by the same rules as any command, through any
++  number of wrappers. `xargs` adds words the gate cannot read (its input), and a word
++  holding its replace string (`-I%`, `-i`, `--replace=@`) is one the gate cannot read.
++
++### 4.1 The command table
++
++The target's command table, `targets/<id>/commands.toml`, is the gate's only source of
++per-command meaning: a command gets a meaning only from its row. Wrappers, the `sudo`
++family, destructive commands, interpreters and builtins are rows, read by one engine.
++
++1. **Row format.** A row names its command words (or `fnmatch` patterns such as
++   `mkfs*`), a minimal example invocation, its class when nothing more applies (at
++   least `mutating`; "not allowlisted" unless the row says otherwise), its argv grammar
++   and its effects. The grammar gives the options with and without a value (short,
++   attached and long `=` forms; `--` ends options), where options stop (anywhere, or at
++   the first operand), and the subcommands it describes. The effects come from one fixed
++   set: `runs-command-at` (an inner command starts at an operand, or after an option),
++   `runs-text`, `runs-stdin-as-code`, `runs-file-as-code`, `stores-code`,
++   `sets-variable`, `alters-session`, `elevates`, `destroys` (with its condition: an
++   option, a subcommand, an operand the gate cannot read, …), `reads-terminal` and
++   `opens-shell`. Every text effect names the grammar of its text (`bash`, `sh`,
++   `env-split`, `arithmetic`, or an unparsed one such as `python`), and operands or
++   option values that are variable names are marked as names. Every `runs-command-at`
++   row declares what it does with no command (`chroot` and `unshare` start `$SHELL`) and
++   when stdin is the terminal (`bash -s x`, `bash /dev/stdin` read the keyboard). Words
++   are read after quote removal, with ANSI-C `$'…'` decoded as bash does (cut at `\0`);
++   any other expansion leaves a word the gate cannot read.
++2. **The table is loaded from one place.** The gate reads the active target's table and
++   nothing else: no environment variable, no file relative to the cwd or `HOME`.
++3. **Decision A.** A command with neither a row nor an allowlist entry (§6) is at least
++   `mutating`, "not allowlisted". If any of its argument words, after quote removal
++   (including ANSI-C decoding), names a row with `elevates`, it is `privileged` and a
++   proposal is rejected; if one names a row with `destroys`, it is at least
++   `destructive`. Decision A does not split a quoted word (`foo 'sudo -i'` stays
++   `mutating`). Before the allowlist lands this raises `man sudo`, `which sudo` or
++   `echo su` to `privileged`; an allowlist entry for such a command lowers it again,
++   which is a reviewed allowlist change (Versioning).
++4. **Elevation reaches inner commands.** Under a row with `elevates`, a proposal is
++   rejected when a later word names a row that runs a shell or code whatever its
++   options (`bash`, `sh`, `python3`, `busybox`, `chroot`, …), whatever command sits
++   between (`sudo strace bash`); when a text effect or `opens-shell` applies; and when a
++   word the gate cannot read, or an option a row does not declare, stands anywhere in
++   the inner argv.
++5. **Decision C.** A gate failure (an unhandled node, the work budget, a missing or
++   invalid command table, any internal error) is `privileged`, rejected, "could not
++   class", for every command.
++6. **Class 1, coverage.** Every binary on the target that elevates, or that runs a shell
++   or an interpreter, has a row, under every name that points at the same file. The
++   target lists them in `targets/<id>/inventory.toml`, harvested from the reference
++   host (setuid, setgid and file-capability binaries; `/etc/shells`; the target's shell
++   and interpreter packages; `python3*`, `perl*`, `busybox`, `gdb`; every other name of
++   those files and of a row's file). The inventory records the host's release and is
++   reviewed like an allowlist change; a difference between it and the reference host is
++   a review finding. A row for a binary that does not elevate (`passwd`) may say just
++   that.
++7. **Class 2, no unread argv.** No row skips argv parsing. An option a row does not
++   declare is at least `destructive`, "option the gate does not know"; on a row with
++   `elevates` a proposal with it is also rejected. A word the gate cannot read where an
++   option may stand is handled the same way, and under `sudo` (a row with options §5
++   rejects) it is rejected. A row may describe only some subcommands (`git clean`,
++   `reset`, `push`); any other subcommand gets the row's class, so Conformance rows 8 and
++   27 hold. A row whose effects do not depend on argv may give a fixed class (at least
++   `mutating`); decision A still runs over its words.
++8. **Class 7, text runners.** Real text runners have rows with their text effects:
++   `busybox` (the applet is the inner command), `python3`, `perl`, `tclsh`, `gjs`,
++   `gdb -ex`, `screen`, `script` (no command opens `$SHELL`; `-c` is bash text), and by
++   name `sg`/`newgrp`, `at`/`batch`, `zsh`, `tmux`, `x-terminal-emulator -e`.
++   **Accepted gap:** an unknown command that takes command text as one quoted word
++   (`foo 'sudo -i'`), and the code-running options of floor rows 8, 10 and 11: `git`
++   global `-c`, `--config-env` and `--exec-path` (`git -c core.pager=sh`), `tar
++   --to-command`, and `ssh -o` (`ssh -o ProxyCommand=sh`). These stay `mutating`, "not
++   allowlisted". Their rows mark exactly these options as the class-7 gap, and the table
++   is refused if any other option carries that mark. Under a row with `elevates`, a
++   proposal using one is rejected.
++9. **Text effects** are decision B until the text-reading layer lands: at least
++   `destructive`, "runs code the gate cannot read".
+ 
+ ### 5. Rejected
+ 
+ - any redirection involving file descriptor 3 or higher (`3>`, `>&3`, `{fd}>`, `exec 3>&-`
+   …): fd 3 is nl-shell's control channel;
+ - `sudo` with `-S`/`--stdin`, `-A`/`--askpass`, `-p`/`--prompt`, or `-s`/`-i` with a pipe
+-  or here-doc;
++  or here-doc; also when the option is quoted or ANSI-C quoted (`sudo "-S"`,
++  `sudo $'-S'`), and `sudo` with a word the gate cannot read where an option may stand
++  (`sudo "$P" true`), through any wrapper;
+ - assignments or exports of `SUDO_PROMPT` or `SUDO_ASKPASS`;
+-- a pipe, here-document or here-string whose consumer is `sudo`, `su`, `pkexec`, `doas`;
++- a pipe, here-document or here-string whose consumer is `sudo`, `su`, `pkexec`, `doas`
++  (or any row with `elevates`, §4.1), also through a wrapper (`echo pw | env sudo -S`); a
++  stdin the gate cannot place counts as a pipe;
+ - model proposals with forbidden characters (§1.1);
+ - a model proposal opening an interactive root shell (`sudo -i`, `sudo -s`, `sudo su`,
+   `sudo bash`, bare `su`, `pkexec bash`). Typed input doing this is `privileged`, and
+@@ -265,7 +353,7 @@ MUST cover every row, with its own commands where a row names an OS-specific too
+ | 13 | `LD_PRELOAD=./x.so ls` | mutating |
+ | 14 | `cat </dev/tcp/example.org/80` | mutating |
+ | 15 | `ls > ~/.bashrc` | mutating (output redirection) |
+-| 16 | `$'\x72m' -rf ~` | mutating at least (non-literal word); never read-only |
++| 16 | `$'\x72m' -rf ~` | destructive (ANSI-C decodes to `rm`) |
+ | 17 | `"r"m -rf ~` | destructive (quote removal gives `rm`) |
+ | 18 | `ls; rm -rf ~` | destructive (list = highest part) |
+ | 19 | `cat` (no operand) | mutating (reads the terminal) |
+diff --git a/scripts/harvest_inventory.py b/scripts/harvest_inventory.py
+new file mode 100644
+index 0000000..80247ce
+--- /dev/null
++++ b/scripts/harvest_inventory.py
+@@ -0,0 +1,201 @@
++"""Write ``targets/ubuntu-26.04/inventory.toml`` from this Ubuntu 26.04 host (#204).
++
++Spec ``policy-gate/v1`` §4.1, class 1 (coverage): every binary on the target that
++elevates, or that runs a shell or an interpreter, has a row in the target's
++``commands.toml``, under every name that points at the same file. This script lists those
++names, from the host it runs on:
++
++- regular files with the setuid or setgid bit, or a file capability
++  (``security.capability``), directly in ``/usr/bin``, ``/usr/sbin`` and
++  ``/usr/lib/cargo/bin``;
++- the shells in ``/etc/shells``;
++- the binaries in those folders of every installed dpkg package in section ``shells`` or
++  ``interpreters``;
++- the names there matching ``python3*``, ``perl*``, ``busybox`` or ``gdb``;
++- every name there whose ``realpath`` is the ``realpath`` of a name above or of a row's
++  name in ``commands.toml`` (``sudo-rs`` and ``sudoedit-rs`` are the file ``sudo`` is).
++
++Usage::
++
++    python3 scripts/harvest_inventory.py [--output PATH]
++
++The file records the host's os-release ``VERSION`` line. It is checked in and reviewed
++like an allowlist change; no test runs this script. A reviewer re-runs it on the
++reference host and diffs the result against the checked-in file: any difference is a
++finding (the drift is judged by a human, not by a gate).
++"""
++
++from __future__ import annotations
++
++import argparse
++import fnmatch
++import os
++import stat
++import subprocess
++import sys
++import tomllib
++from pathlib import Path
++
++REPO = Path(__file__).resolve().parents[1]
++TARGET = REPO / "targets" / "ubuntu-26.04"
++OUTPUT = TARGET / "inventory.toml"
++COMMANDS = TARGET / "commands.toml"
++DIRS = ("/usr/bin", "/usr/sbin", "/usr/lib/cargo/bin")
++SHELLS = Path("/etc/shells")
++OS_RELEASE = Path("/etc/os-release")
++SECTIONS = ("shells", "interpreters")
++PATTERNS = ("python3*", "perl*", "busybox", "gdb")
++HEADER = """\
++# Binaries on the ubuntu-26.04 target that elevate, or that run a shell or an
++# interpreter (spec policy-gate/v1 §4.1, class 1). Every name here MUST have a row in
++# commands.toml (tests/test_gate_commands.py checks it).
++#
++# GENERATED by scripts/harvest_inventory.py on the reference host; do not edit by hand.
++# Reviewed like an allowlist change. Drift against the host is judged by a human at
++# review (re-run the script there and diff), not by a test.
++"""
++
++
++def entries() -> dict[str, Path]:
++    """Every entry directly in ``DIRS``, keyed by its path."""
++    found: dict[str, Path] = {}
++    for folder in DIRS:
++        try:
++            names = sorted(os.listdir(folder))
++        except OSError:
++            continue
++        for name in names:
++            found[os.path.join(folder, name)] = Path(folder, name)
++    return found
++
++
++def has_capability(path: str) -> bool:
++    try:
++        return bool(os.getxattr(path, "security.capability", follow_symlinks=False))
++    except OSError:
++        return False
++
++
++def package_binaries() -> dict[str, str]:
++    """``path -> package`` for the binaries in ``DIRS`` of packages in ``SECTIONS``."""
++    listing = subprocess.run(
++        ["dpkg-query", "-W", "-f", "${Section}\t${Package}\n"],
++        check=True,
++        capture_output=True,
++        text=True,
++    ).stdout
++    out: dict[str, str] = {}
++    for line in listing.splitlines():
++        section, _, package = line.partition("\t")
++        if section.rsplit("/", 1)[-1] not in SECTIONS:
++            continue
++        files = subprocess.run(
++            ["dpkg-query", "-L", package], check=True, capture_output=True, text=True
++        ).stdout
++        for path in files.splitlines():
++            if os.path.dirname(path) in DIRS and os.path.lexists(path):
++                out[path] = package
++    return out
++
++
++def row_names() -> tuple[set[str], tuple[str, ...]]:
++    doc = tomllib.loads(COMMANDS.read_text(encoding="utf-8"))
++    names: set[str] = set()
++    patterns: list[str] = []
++    for row in doc.get("command", []):
++        names.update(row.get("names", []))
++        patterns.extend(row.get("patterns", []))
++    return names, tuple(patterns)
++
++
++def version_line() -> str:
++    for line in OS_RELEASE.read_text(encoding="utf-8").splitlines():
++        if line.startswith("VERSION="):
++            return line.partition("=")[2].strip().strip('"')
++    raise SystemExit(f"{OS_RELEASE}: no VERSION line")
++
++
++def harvest() -> dict[str, dict[str, set[str]]]:
++    """``name -> {"paths": {...}, "why": {...}}``."""
++    listed: dict[str, dict[str, set[str]]] = {}
++
++    def add(path: str, why: str) -> None:
++        entry = listed.setdefault(os.path.basename(path), {"paths": set(), "why": set()})
++        entry["paths"].add(path)
++        entry["why"].add(why)
++
++    all_entries = entries()
++    for path in all_entries:
++        try:
++            info = os.lstat(path)
++        except OSError:
++            continue
++        if not stat.S_ISREG(info.st_mode):
++            continue
++        if info.st_mode & stat.S_ISUID:
++            add(path, "setuid")
++        if info.st_mode & stat.S_ISGID:
++            add(path, "setgid")
++        if has_capability(path):
++            add(path, "file capability")
++    for line in SHELLS.read_text(encoding="utf-8").splitlines():
++        line = line.split("#", 1)[0].strip()
++        if line and os.path.lexists(line):
++            add(line, "/etc/shells")
++    for path, package in package_binaries().items():
++        add(path, f"dpkg package {package}")
++    for path in all_entries:
++        name = os.path.basename(path)
++        if any(fnmatch.fnmatchcase(name, p) for p in PATTERNS):
++            add(path, "name pattern")
++
++    # Every name for the same files: the other names of a listed binary, and every name
++    # of a row's binary (`gnurm` is the file `rm` is, `systemd-run` the file `run0` is).
++    names, patterns = row_names()
++
++    def is_row(name: str) -> bool:
++        return name in names or any(fnmatch.fnmatchcase(name, p) for p in patterns)
++
++    seeds = {os.path.realpath(p) for entry in listed.values() for p in entry["paths"]}
++    seeds |= {os.path.realpath(p) for p in all_entries if is_row(os.path.basename(p))}
++    for path in all_entries:
++        target = os.path.realpath(path)
++        if target in seeds:
++            add(path, f"same file as {target}" if target != path else "a row's binary")
++    for entry in listed.values():
++        for path in list(entry["paths"]):
++            target = os.path.realpath(path)
++            if target != path:
++                entry["why"].add(f"same file as {target}")
++    return listed
++
++
++def render(listed: dict[str, dict[str, set[str]]], version: str) -> str:
++    def quote(text: str) -> str:
++        return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
++
++    lines = [HEADER, f"host_version = {quote(version)}", ""]
++    for name in sorted(listed):
++        entry = listed[name]
++        lines.append("[[binary]]")
++        lines.append(f"name = {quote(name)}")
++        paths = ", ".join(quote(p) for p in sorted(entry["paths"]))
++        why = ", ".join(quote(w) for w in sorted(entry["why"]))
++        lines.append(f"paths = [{paths}]")
++        lines.append(f"why = [{why}]")
++        lines.append("")
++    return "\n".join(lines)
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    parser.add_argument("--output", type=Path, default=OUTPUT)
++    args = parser.parse_args(argv)
++    text = render(harvest(), version_line())
++    args.output.write_text(text, encoding="utf-8")
++    print(f"wrote {args.output}", file=sys.stderr)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src/nl_shell/gate/__init__.py b/src/nl_shell/gate/__init__.py
+index d7ecc55..4882d82 100644
+--- a/src/nl_shell/gate/__init__.py
++++ b/src/nl_shell/gate/__init__.py
+@@ -6,11 +6,11 @@ returns a ``Result`` with the session-log ``gate`` shape
+ 
+ This package ships the **shell layer** (issue #196): the character check (§1.1), the
+ parse and walk (``nl_shell.gate.parse``, Rules 1-5), and the shell-level rules of §2, §3
+-and §5 that need no per-command meaning. The later steps are stubs the pipeline already
+-calls, for the issues that replace them:
++and §5 that need no per-command meaning; and the **command layer** (``rules``, issue
++#204): one engine that reads the target's command table (``commands``), with decisions
++A and C and text effects as decision B (spec §4.1). The allowlist is #198. The later
++steps are stubs the pipeline already calls, for the issues that replace them:
+ 
+-- ``rules`` (the command layer, #197/#198): every simple command is ``mutating``,
+-  "not allowlisted" (decision A's floor);
+ - ``live`` (§7, #192): every simple command still ``read-only`` becomes ``mutating``,
+   "live-session resolution not implemented";
+ - ``sensitive`` (§8, #190) and ``words`` (#191): no-ops.
+@@ -193,7 +193,7 @@ def _classify(command: str, origin: str, label: str | None) -> Result:
+ 
+     for invocation in layer.invocations:
+         _shell_rules(tally, invocation)
+-        verdict = rules.classify(invocation)
++        verdict = rules.classify(invocation, origin=origin)
+         verdict = live.resolve(invocation, verdict)
+         tally.verdict(verdict)
+         for step in (sensitive.check, words.check):
+diff --git a/src/nl_shell/gate/commands.py b/src/nl_shell/gate/commands.py
+new file mode 100644
+index 0000000..aab2d09
+--- /dev/null
++++ b/src/nl_shell/gate/commands.py
+@@ -0,0 +1,661 @@
++"""Loading the command table, ``targets/<id>/commands.toml`` (issue #204).
++
++Spec ``policy-gate/v1`` §4.1. The table is the gate's only source of per-command meaning:
++each row gives a command's argv grammar and its effects from one fixed set, and the one
++engine in ``nl_shell.gate.rules`` reads it. Nothing about a command is in code.
++
++The loader takes no path. It reads ``TARGETS_ROOT / TARGET_ID / COMMANDS_FILE`` and
++refuses a path that resolves outside ``TARGETS_ROOT`` (as ``nl_shell.targets.load``
++does). It reads no environment variable and nothing relative to the cwd or ``HOME``.
++Choosing the target from os-release is a later issue; the id is fixed here.
++
++A missing or invalid table raises ``CommandsError``; the gate turns that into decision C
++for every command, never into a silent ``mutating``.
++
++File format (``format = 1``), one ``[[command]]`` table per row:
++
++- ``names`` (command words) and/or ``patterns`` (``fnmatch`` patterns, ``mkfs*``);
++- ``example``: a minimal invocation; ``prefix``: the words before the inner command,
++  required on a row with ``runs-command-at``;
++- ``class`` (at least ``mutating``, default ``mutating``) and ``reason`` (default
++  "not allowlisted"): what the row gives when no effect says more;
++- ``fixed = true``: the row's effects do not depend on argv, so argv is not parsed (its
++  words still go through decision A); otherwise ``parse`` is ``gnu`` (options anywhere
++  before ``--``), ``posix`` (options end at the first operand) or ``long`` (each word
++  matched whole, one or two dashes, ``find``/``gdb`` style);
++- ``options``: a table from spellings (``"-r|-R|--recursive"``) to an option: ``value``
++  (``none``, ``required``, ``optional`` or a word count), ``effects``, ``rejects`` (a
++  reason: the option is rejected, spec §5), ``gap = "class-7"`` (named options only),
++  ``last`` (options end after it), ``replace`` (its value is a replace string, ``xargs``),
++  ``name`` (its value is a variable name), ``plus`` (``+x`` is accepted too);
++- ``flag_patterns``: regular expressions for flags that are not a fixed list (``-9``);
++- ``plus`` (``+x`` options), ``old_style`` (``tar xf``: a first word with no dash is a
++  bundle of short options);
++- ``effects``: a list of effects, each a name or a table (below);
++- ``subcommands``: a table from subcommand names (``"stop|kill"``) to a table with the
++  same grammar keys; a subcommand not listed gets the row's ``class`` and ``reason``;
++- ``no_command`` (``nothing`` or ``opens-shell``) and ``terminal_stdin`` (``inherits``,
++  ``opens-shell`` or ``runs-code``): required on every grammar with ``runs-command-at``,
++  and ``terminal_stdin`` on every grammar with ``runs-stdin-as-code``.
++
++An effect table has ``effect`` and, as needed: ``grammar`` (required on a text effect),
++``when`` / ``unless`` (option spellings), ``if`` (a condition on the words), ``at`` (the
++operand where an inner command starts, or ``"after"`` the option), ``until`` (words that
++end an inner command), ``appends`` (input adds words to the inner command), ``assignments``
++(``NAME=value`` words come before the inner command), ``name`` (operands are variable
++names), ``scope`` (of ``sets-variable``: ``session`` or ``command``), ``reason``.
++"""
++
++from __future__ import annotations
++
++import fnmatch
++import functools
++import re
++import tomllib
++from collections.abc import Mapping
++from dataclasses import dataclass, field
++from types import MappingProxyType
++from typing import Any
++
++from nl_shell import targets
++from nl_shell.gate.parse import CLASSES, RANK
++
++# The fixed load location. Tests point TARGETS_ROOT at a temporary folder (and clear the
++# cache with ``table.cache_clear()``); nothing else changes where the table comes from.
++TARGETS_ROOT = targets.TARGETS_ROOT
++# The one target with a table. Choosing it from os-release is a later issue; until then
++# the id is fixed here, the one place package code names a target (tests/test_targets.py).
++TARGET_ID = "ubuntu-26.04"
++COMMANDS_FILE = "commands.toml"
++FORMAT = 1
++
++EFFECTS = (
++    "runs-command-at",
++    "runs-text",
++    "runs-stdin-as-code",
++    "runs-file-as-code",
++    "stores-code",
++    "sets-variable",
++    "elevates",
++    "destroys",
++    "reads-terminal",
++    "opens-shell",
++    "alters-session",
++)
++TEXT_EFFECTS = ("runs-text", "runs-stdin-as-code", "runs-file-as-code", "stores-code")
++# Every text effect names the language of its text. The text-reading layer (child-2 of
++# #197) parses some of these; until it lands every text effect is decision B.
++GRAMMARS = (
++    "bash",
++    "sh",
++    "zsh",
++    "env-split",
++    "arithmetic",
++    "python",
++    "perl",
++    "tcl",
++    "js",
++    "gdb",
++    "screen",
++    "tmux",
++    "elf",
++    "ssh-config",
++    "remote-sh",
++    "cpp",
++)
++CONDITIONS = (
++    "operand",  # the operand at `at` (default 0) exists
++    "no-operand",
++    "assignment",  # an operand is NAME=value, or a word the gate cannot read
++    "nonliteral-operand",
++    "operand-prefix:+",
++    "operand-prefix::",
++    "word:-1",
++    "joined-special",  # an inner word that sh would not read as one plain word
++)
++PARSE_STYLES = ("gnu", "posix", "long")
++VALUES = ("none", "required", "optional")
++NO_COMMAND = ("nothing", "opens-shell")
++TERMINAL_STDIN = ("inherits", "opens-shell", "runs-code")
++# Spec §4.1, class 7: the code-running options of floor rows 8, 10 and 11 that stay at
++# the row's default. The loader accepts `gap = "class-7"` only on these.
++CLASS7_GAP = frozenset(
++    (
++        ("git", "-c"),
++        ("git", "--config-env"),
++        ("git", "--exec-path"),
++        ("tar", "--to-command"),
++        ("ssh", "-o"),
++    )
++)
++
++_ROW_KEYS = frozenset(
++    (
++        "names",
++        "patterns",
++        "example",
++        "prefix",
++        "class",
++        "reason",
++        "fixed",
++        "parse",
++        "plus",
++        "old_style",
++        "options",
++        "flag_patterns",
++        "effects",
++        "subcommands",
++        "no_command",
++        "terminal_stdin",
++        "note",
++    )
++)
++_GRAMMAR_KEYS = frozenset(
++    (
++        "class",
++        "reason",
++        "parse",
++        "plus",
++        "old_style",
++        "options",
++        "flag_patterns",
++        "effects",
++        "no_command",
++        "terminal_stdin",
++        "note",
++    )
++)
++_FIXED_KEYS = frozenset(
++    ("names", "patterns", "example", "class", "reason", "fixed", "effects", "note")
++)
++_OPTION_KEYS = frozenset(
++    ("value", "effects", "rejects", "gap", "last", "replace", "name", "plus")
++)
++_EFFECT_KEYS = frozenset(
++    (
++        "effect",
++        "grammar",
++        "when",
++        "unless",
++        "if",
++        "at",
++        "until",
++        "appends",
++        "assignments",
++        "name",
++        "scope",
++        "reason",
++    )
++)
++
++
++class CommandsError(Exception):
++    """The command table could not be loaded; the message says why."""
++
++
++@dataclass(frozen=True)
++class Effect:
++    effect: str
++    grammar: str | None = None
++    when: frozenset[str] = frozenset()  # option keys: applies only if one is present
++    unless: frozenset[str] = frozenset()  # option keys: off if one is present
++    cond: str | None = None
++    at: int | str | None = None
++    until: tuple[str, ...] = ()
++    appends: bool = False
++    assignments: bool = False
++    name: bool = False
++    scope: str | None = None
++    reason: str | None = None
++
++    @property
++    def text(self) -> bool:
++        return self.effect in TEXT_EFFECTS
++
++
++@dataclass(frozen=True)
++class Option:
++    key: str  # its first spelling
++    spellings: tuple[str, ...]
++    value: str | int = "none"
++    effects: tuple[Effect, ...] = ()
++    rejects: str | None = None
++    gap: str | None = None
++    last: bool = False
++    replace: str | None = None  # the default replace string, when it takes one
++    name: bool = False
++    plus: bool = False
++
++
++@dataclass(frozen=True)
++class Grammar:
++    label: str  # "rm", "git clean"
++    parse: str
++    options: Mapping[str, Option]  # spelling -> option
++    flag_patterns: tuple[re.Pattern, ...]
++    effects: tuple[Effect, ...]
++    cls: str
++    reason: str
++    plus: bool = False
++    old_style: bool = False
++    subcommands: Mapping[str, Grammar] | None = None
++    no_command: str | None = None
++    terminal_stdin: str | None = None
++
++    def all_effects(self) -> tuple[Effect, ...]:
++        found = list(self.effects)
++        for option in {id(o): o for o in self.options.values()}.values():
++            found.extend(option.effects)
++        return tuple(found)
++
++
++@dataclass(frozen=True)
++class Row:
++    names: tuple[str, ...]
++    patterns: tuple[str, ...]
++    example: str
++    prefix: str | None
++    fixed: bool
++    grammar: Grammar
++    elevates: bool  # some effect of the row elevates (decision A)
++    destroys: bool  # some effect of the row destroys (decision A)
++    runs_code: bool  # it runs a shell or code whatever its options (elevation rule)
++    opens_shell_with_no_command: bool
++    reads_argv: bool = field(default=True)
++
++    @property
++    def name(self) -> str:
++        return self.names[0] if self.names else self.patterns[0]
++
++
++@dataclass(frozen=True)
++class Table:
++    rows: tuple[Row, ...]
++    by_name: Mapping[str, Row]
++
++    def lookup(self, word: str) -> Row | None:
++        """The row for a command word: by name, then by the last path component, then
++        by pattern."""
++        if not word:
++            return None
++        row = self.by_name.get(word)
++        if row is not None:
++            return row
++        base = word.rsplit("/", 1)[-1]
++        if base != word:
++            row = self.by_name.get(base)
++            if row is not None:
++                return row
++        for row in self.rows:
++            if any(fnmatch.fnmatchcase(base, p) for p in row.patterns):
++                return row
++        return None
++
++
++@functools.cache
++def table() -> Table:
++    """The command table, loaded once."""
++    return load()
++
++
++def load() -> Table:
++    """Load and validate ``TARGETS_ROOT / TARGET_ID / COMMANDS_FILE``."""
++    root = TARGETS_ROOT
++    path = root / TARGET_ID / COMMANDS_FILE
++    try:
++        inside = path.resolve().is_relative_to(root.resolve())
++    except OSError as exc:
++        raise CommandsError(f"{path}: cannot resolve: {exc.strerror or exc}") from None
++    if not inside:
++        raise CommandsError(f"{path}: resolves outside {root}")
++    try:
++        data = path.read_bytes()
++    except FileNotFoundError:
++        raise CommandsError(f"{path}: missing") from None
++    except OSError as exc:
++        raise CommandsError(f"{path}: cannot read: {exc.strerror or exc}") from None
++    try:
++        doc = tomllib.loads(data.decode("utf-8"))
++    except UnicodeDecodeError:
++        raise CommandsError(f"{path}: not valid TOML: not valid UTF-8") from None
++    except tomllib.TOMLDecodeError as exc:
++        raise CommandsError(f"{path}: not valid TOML: {exc}") from None
++    return validate(doc, str(path))
++
++
++def validate(doc: Mapping[str, Any], where: str = "commands.toml") -> Table:
++    """Validate a parsed table. Raises ``CommandsError`` naming the row."""
++    extra = sorted(set(doc) - {"format", "command"})
++    if extra:
++        raise CommandsError(f"{where}: unknown top-level key `{extra[0]}`")
++    if doc.get("format") != FORMAT:
++        raise CommandsError(f"{where}: `format` must be {FORMAT}")
++    entries = doc.get("command")
++    if not isinstance(entries, list) or not entries:
++        raise CommandsError(f"{where}: `command` must be a non-empty list of [[command]]")
++    if not all(isinstance(e, dict) for e in entries):
++        raise CommandsError(f"{where}: `command` must be a list of [[command]] tables")
++    rows = []
++    by_name: dict[str, Row] = {}
++    for n, entry in enumerate(entries, 1):
++        row = _row(entry, f"{where}: command {n}")
++        for name in row.names:
++            if name in by_name:
++                raise CommandsError(f"{where}: command {n}: name {name!r} is in two rows")
++            by_name[name] = row
++        rows.append(row)
++    return Table(rows=tuple(rows), by_name=MappingProxyType(by_name))
++
++
++def _fail(where: str, text: str) -> CommandsError:
++    return CommandsError(f"{where}: {text}")
++
++
++def _strings(value: Any, where: str, key: str, empty: bool = False) -> tuple[str, ...]:
++    if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
++        raise _fail(where, f"`{key}` must be a list of non-empty strings")
++    if not value and not empty:
++        raise _fail(where, f"`{key}` must not be empty")
++    return tuple(value)
++
++
++def _row(entry: dict[str, Any], where: str) -> Row:
++    if "raw" in entry:
++        raise _fail(where, "`raw` is not allowed: every row reads its argv")
++    names = _strings(entry.get("names", []), where, "names", empty=True)
++    patterns = _strings(entry.get("patterns", []), where, "patterns", empty=True)
++    if not names and not patterns:
++        raise _fail(where, "a row needs `names` or `patterns`")
++    where = f"{where} ({(names or patterns)[0]})"
++    fixed = entry.get("fixed", False)
++    if not isinstance(fixed, bool):
++        raise _fail(where, "`fixed` must be a boolean")
++    allowed = _FIXED_KEYS if fixed else _ROW_KEYS
++    unknown = sorted(set(entry) - allowed)
++    if unknown:
++        on = " on a fixed row" if fixed else ""
++        raise _fail(where, f"unknown key `{unknown[0]}`{on}")
++    example = entry.get("example")
++    if not isinstance(example, str) or not example:
++        raise _fail(where, "missing `example` (a minimal invocation)")
++    label = (names or patterns)[0]
++    if fixed:
++        grammar = _grammar(
++            {k: v for k, v in entry.items() if k in ("class", "reason", "effects")},
++            where,
++            label,
++            fixed=True,
++        )
++    else:
++        if "parse" not in entry:
++            raise _fail(where, "missing `parse` (gnu, posix or long), or `fixed = true`")
++        body = {k: v for k, v in entry.items() if k in _GRAMMAR_KEYS}
++        grammar = _grammar(body, where, label)
++        subs = entry.get("subcommands")
++        if subs is not None:
++            if not isinstance(subs, dict) or not subs:
++                raise _fail(where, "`subcommands` must be a non-empty table")
++            table: dict[str, Grammar] = {}
++            for key, sub in subs.items():
++                spellings = _spellings(key, where)
++                if not isinstance(sub, dict):
++                    raise _fail(where, f"subcommand `{key}` must be a table")
++                sub_where = f"{where} subcommand {key}"
++                unknown = sorted(set(sub) - _GRAMMAR_KEYS)
++                if unknown:
++                    raise _fail(sub_where, f"unknown key `{unknown[0]}`")
++                body = dict(sub)
++                body.setdefault("parse", grammar.parse)
++                body.setdefault("class", grammar.cls)
++                if "reason" not in body and "class" not in sub:
++                    body["reason"] = grammar.reason
++                # Under `gnu` the row's options stand anywhere, also after the subcommand.
++                inherited = grammar.options if grammar.parse == "gnu" else {}
++                parsed = _grammar(body, sub_where, f"{label} {spellings[0]}", inherited)
++                for spelling in spellings:
++                    if spelling in table:
++                        raise _fail(where, f"subcommand {spelling!r} listed twice")
++                    table[spelling] = parsed
++            fields = {**grammar.__dict__, "subcommands": MappingProxyType(table)}
++            grammar = Grammar(**fields)
++    for option in {id(o): o for o in grammar.options.values()}.values():
++        if option.gap is not None:
++            if not any((name, s) in CLASS7_GAP for name in names for s in option.spellings):
++                raise _fail(
++                    where,
++                    f"`gap` on {option.key}: only the spec's class-7 options may carry it",
++                )
++    grammars = [grammar, *((grammar.subcommands or {}).values())]
++    effects = [e for g in grammars for e in g.all_effects()]
++    has_command_at = any(e.effect == "runs-command-at" for e in effects)
++    prefix = entry.get("prefix")
++    if has_command_at:
++        if not isinstance(prefix, str) or not prefix:
++            raise _fail(
++                where,
++                "a row with `runs-command-at` needs `prefix` "
++                "(the words before the inner command)",
++            )
++    elif prefix is not None:
++        raise _fail(where, "`prefix` is only for a row with `runs-command-at`")
++    unconditional = [e for g in grammars for e in g.effects if not e.when]
++    runs_code = any(e.text or e.effect == "opens-shell" for e in unconditional) or any(
++        g.no_command == "opens-shell" or g.terminal_stdin == "opens-shell" for g in grammars
++    )
++    return Row(
++        names=names,
++        patterns=patterns,
++        example=example,
++        prefix=prefix,
++        fixed=fixed,
++        grammar=grammar,
++        elevates=any(e.effect == "elevates" for e in effects),
++        destroys=any(e.effect == "destroys" for e in effects),
++        runs_code=runs_code,
++        opens_shell_with_no_command=any(g.no_command == "opens-shell" for g in grammars),
++        reads_argv=not fixed,
++    )
++
++
++def _spellings(key: str, where: str) -> tuple[str, ...]:
++    parts = tuple(key.split("|"))
++    if not all(parts):
++        raise _fail(where, f"bad spelling list `{key}`")
++    return parts
++
++
++def _grammar(
++    body: dict[str, Any],
++    where: str,
++    label: str,
++    inherited: Mapping[str, Option] | None = None,
++    fixed: bool = False,
++) -> Grammar:
++    cls = body.get("class", "mutating")
++    if cls not in CLASSES or RANK[cls] < RANK["mutating"]:
++        raise _fail(where, "`class` must be one of the classes and at least mutating")
++    reason = body.get("reason", "not allowlisted")
++    if not isinstance(reason, str) or not reason:
++        raise _fail(where, "`reason` must be a non-empty string")
++    style = body.get("parse", "posix")
++    if not fixed and style not in PARSE_STYLES:
++        raise _fail(where, f"`parse` must be one of {', '.join(PARSE_STYLES)}")
++    for key in ("plus", "old_style"):
++        if not isinstance(body.get(key, False), bool):
++            raise _fail(where, f"`{key}` must be a boolean")
++    options: dict[str, Option] = dict(inherited or {})
++    raw_options = body.get("options", {})
++    if not isinstance(raw_options, dict):
++        raise _fail(where, "`options` must be a table")
++    own: list[tuple[Option, dict]] = []
++    for key, spec in raw_options.items():
++        spellings = _spellings(key, where)
++        for s in spellings:
++            if not s.startswith(("-", "+")) and s not in ("(", ")", "!", ","):
++                raise _fail(where, f"option {s!r} must start with '-'")
++        if not isinstance(spec, dict):
++            raise _fail(where, f"option `{key}` must be a table (`{{}}` for a plain flag)")
++        unknown = sorted(set(spec) - _OPTION_KEYS)
++        if unknown:
++            raise _fail(where, f"option `{key}`: unknown key `{unknown[0]}`")
++        option = _option(spellings, spec, f"{where} option {key}")
++        own.append((option, spec))
++        for s in spellings:
++            options[s] = option
++    patterns = []
++    for text in _strings(body.get("flag_patterns", []), where, "flag_patterns", empty=True):
++        try:
++            patterns.append(re.compile(text))
++        except re.error as exc:
++            raise _fail(where, f"bad flag pattern {text!r}: {exc}") from None
++    keys = {s: o.key for s, o in options.items()}
++    # Option effects may only name this grammar's options in when/unless.
++    resolved = []
++    for option, spec in own:
++        effects = _effects(
++            spec.get("effects", []), f"{where} option {option.key}", keys, True
++        )
++        resolved.append(Option(**{**option.__dict__, "effects": effects}))
++    for option in resolved:
++        for s in option.spellings:
++            options[s] = option
++    effects = _effects(body.get("effects", []), where, keys, False, fixed=fixed)
++    no_command = body.get("no_command")
++    terminal = body.get("terminal_stdin")
++    if no_command is not None and no_command not in NO_COMMAND:
++        raise _fail(where, f"`no_command` must be one of {', '.join(NO_COMMAND)}")
++    if terminal is not None and terminal not in TERMINAL_STDIN:
++        raise _fail(where, f"`terminal_stdin` must be one of {', '.join(TERMINAL_STDIN)}")
++    everything = list(effects) + [e for o in resolved for e in o.effects]
++    if any(e.effect == "runs-command-at" for e in everything):
++        if no_command is None:
++            raise _fail(where, "a `runs-command-at` row must declare `no_command`")
++        if terminal is None:
++            raise _fail(where, "a `runs-command-at` row must declare `terminal_stdin`")
++    if any(e.effect == "runs-stdin-as-code" for e in everything) and terminal is None:
++        raise _fail(where, "a `runs-stdin-as-code` row must declare `terminal_stdin`")
++    return Grammar(
++        label=label,
++        parse=style if not fixed else "fixed",
++        options=MappingProxyType(options),
++        flag_patterns=tuple(patterns),
++        effects=effects,
++        cls=cls,
++        reason=reason,
++        plus=body.get("plus", False),
++        old_style=body.get("old_style", False),
++        no_command=no_command,
++        terminal_stdin=terminal,
++    )
++
++
++def _option(spellings: tuple[str, ...], spec: dict[str, Any], where: str) -> Option:
++    value = spec.get("value", "none")
++    count = isinstance(value, int) and not isinstance(value, bool) and value >= 1
++    if not (value in VALUES or count):
++        raise _fail(where, "`value` must be none, required, optional or a word count")
++    rejects = spec.get("rejects")
++    if rejects is not None and (not isinstance(rejects, str) or not rejects):
++        raise _fail(where, "`rejects` must be a non-empty reason")
++    gap = spec.get("gap")
++    if gap is not None and gap != "class-7":
++        raise _fail(where, '`gap` must be "class-7"')
++    replace = spec.get("replace")
++    if replace is not None and (not isinstance(replace, str) or value == "none"):
++        raise _fail(where, "`replace` must be a string, on an option that takes a value")
++    for key in ("last", "name", "plus"):
++        if not isinstance(spec.get(key, False), bool):
++            raise _fail(where, f"`{key}` must be a boolean")
++    return Option(
++        key=spellings[0],
++        spellings=spellings,
++        value=value,
++        rejects=rejects,
++        gap=gap,
++        last=spec.get("last", False),
++        replace=replace,
++        name=spec.get("name", False),
++        plus=spec.get("plus", False),
++    )
++
++
++def _effects(
++    raw: Any, where: str, keys: Mapping[str, str], on_option: bool, fixed: bool = False
++) -> tuple[Effect, ...]:
++    if not isinstance(raw, list):
++        raise _fail(where, "`effects` must be a list")
++    out = []
++    for item in raw:
++        spec = {"effect": item} if isinstance(item, str) else item
++        if not isinstance(spec, dict):
++            raise _fail(where, "an effect is a name or a table")
++        unknown = sorted(set(spec) - _EFFECT_KEYS)
++        if unknown:
++            raise _fail(where, f"effect: unknown key `{unknown[0]}`")
++        name = spec.get("effect")
++        if name not in EFFECTS:
++            raise _fail(where, f"unknown effect {name!r}")
++        grammar = spec.get("grammar")
++        if name in TEXT_EFFECTS:
++            if grammar not in GRAMMARS:
++                raise _fail(where, f"{name} must name its grammar ({', '.join(GRAMMARS)})")
++        elif grammar is not None:
++            raise _fail(where, f"`grammar` is only for a text effect, not {name}")
++        if fixed and any(k in spec for k in ("when", "unless", "if", "at", "until")):
++            raise _fail(where, "an effect on a fixed row cannot depend on argv")
++        if fixed and name == "runs-command-at":
++            raise _fail(where, "a fixed row cannot run an inner command")
++
++        def option_keys(key: str) -> frozenset[str]:
++            spellings = _strings(spec.get(key, []), where, key, empty=True)
++            for s in spellings:
++                if s not in keys:
++                    raise _fail(where, f"`{key}` names {s!r}, which is not an option here")
++            return frozenset(keys[s] for s in spellings)
++
++        cond = spec.get("if")
++        if cond is not None and cond not in CONDITIONS:
++            raise _fail(where, f"`if` must be one of {', '.join(CONDITIONS)}")
++        at = spec.get("at")
++        if name == "runs-command-at":
++            if on_option:
++                if at != "after":
++                    raise _fail(where, 'runs-command-at on an option needs `at = "after"`')
++            elif not (isinstance(at, int) and not isinstance(at, bool) and at >= 0):
++                raise _fail(
++                    where, "runs-command-at needs `at` (the operand where it starts)"
++                )
++        elif at is not None and not (isinstance(at, int) and cond == "operand"):
++            raise _fail(where, '`at` is for runs-command-at or `if = "operand"`')
++        until = _strings(spec.get("until", []), where, "until", empty=True)
++        if until and at != "after":
++            raise _fail(where, '`until` is only for `at = "after"`')
++        scope = spec.get("scope")
++        if name == "sets-variable":
++            if scope not in ("session", "command"):
++                raise _fail(where, "sets-variable needs `scope` (session or command)")
++        elif scope is not None:
++            raise _fail(where, "`scope` is only for sets-variable")
++        for key in ("appends", "assignments", "name"):
++            if not isinstance(spec.get(key, False), bool):
++                raise _fail(where, f"`{key}` must be a boolean")
++        reason = spec.get("reason")
++        if reason is not None and (not isinstance(reason, str) or not reason):
++            raise _fail(where, "`reason` must be a non-empty string")
++        out.append(
++            Effect(
++                effect=name,
++                grammar=grammar,
++                when=option_keys("when"),
++                unless=option_keys("unless"),
++                cond=cond,
++                at=at,
++                until=until,
++                appends=spec.get("appends", False),
++                assignments=spec.get("assignments", False),
++                name=spec.get("name", False),
++                scope=scope,
++                reason=reason,
++            )
++        )
++    return tuple(out)
+diff --git a/src/nl_shell/gate/rules.py b/src/nl_shell/gate/rules.py
+index 27597dc..59212ce 100644
+--- a/src/nl_shell/gate/rules.py
++++ b/src/nl_shell/gate/rules.py
+@@ -1,17 +1,54 @@
+-"""The policy gate's command layer: a stub (issue #196).
++"""The policy gate's command layer (spec ``policy-gate/v1`` §1 step 4, §4, §4.1, §5).
+ 
+-Spec ``policy-gate/v1`` §1 step 4: the static, session-altering, destructive and
+-privileged rules and the allowlist, per simple command. #197 (wrappers, sudo, destructive
+-commands, builtins, decisions A and B) and #198 (the allowlist, the terminal-read rule,
+-the here-doc exemption) replace this stub. Until then every simple command is
+-``mutating``, "not allowlisted": decision A's floor, so nothing is ``read-only``.
++One generic engine reads the reviewed command table (``nl_shell.gate.commands``,
++``targets/<id>/commands.toml``). A command gets a meaning only from its row:
++wrappers, the sudo family, destructive commands, interpreters and builtins are rows, not
++code paths here.
++
++- A command with a row has its argv parsed by the row's grammar, and gets the row's
++  class plus whatever its effects say. An option the row does not declare is at least
++  ``destructive``, "option the gate does not know" (class 2).
++- **Decision A**: a command with no row is at least ``mutating``, "not allowlisted". If
++  an argument word names a row with ``elevates`` it is ``privileged`` (a proposal is
++  rejected); if one names a row with ``destroys``, at least ``destructive``.
++- **Decision B** (this issue): every text effect (``runs-text``, ``runs-stdin-as-code``,
++  ``runs-file-as-code``, ``stores-code``) is at least ``destructive``, "runs code the gate
++  cannot read". The text is not read. Inner commands of wrappers (``runs-command-at``) are
++  argv, and are classed by this same engine.
++- **Elevation** reaches inner commands: under a row with ``elevates``, a proposal is
++  rejected when a later word names a row that runs a shell or code whatever its options,
++  when a text effect or ``opens-shell`` applies, and when a word the gate cannot read or
++  an option it does not know stands anywhere in the inner argv.
++- **Decision C**: a missing or invalid table is a ``GateFailure``, which the gate turns
++  into ``privileged``, rejected, "could not class".
++
++Words are read after quote removal, with ANSI-C ``$'…'`` decoded as bash does
++(``readable``); this decoding is for the command layer only. The shell layer's
++``Word.literal`` is unchanged, so no shell-layer verdict moves.
++
++#198 adds the allowlist, the terminal-read rule and the here-doc exemption.
+ """
+ 
+ from __future__ import annotations
+ 
+-from dataclasses import dataclass
++import re
++from dataclasses import dataclass, field
++
++from nl_shell.gate import commands, parse
++from nl_shell.gate.parse import RANK, Stdin, Word
+ 
+ NOT_ALLOWLISTED = "not allowlisted"
++CANNOT_READ = "runs code the gate cannot read"
++UNKNOWN_OPTION = "option the gate does not know"
++# Wrappers inside wrappers: deeper than this is decision C.
++MAX_NESTING = 32
++# Files that are stdin when a row runs a file as code (`bash /dev/stdin`).
++_STDIN_FILES = ("/dev/stdin", "/dev/fd/0", "/proc/self/fd/0")
++_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=")
++# A word sh reads as one plain word when `watch` joins its words with spaces.
++_PLAIN_FOR_SH = re.compile(r"[A-Za-z0-9_@%+=:,./-]+")
++# A word that stands for input the gate never sees (xargs input, a replace string).
++_INPUT = Word(text="", literal=False, source="")
+ 
+ 
+ @dataclass(frozen=True)
+@@ -23,6 +60,652 @@ class Verdict:
+     rejected: bool = False
+ 
+ 
+-def classify(invocation) -> Verdict:
+-    """Class one ``nl_shell.gate.parse.Invocation``."""
+-    return Verdict("mutating", (NOT_ALLOWLISTED,))
++def classify(invocation, origin: str = "typed") -> Verdict:
++    """Class one ``nl_shell.gate.parse.Invocation``. ``origin`` is ``proposal`` or
++    ``typed``. Raises ``parse.GateFailure`` (decision C) when the table cannot be
++    loaded or the work bound is passed."""
++    try:
++        table = commands.table()
++    except commands.CommandsError:
++        raise parse.GateFailure("command table missing or invalid") from None
++    words = list(invocation.words)
++    acc = _Acc()
++    if not words or not words[0].source:
++        acc.raise_to("mutating", NOT_ALLOWLISTED)  # no command word
++        return acc.verdict()
++    _Engine(table, origin == "proposal", acc).argv(words, invocation.stdin, False, 0)
++    return acc.verdict()
++
++
++# --- ANSI-C decoding (command layer only) ----------------------------------------------
++
++_SIMPLE_ESCAPES = {
++    "a": "\a",
++    "b": "\b",
++    "e": "\x1b",
++    "E": "\x1b",
++    "f": "\f",
++    "n": "\n",
++    "r": "\r",
++    "t": "\t",
++    "v": "\v",
++    "\\": "\\",
++    "'": "'",
++    '"': '"',
++    "?": "?",
++}
++_HEX = "0123456789abcdefABCDEF"
++_UNQUOTED_SPECIAL = set("$`*?[]{}()~ \t\n;&|<>!")
++
++
++def readable(word: Word) -> str | None:
++    """The word as bash passes it, or None when the gate cannot read it.
++
++    A literal word is its quote-removed text. A word whose only non-literal part is
++    ANSI-C quoting (``$'…'``) is decoded as bash does: the escapes below, and the text
++    of one ``$'…'`` cut at its first NUL (bash keeps the rest of the word). Any other
++    expansion, a glob, an undecodable escape or a word the gate made up for unseen
++    input gives None.
++    """
++    if word.literal:
++        return word.text
++    source = word.source
++    if not source:
++        return None
++    _, causes = parse.lex_word(source)
++    if causes != {"expansion"} or "$'" not in source:
++        return None
++    out: list[str] = []
++    i, n = 0, len(source)
++    while i < n:
++        c = source[i]
++        if c == "\\":
++            if i + 1 >= n or source[i + 1] == "\n":
++                return None
++            out.append(source[i + 1])
++            i += 2
++        elif c == "'":
++            end = source.find("'", i + 1)
++            if end < 0:
++                return None
++            out.append(source[i + 1 : end])
++            i = end + 1
++        elif c == '"':
++            j = i + 1
++            while j < n and source[j] != '"':
++                if source[j] in "$`":
++                    return None
++                if source[j] == "\\" and j + 1 < n and source[j + 1] in '$`"\\':
++                    out.append(source[j + 1])
++                    j += 2
++                    continue
++                if source[j] == "\\" and j + 1 < n and source[j + 1] == "\n":
++                    return None
++                out.append(source[j])
++                j += 1
++            if j >= n:
++                return None
++            i = j + 1
++        elif c == "$" and source[i + 1 : i + 2] == "'":
++            decoded = _ansi_c(source, i + 2)
++            if decoded is None:
++                return None
++            text, i = decoded
++            out.append(text)
++        elif c in _UNQUOTED_SPECIAL:
++            return None
++        else:
++            out.append(c)
++            i += 1
++    return "".join(out)
++
++
++def _ansi_c(source: str, i: int) -> tuple[str, int] | None:
++    """Decode one ``$'…'`` body starting at ``i``; returns the text and the index after
++    the closing quote."""
++    out: list[str] = []
++    cut = False
++    n = len(source)
++    while i < n:
++        c = source[i]
++        if c == "'":
++            return "".join(out), i + 1
++        if c != "\\":
++            char, i = c, i + 1
++        else:
++            if i + 1 >= n:
++                return None
++            e = source[i + 1]
++            i += 2
++            if e in _SIMPLE_ESCAPES:
++                char = _SIMPLE_ESCAPES[e]
++            elif e in "01234567":
++                digits = e
++                while len(digits) < 3 and i < n and source[i] in "01234567":
++                    digits += source[i]
++                    i += 1
++                char = chr(int(digits, 8) & 0xFF)
++            elif e in "xuU":
++                width = {"x": 2, "u": 4, "U": 8}[e]
++                digits = ""
++                while len(digits) < width and i < n and source[i] in _HEX:
++                    digits += source[i]
++                    i += 1
++                if not digits:
++                    return None
++                code = int(digits, 16)
++                if code > 0x10FFFF or 0xD800 <= code <= 0xDFFF:
++                    return None
++                char = chr(code)
++            elif e == "c":
++                if i >= n or not (0x20 < ord(source[i]) < 0x7F) or source[i] in "\\'":
++                    return None
++                char = chr(ord(source[i]) & 0x1F)
++                i += 1
++            else:
++                char = "\\" + e  # bash keeps an unknown escape as written
++        if char == "\0":
++            cut = True
++        if not cut:
++            out.append(char)
++    return None
++
++
++# --- the engine ------------------------------------------------------------------------
++
++
++class _Acc:
++    def __init__(self) -> None:
++        self.rank = -1
++        self.cls = "mutating"
++        self.reasons: list[str] = []
++        self.rejected = False
++
++    def raise_to(self, cls: str, reason: str) -> None:
++        rank = RANK[cls]
++        if rank > self.rank or (rank == self.rank and cls == "session-altering"):
++            self.rank, self.cls = rank, cls
++        if reason not in self.reasons:
++            self.reasons.append(reason)
++
++    def reject(self, reason: str) -> None:
++        self.rejected = True
++        self.raise_to("mutating", reason)
++
++    def verdict(self) -> Verdict:
++        if self.rank < RANK["mutating"]:
++            self.raise_to("mutating", NOT_ALLOWLISTED)
++        return Verdict(self.cls, tuple(self.reasons), self.rejected)
++
++
++@dataclass
++class _Parsed:
++    present: list = field(default_factory=list)  # (Option, value words, spelling)
++    unknown: list[str] = field(default_factory=list)
++    unreadable_options: int = 0
++    operands: list[Word] = field(default_factory=list)
++    sub: commands.Grammar | None = None
++    sub_name: str | None = None
++    undescribed: str | None = None
++    unreadable_sub: bool = False
++    # Not parsed: the words after a subcommand the row does not describe.
++    tail: list[Word] = field(default_factory=list)
++    inner: list[Word] | None = None  # the inner command at an operand
++    inner_effect: commands.Effect | None = None
++    option_inners: list = field(default_factory=list)  # (Option, Effect, words)
++
++    def keys(self) -> frozenset[str]:
++        return frozenset(o.key for o, _, _ in self.present)
++
++
++def _holds(effect: commands.Effect, keys: frozenset[str]) -> bool:
++    if effect.when and not (effect.when & keys):
++        return False
++    return not (effect.unless & keys)
++
++
++class _Engine:
++    def __init__(self, table: commands.Table, proposal: bool, acc: _Acc) -> None:
++        self.table = table
++        self.proposal = proposal
++        self.acc = acc
++
++    # One argv: a command word and its arguments.
++    def argv(self, words: list[Word], stdin: Stdin, elevated: bool, depth: int) -> None:
++        if depth > MAX_NESTING:
++            raise parse.GateFailure("wrapper nesting too deep")
++        head, args = words[0], words[1:]
++        name = readable(head)
++        acc = self.acc
++        if name is None:
++            acc.raise_to("mutating", NOT_ALLOWLISTED)
++            if depth > 0:
++                acc.raise_to("destructive", "inner command the gate cannot read")
++            if elevated:
++                self._elevated_opaque(args)
++                if self.proposal:
++                    acc.reject("proposal: a command the gate cannot read under elevation")
++            return
++        row = self.table.lookup(name)
++        if row is None:
++            acc.raise_to("mutating", NOT_ALLOWLISTED)
++            self._decision_a(args)
++            if elevated:
++                self._elevated_opaque(args)
++            return
++        label = name.rsplit("/", 1)[-1]
++        if row.fixed:
++            grammar = row.grammar
++            acc.raise_to(grammar.cls, grammar.reason)
++            elevating = any(e.effect == "elevates" for e in grammar.effects)
++            if elevating:
++                self._elevation(label, args, stdin)
++            for effect in grammar.effects:
++                self._effect(effect, label, stdin, elevated or elevating, grammar, None)
++            self._decision_a(args)
++            if elevated:
++                self._elevated_opaque(args)
++            return
++        self._row(row, label, args, stdin, elevated, depth)
++
++    def _decision_a(self, args: list[Word]) -> None:
++        for word in args:
++            text = readable(word)
++            if text is None:
++                continue
++            row = self.table.lookup(text)
++            if row is None:
++                continue
++            if row.elevates:
++                self.acc.raise_to(
++                    "privileged", f"argument names an elevating command: {text}"
++                )
++                if self.proposal:
++                    self.acc.reject(
++                        f"proposal passes an elevating command to a command the gate does "
++                        f"not know: {text}"
++                    )
++            elif row.destroys:
++                self.acc.raise_to(
++                    "destructive", f"argument names a destructive command: {text}"
++                )
++
++    def _elevated_opaque(self, words: list[Word]) -> None:
++        """Words under elevation that no grammar declares: every option is one the gate
++        does not know."""
++        if not self.proposal:
++            return
++        for word in words:
++            text = readable(word)
++            if text is not None and text.startswith("-") and text != "-":
++                self.acc.reject(f"proposal: {UNKNOWN_OPTION} under elevation: {text}")
++                return
++
++    def _elevation(self, label: str, args: list[Word], stdin: Stdin) -> None:
++        acc = self.acc
++        acc.raise_to("privileged", f"elevating command: {label}")
++        if stdin.kind not in ("terminal", "file"):
++            # §5; `unknown` counts as a pipe.
++            acc.reject(f"pipe, here-doc or here-string into {label}")
++        if not self.proposal:
++            return
++        for word in args:
++            text = readable(word)
++            if text is None:
++                acc.reject(f"proposal: a word the gate cannot read under {label}")
++                continue
++            row = self.table.lookup(text)
++            if row is not None and row.runs_code:
++                acc.reject(f"proposal runs a shell or interpreter under {label}: {text}")
++
++    def _row(
++        self, row, label: str, args: list[Word], stdin: Stdin, elevated: bool, depth: int
++    ) -> None:
++        acc = self.acc
++        grammar = row.grammar
++        parsed = self._parse(grammar, args)
++        keys = parsed.keys()
++        active = grammar if parsed.sub is None else parsed.sub
++        shown = label if parsed.sub_name is None else f"{label} {parsed.sub_name}"
++        acc.raise_to(active.cls, active.reason)
++
++        effects: list[tuple[commands.Effect, commands.Grammar, str | None]] = []
++        for effect in grammar.effects:
++            effects.append((effect, grammar, None))
++        if parsed.sub is not None:
++            for effect in parsed.sub.effects:
++                effects.append((effect, parsed.sub, None))
++        for option, _, spelling in parsed.present:
++            for effect in option.effects:
++                if effect.effect != "runs-command-at":
++                    effects.append((effect, active, spelling))
++        effects = [(e, g, s) for e, g, s in effects if _holds(e, keys)]
++        effects = [(e, g, s) for e, g, s in effects if self._condition(e, parsed)]
++
++        elevating = any(e.effect == "elevates" for e, _, _ in effects)
++        under = elevated or elevating
++        if elevating:
++            self._elevation(label, args, stdin)
++
++        for option, _, spelling in parsed.present:
++            if option.rejects:
++                acc.reject(f"{label} {spelling}: {option.rejects}")
++            if option.gap and under and self.proposal:
++                acc.reject(f"proposal: {label} {spelling} can run code, under elevation")
++        rejecting = any(o.rejects for o in grammar.options.values())
++        for text in parsed.unknown:
++            acc.raise_to("destructive", f"{UNKNOWN_OPTION}: {shown} {text}")
++            if under and self.proposal:
++                acc.reject(f"proposal: {UNKNOWN_OPTION} under elevation: {shown} {text}")
++        unreadable = f"proposal: a word the gate cannot read under elevation: {shown}"
++        if parsed.unreadable_options:
++            acc.raise_to(
++                "destructive", f"word the gate cannot read where {shown} takes an option"
++            )
++            if rejecting:
++                acc.reject(
++                    f"word the gate cannot read where {label} takes options it rejects"
++                )
++            elif under and self.proposal:
++                acc.reject(unreadable)
++        if parsed.unreadable_sub:
++            acc.raise_to(
++                "destructive", f"word the gate cannot read where {label} takes a subcommand"
++            )
++        if parsed.tail and under:
++            self._elevated_opaque(parsed.tail)
++            if self.proposal and any(readable(w) is None for w in parsed.tail):
++                acc.reject(unreadable)
++
++        for effect, owner, spelling in effects:
++            trigger = shown if spelling is None else f"{shown} {spelling}"
++            self._effect(effect, trigger, stdin, under, owner, parsed)
++
++        # Inner commands.
++        if parsed.inner_effect is not None:
++            if parsed.inner:
++                self._inner(parsed.inner, parsed.inner_effect, parsed, stdin, under, depth)
++            elif active.no_command == "opens-shell":
++                self._opens_shell(f"{shown} with no command", under)
++        for option, effect, inner in parsed.option_inners:
++            if _holds(effect, keys):
++                if inner:
++                    self._inner(inner, effect, parsed, stdin, under, depth)
++                elif active.no_command == "opens-shell":
++                    self._opens_shell(f"{shown} {option.key} with no command", under)
++
++    def _inner(
++        self, words, effect, parsed: _Parsed, stdin: Stdin, under: bool, depth: int
++    ) -> None:
++        acc = self.acc
++        words = list(words)
++        replace = None
++        for option, values, _ in parsed.present:
++            if option.replace is not None:
++                replace = values[0].text if values and values[0].text else option.replace
++        if replace is not None:
++            words = [
++                _INPUT if (readable(w) is None or replace in (readable(w) or "")) else w
++                for w in words
++            ]
++        elif effect.appends:
++            words.append(_INPUT)
++        if effect.assignments:
++            while words:
++                text = readable(words[0])
++                if text is None or not _ASSIGNMENT.match(text):
++                    break
++                acc.raise_to("mutating", "sets a variable for the command")
++                words.pop(0)
++        if not words:
++            return
++        self.argv(words, stdin, under, depth + 1)
++
++    def _opens_shell(self, trigger: str, under: bool) -> None:
++        self.acc.raise_to("mutating", f"opens an interactive shell: {trigger}")
++        if under and self.proposal:
++            self.acc.reject(f"proposal opens a root shell: {trigger}")
++
++    def _effect(
++        self, effect, trigger: str, stdin: Stdin, under: bool, owner, parsed
++    ) -> None:
++        acc = self.acc
++        kind = effect.effect
++        if kind in ("elevates", "runs-command-at"):
++            return  # handled by the caller
++        if kind == "destroys":
++            acc.raise_to("destructive", effect.reason or f"destructive command: {trigger}")
++        elif kind == "opens-shell":
++            self._opens_shell(effect.reason or trigger, under)
++        elif kind == "sets-variable":
++            if effect.scope == "session":
++                acc.raise_to("session-altering", f"sets a shell variable: {trigger}")
++            else:
++                acc.raise_to("mutating", f"sets a variable for the command: {trigger}")
++        elif kind == "alters-session":
++            acc.raise_to("session-altering", f"builtin alters the session: {trigger}")
++        elif kind == "reads-terminal":
++            acc.raise_to("mutating", f"reads the terminal: {trigger}")
++        elif effect.text:
++            from_stdin = kind == "runs-stdin-as-code"
++            file_operand = kind == "runs-file-as-code" and effect.cond == "operand"
++            if file_operand and parsed is not None:
++                at = effect.at or 0
++                if at < len(parsed.operands):
++                    text = readable(parsed.operands[at])
++                    from_stdin = text in _STDIN_FILES or text == "-"
++            keyboard = from_stdin and stdin.kind == "terminal"
++            if keyboard and owner.terminal_stdin == "opens-shell":
++                self._opens_shell(trigger, under)
++                return
++            what = effect.reason or f"{trigger} ({effect.grammar})"
++            acc.raise_to("destructive", f"{CANNOT_READ}: {what}")
++            if under and self.proposal:
++                acc.reject(
++                    f"proposal runs code the gate cannot read under elevation: {trigger}"
++                )
++
++    def _condition(self, effect: commands.Effect, parsed: _Parsed) -> bool:
++        cond = effect.cond
++        operands = parsed.operands
++        if cond is None:
++            return True
++        if cond == "operand":
++            return len(operands) > (effect.at or 0)
++        if cond == "no-operand":
++            return not operands and not parsed.inner
++        if cond == "assignment":
++            return any(
++                (t := readable(w)) is None or _ASSIGNMENT.match(t) is not None
++                for w in operands
++            )
++        if cond == "nonliteral-operand":
++            return any(readable(w) is None for w in operands)
++        if cond.startswith("operand-prefix:"):
++            prefix = cond.partition(":")[2]
++            return any((readable(w) or "").startswith(prefix) for w in operands)
++        if cond.startswith("word:"):
++            wanted = cond.partition(":")[2]
++            seen = list(operands) + [v for _, values, _ in parsed.present for v in values]
++            return any(readable(w) == wanted for w in seen) or any(
++                s == wanted for _, _, s in parsed.present
++            )
++        if cond == "joined-special":
++            words = parsed.inner or []
++            return any(
++                (t := readable(w)) is None or not _PLAIN_FOR_SH.fullmatch(t) for w in words
++            )
++        raise parse.GateFailure("unknown condition in the command table")
++
++    # --- argv parsing ----------------------------------------------------------------
++
++    def _parse(self, grammar: commands.Grammar, args: list[Word]) -> _Parsed:
++        parsed = _Parsed()
++        words = self._old_style(grammar, list(args))
++        current = grammar
++        options_on = True
++        i = 0
++        while i < len(words):
++            word = words[i]
++            text = readable(word)
++            if options_on and text is not None:
++                if text == "--" and "--" not in current.options:
++                    options_on = False
++                    i += 1
++                    continue
++                before = len(parsed.present)
++                step = self._option(current, text, words, i, parsed)
++                if step:
++                    i += step
++                    if any(o.last for o, _, _ in parsed.present[before:]):
++                        options_on = False
++                    continue
++            elif options_on and text is None:
++                # It may be any option, `--`, or an operand.
++                parsed.unreadable_options += 1
++            # An operand.
++            subcommand_next = parsed.sub is None and parsed.undescribed is None
++            if current.subcommands is not None and subcommand_next:
++                if text is None:
++                    parsed.unreadable_sub = True
++                    parsed.tail = words[i + 1 :]
++                    break
++                sub = current.subcommands.get(text)
++                if sub is None:
++                    parsed.undescribed = text
++                    parsed.tail = words[i + 1 :]
++                    break
++                parsed.sub, parsed.sub_name = sub, text
++                current = sub
++                parsed.operands = []
++                options_on = True
++                i += 1
++                continue
++            if current.parse == "posix":
++                options_on = False
++            effect = self._command_at(current, parsed)
++            if effect is not None and len(parsed.operands) == effect.at:
++                parsed.inner = words[i:]
++                parsed.inner_effect = effect
++                break
++            parsed.operands.append(word)
++            i += 1
++        if parsed.inner_effect is None:
++            effect = self._command_at(current, parsed)
++            if effect is not None:
++                parsed.inner_effect = effect
++                parsed.inner = []
++        return parsed
++
++    @staticmethod
++    def _command_at(grammar: commands.Grammar, parsed: _Parsed) -> commands.Effect | None:
++        keys = parsed.keys()
++        for effect in grammar.effects:
++            if effect.effect == "runs-command-at" and _holds(effect, keys):
++                return effect
++        return None
++
++    @staticmethod
++    def _old_style(grammar: commands.Grammar, words: list[Word]) -> list[Word]:
++        """``tar xf a.tar``: a first word with no dash is a bundle of short options, whose
++        values are the next words in order."""
++        if not grammar.old_style or not words:
++            return words
++        first = readable(words[0])
++        if first is None or not first or first.startswith("-"):
++            return words
++        out: list[Word] = []
++        rest = words[1:]
++        for char in first:
++            out.append(Word(text="-" + char, literal=True, source="-" + char))
++            option = grammar.options.get("-" + char)
++            if option is not None and option.value not in ("none", "optional") and rest:
++                count = option.value if isinstance(option.value, int) else 1
++                out.extend(rest[:count])
++                rest = rest[count:]
++        return out + rest
++
++    def _option(
++        self, grammar, text: str, words: list[Word], i: int, parsed: _Parsed
++    ) -> int:
++        """Read the option at ``words[i]``; returns how many words it used (0: an
++        operand)."""
++        options = grammar.options
++
++        def take(option, spelling, attached: str | None) -> int:
++            values: list[Word] = []
++            used = 1
++            if attached is not None:
++                values.append(Word(text=attached, literal=True, source=attached))
++            elif option.value == "required" or isinstance(option.value, int):
++                count = option.value if isinstance(option.value, int) else 1
++                values = list(words[i + 1 : i + 1 + count])
++                used += len(values)
++            parsed.present.append((option, values, spelling))
++            for effect in option.effects:
++                if effect.effect == "runs-command-at":
++                    end, stop = self._until(words, i + used, effect.until)
++                    parsed.option_inners.append((option, effect, words[i + used : end]))
++                    return end - i + (1 if stop else 0)
++            return used
++
++        option = options.get(text)
++        if option is not None:
++            return take(option, text, None)
++        if grammar.flag_patterns and any(p.fullmatch(text) for p in grammar.flag_patterns):
++            parsed.present.append((commands.Option(key=text, spellings=(text,)), [], text))
++            return 1
++        long = text.startswith("--") or (grammar.parse == "long" and text.startswith("-"))
++        if long and len(text) > 1:
++            name, eq, value = text.partition("=")
++            option = options.get(name)
++            if option is not None and eq:
++                if option.value == "none":
++                    parsed.unknown.append(text)
++                    return 1
++                return take(option, name, value)
++            parsed.unknown.append(text)
++            return 1
++        plus = text.startswith("+") and (
++            grammar.plus or any(o.plus for o in options.values())
++        )
++        if (text.startswith("-") or plus) and len(text) > 1:
++            sign = text[0]
++            j = 1
++            while j < len(text):
++                spelling = "-" + text[j]
++                option = options.get(spelling)
++                if option is None or (sign == "+" and not (grammar.plus or option.plus)):
++                    parsed.unknown.append(text)
++                    return 1
++                rest = text[j + 1 :]
++                if option.value == "none":
++                    parsed.present.append((option, [], sign + text[j]))
++                    for effect in option.effects:
++                        if effect.effect == "runs-command-at":
++                            end, stop = self._until(words, i + 1, effect.until)
++                            inner = words[i + 1 : end]
++                            parsed.option_inners.append((option, effect, inner))
++                            return end - i + (1 if stop else 0)
++                    j += 1
++                    continue
++                if option.value == "optional":
++                    return take(option, spelling, rest)
++                if rest:
++                    return take(option, spelling, rest)
++                return take(option, spelling, None)
++            return 1
++        return 0
++
++    @staticmethod
++    def _until(words: list[Word], start: int, until: tuple[str, ...]) -> tuple[int, bool]:
++        """Where an inner command that starts at ``start`` ends: at a word in ``until``
++        (``+`` only right after ``{}``, as ``find`` reads it), or at the end."""
++        for k in range(start, len(words)):
++            text = readable(words[k])
++            if text is None:
++                continue
++            after_braces = k > start and words[k - 1].source == "{}"
++            if text in until and (text != "+" or after_braces):
++                return k, True
++        return len(words), False
+diff --git a/targets/ubuntu-26.04/commands.toml b/targets/ubuntu-26.04/commands.toml
+new file mode 100644
+index 0000000..7203088
+--- /dev/null
++++ b/targets/ubuntu-26.04/commands.toml
+@@ -0,0 +1,2081 @@
++# The policy gate's command table for the ubuntu-26.04 target (spec policy-gate/v1 §4.1).
++# Loaded by nl_shell.gate.commands; the format is in that module's docstring.
++#
++# This is the gate's only source of per-command meaning. A command with no row here is
++# decision A (at least mutating, "not allowlisted"). Every row is reviewed like an
++# allowlist change: adding a row or raising a class is compatible within v1; lowering
++# one needs v2 (spec "Versioning and compatibility").
++#
++# Every text effect (runs-text, runs-stdin-as-code, runs-file-as-code, stores-code) is
++# decision B until the text-reading layer lands: at least destructive, "runs code the
++# gate cannot read". The `grammar` of each text effect names the language of the text.
++#
++# Builtin stored code that later issues read (alias values, function bodies) is not
++# declared here: `alias` stays session-altering (Conformance row 33).
++
++format = 1
++
++# --- elevation (spec §4 privileged, §5) ------------------------------------------------
++
++[[command]]
++names = ["sudo", "sudo-rs", "sudo.ws"]
++example = "sudo true"
++prefix = "sudo"
++class = "privileged"
++reason = "runs a command as another user"
++parse = "posix"
++effects = [
++  "elevates",
++  { effect = "runs-command-at", at = 0, assignments = true, unless = ["-e", "-l", "-v", "-k", "-K", "-V"] },
++]
++no_command = "nothing"
++terminal_stdin = "inherits"
++note = "sudo-rs (the default sudo on 26.04) and sudo.ws (the original sudo) take the same options here."
++
++[command.options]
++"-A|--askpass" = { rejects = "sudo reads the password through an askpass program (§5)" }
++"-S|--stdin" = { rejects = "sudo reads the password from stdin (§5)" }
++"-p|--prompt" = { value = "required", rejects = "sudo with its own password prompt (§5)" }
++"-b|--background" = {}
++"-B|--bell" = {}
++"-E" = {}
++"--preserve-env" = { value = "optional" }
++"-e|--edit" = {}
++"-H|--set-home" = {}
++"-h|--help" = {}
++"--host" = { value = "required" }
++"-i|--login" = { effects = ["opens-shell"] }
++"-K|--remove-timestamp" = {}
++"-k|--reset-timestamp" = {}
++"-l|--list" = {}
++"-N|--no-update" = {}
++"-n|--non-interactive" = {}
++"-P|--preserve-groups" = {}
++"-s|--shell" = { effects = ["opens-shell"] }
++"-V|--version" = {}
++"-v|--validate" = {}
++"-C|--close-from" = { value = "required" }
++"-D|--chdir" = { value = "required" }
++"-g|--group" = { value = "required" }
++"-R|--chroot" = { value = "required" }
++"-r|--role" = { value = "required" }
++"-t|--type" = { value = "required" }
++"-T|--command-timeout" = { value = "required" }
++"-U|--other-user" = { value = "required" }
++"-u|--user" = { value = "required" }
++
++[[command]]
++names = ["sudoedit", "sudoedit-rs"]
++example = "sudoedit /etc/hosts"
++class = "privileged"
++reason = "edits files as another user"
++parse = "posix"
++effects = ["elevates"]
++
++[command.options]
++"-A|--askpass" = { rejects = "sudo reads the password through an askpass program (§5)" }
++"-S|--stdin" = { rejects = "sudo reads the password from stdin (§5)" }
++"-p|--prompt" = { value = "required", rejects = "sudo with its own password prompt (§5)" }
++"-B|--bell" = {}
++"-h|--help" = {}
++"--host" = { value = "required" }
++"-k|--reset-timestamp" = {}
++"-N|--no-update" = {}
++"-n|--non-interactive" = {}
++"-V|--version" = {}
++"-C|--close-from" = { value = "required" }
++"-D|--chdir" = { value = "required" }
++"-g|--group" = { value = "required" }
++"-r|--role" = { value = "required" }
++"-t|--type" = { value = "required" }
++"-T|--command-timeout" = { value = "required" }
++"-u|--user" = { value = "required" }
++
++[[command]]
++names = ["su", "su-rs"]
++example = "su -c true"
++class = "privileged"
++reason = "runs a shell as another user"
++parse = "gnu"
++effects = [
++  "elevates",
++  { effect = "opens-shell", unless = ["-c", "-C"] },
++  { effect = "runs-text", grammar = "sh", if = "operand", at = 1 },
++]
++note = "Words after the user go to the user's shell (`su root -c x`, `su root f.sh`)."
++
++[command.options]
++"-c|--command" = { value = "required", effects = [{ effect = "runs-text", grammar = "sh" }] }
++"-C|--session-command" = { value = "required", effects = [{ effect = "runs-text", grammar = "sh" }] }
++"-f|--fast" = {}
++"-g|--group" = { value = "required" }
++"-G|--supp-group" = { value = "required" }
++"-l|--login|-" = {}
++"-m|-p|--preserve-environment" = {}
++"-P|--pty" = {}
++"-s|--shell" = { value = "required" }
++"-w|--whitelist-environment" = { value = "required" }
++"-h|--help" = {}
++"-V|--version" = {}
++
++[[command]]
++names = ["pkexec"]
++example = "pkexec true"
++prefix = "pkexec"
++class = "privileged"
++reason = "runs a command as another user"
++parse = "posix"
++effects = ["elevates", { effect = "runs-command-at", at = 0 }]
++no_command = "opens-shell"
++terminal_stdin = "inherits"
++
++[command.options]
++"--user" = { value = "required" }
++"--disable-internal-agent" = {}
++"--keep-cwd" = {}
++"--help" = {}
++"--version" = {}
++
++[[command]]
++names = ["doas"]
++example = "doas true"
++prefix = "doas"
++class = "privileged"
++reason = "runs a command as another user"
++parse = "posix"
++effects = ["elevates", { effect = "runs-command-at", at = 0 }]
++no_command = "nothing"
++terminal_stdin = "inherits"
++note = "Not installed on 26.04; named by spec §4 and §5."
++
++[command.options]
++"-L" = {}
++"-n" = {}
++"-s" = { effects = ["opens-shell"] }
++"-a" = { value = "required" }
++"-C" = { value = "required" }
++"-u" = { value = "required" }
++
++[[command]]
++names = ["run0"]
++example = "run0 true"
++prefix = "run0"
++class = "privileged"
++reason = "runs a command as root"
++parse = "posix"
++effects = ["elevates", { effect = "runs-command-at", at = 0 }]
++no_command = "opens-shell"
++terminal_stdin = "inherits"
++
++[command.options]
++"--no-ask-password" = {}
++"--machine" = { value = "required" }
++"--unit" = { value = "required" }
++"--property" = { value = "required" }
++"--description" = { value = "required" }
++"--slice" = { value = "required" }
++"--slice-inherit" = {}
++"-u|--user" = { value = "required" }
++"-g|--group" = { value = "required" }
++"--nice" = { value = "required" }
++"-D|--chdir" = { value = "required" }
++"--setenv" = { value = "required" }
++"--background" = { value = "required" }
++"--pty" = {}
++"--pipe" = {}
++"--shell-prompt-prefix" = { value = "required" }
++"--via-shell" = { effects = [{ effect = "runs-text", grammar = "sh" }] }
++"-i" = { effects = ["opens-shell"] }
++"--empower" = {}
++"--lightweight" = { value = "required" }
++"--area" = { value = "required" }
++"-h|--help" = {}
++"--version" = {}
++
++[[command]]
++names = ["systemd-run"]
++example = "systemd-run true"
++prefix = "systemd-run"
++parse = "posix"
++effects = [
++  { effect = "elevates", unless = ["--user"] },
++  { effect = "runs-command-at", at = 0 },
++]
++no_command = "nothing"
++terminal_stdin = "inherits"
++note = "Without --user the command runs as a system service, as root by default. run0 is the same file."
++
++[command.options]
++"--user" = {}
++"--system" = {}
++"-H|--host" = { value = "required" }
++"-M|--machine" = { value = "required" }
++"--scope" = {}
++"-u|--unit" = { value = "required" }
++"-p|--property" = { value = "required" }
++"--description" = { value = "required" }
++"--slice" = { value = "required" }
++"--slice-inherit" = {}
++"-r|--remain-after-exit" = {}
++"--send-sighup" = {}
++"--service-type" = { value = "required" }
++"--uid" = { value = "required" }
++"--gid" = { value = "required" }
++"--nice" = { value = "required" }
++"--working-directory" = { value = "required" }
++"-d|--same-dir" = {}
++"-E|--setenv" = { value = "required" }
++"-t|--pty" = {}
++"-P|--pipe" = {}
++"-q|--quiet" = {}
++"-v|--verbose" = {}
++"--on-active" = { value = "required" }
++"--on-boot" = { value = "required" }
++"--on-startup" = { value = "required" }
++"--on-unit-active" = { value = "required" }
++"--on-unit-inactive" = { value = "required" }
++"--on-calendar" = { value = "required" }
++"--on-timezone-change" = {}
++"--on-clock-change" = {}
++"--timer-property" = { value = "required" }
++"--path-property" = { value = "required" }
++"--socket-property" = { value = "required" }
++"--no-block" = {}
++"--wait" = {}
++"-G|--collect" = {}
++"-S|--shell" = { effects = ["opens-shell"] }
++"--ignore-failure" = {}
++"--background" = { value = "required" }
++"--json" = { value = "required" }
++"--job-mode" = { value = "required" }
++"--no-ask-password" = {}
++"--expand-environment" = { value = "required" }
++"-h|--help" = {}
++"--version" = {}
++
++[[command]]
++names = ["machinectl"]
++example = "machinectl list"
++prefix = "machinectl shell .host"
++parse = "gnu"
++
++[command.options]
++"-h|--help" = {}
++"--version" = {}
++"--no-pager" = {}
++"--no-legend" = {}
++"--no-ask-password" = {}
++"-H|--host" = { value = "required" }
++"-M|--machine" = { value = "required" }
++"-p|--property" = { value = "required" }
++"-P" = { value = "required" }
++"--value" = {}
++"-a|--all" = {}
++"-l|--full" = {}
++"--kill-whom" = { value = "required" }
++"-s|--signal" = { value = "required" }
++"--uid" = { value = "required" }
++"-E|--setenv" = { value = "required" }
++"--read-only" = {}
++"--mkdir" = {}
++"-n|--lines" = { value = "required" }
++"-o|--output" = { value = "required" }
++"--verify" = { value = "required" }
++"--force" = {}
++"--format" = { value = "required" }
++"--max-addresses" = { value = "required" }
++"-q|--quiet" = {}
++"--system" = {}
++"--user" = {}
++"--runner" = { value = "required" }
++
++[command.subcommands.shell]
++class = "privileged"
++reason = "opens a shell or runs a command in a machine, as root by default"
++effects = ["elevates", { effect = "runs-command-at", at = 1 }]
++no_command = "opens-shell"
++terminal_stdin = "inherits"
++
++# --- shells ----------------------------------------------------------------------------
++
++[[command]]
++names = ["bash", "rbash"]
++example = "bash -c true"
++parse = "posix"
++plus = true
++effects = [
++  { effect = "runs-file-as-code", grammar = "bash", if = "operand", unless = ["-c", "-s"] },
++  { effect = "runs-stdin-as-code", grammar = "bash", if = "no-operand", unless = ["-c", "-s"] },
++]
++terminal_stdin = "opens-shell"
++
++[command.options]
++"-c" = { effects = [{ effect = "runs-text", grammar = "bash" }] }
++"-s" = { effects = [{ effect = "runs-stdin-as-code", grammar = "bash" }] }
++"-i" = { effects = ["opens-shell"] }
++"-l|--login" = {}
++"-r|--restricted" = {}
++"-a" = {}
++"-b" = {}
++"-e" = {}
++"-f" = {}
++"-h" = {}
++"-k" = {}
++"-m" = {}
++"-n" = {}
++"-p" = {}
++"-t" = {}
++"-u" = {}
++"-v" = {}
++"-x" = {}
++"-B" = {}
++"-C" = {}
++"-D" = {}
++"-E" = {}
++"-H" = {}
++"-P" = {}
++"-T" = {}
++"-o" = { value = "required" }
++"-O" = { value = "required" }
++"--noprofile" = {}
++"--norc" = {}
++"--posix" = {}
++"--debugger" = {}
++"--dump-strings" = {}
++"--dump-po-strings" = {}
++"--verbose" = {}
++"--version" = {}
++"--help" = {}
++"--noediting" = {}
++"--pretty-print" = {}
++"--init-file|--rcfile" = { value = "required", effects = [{ effect = "runs-file-as-code", grammar = "bash" }] }
++"-" = { last = true }
++
++[[command]]
++names = ["sh", "dash", "static-sh", "ash", "hush"]
++example = "sh -c true"
++parse = "posix"
++plus = true
++effects = [
++  { effect = "runs-file-as-code", grammar = "sh", if = "operand", unless = ["-c", "-s"] },
++  { effect = "runs-stdin-as-code", grammar = "sh", if = "no-operand", unless = ["-c", "-s"] },
++]
++terminal_stdin = "opens-shell"
++note = "dash is /bin/sh; static-sh, ash and hush are busybox's shells."
++
++[command.options]
++"-c" = { effects = [{ effect = "runs-text", grammar = "sh" }] }
++"-s" = { effects = [{ effect = "runs-stdin-as-code", grammar = "sh" }] }
++"-i" = { effects = ["opens-shell"] }
++"-l" = {}
++"-a" = {}
++"-b" = {}
++"-C" = {}
++"-e" = {}
++"-E" = {}
++"-f" = {}
++"-h" = {}
++"-I" = {}
++"-m" = {}
++"-n" = {}
++"-p" = {}
++"-u" = {}
++"-v" = {}
++"-V" = {}
++"-x" = {}
++"-o" = { value = "required" }
++"-" = { last = true }
++
++[[command]]
++names = ["zsh"]
++example = "zsh -c true"
++parse = "posix"
++plus = true
++effects = [
++  { effect = "runs-file-as-code", grammar = "zsh", if = "operand", unless = ["-c", "-s"] },
++  { effect = "runs-stdin-as-code", grammar = "zsh", if = "no-operand", unless = ["-c", "-s"] },
++]
++terminal_stdin = "opens-shell"
++note = "Not installed on 26.04; listed by name."
++
++[command.options]
++"-c" = { effects = [{ effect = "runs-text", grammar = "zsh" }] }
++"-s" = { effects = [{ effect = "runs-stdin-as-code", grammar = "zsh" }] }
++"-i" = { effects = ["opens-shell"] }
++"-l" = {}
++"-d" = {}
++"-e" = {}
++"-f" = {}
++"-n" = {}
++"-v" = {}
++"-x" = {}
++"-o" = { value = "required" }
++"--emulate" = { value = "required" }
++"--version" = {}
++"--help" = {}
++"-" = { last = true }
++
++[[command]]
++names = ["screen"]
++example = "screen -ls"
++prefix = "screen"
++parse = "posix"
++effects = [
++  { effect = "runs-command-at", at = 0, unless = ["-ls", "-wipe", "-r", "-R", "-x", "-X", "-Q", "-v"] },
++]
++no_command = "opens-shell"
++terminal_stdin = "inherits"
++
++[command.options]
++"-ls|-list" = {}
++"-wipe" = {}
++"-a" = {}
++"-A" = {}
++"-c" = { value = "required", effects = [{ effect = "runs-file-as-code", grammar = "screen" }] }
++"-d" = {}
++"-D" = {}
++"-r" = { effects = ["opens-shell"] }
++"-R" = { effects = ["opens-shell"] }
++"-x" = { effects = ["opens-shell"] }
++"-X" = { value = "required", effects = [{ effect = "runs-text", grammar = "screen" }] }
++"-Q" = { value = "required", effects = [{ effect = "runs-text", grammar = "screen" }] }
++"-e" = { value = "required" }
++"-f" = {}
++"-fn" = {}
++"-fa" = {}
++"-h" = { value = "required" }
++"-i" = {}
++"-l" = {}
++"-ln" = {}
++"-L" = {}
++"-Logfile" = { value = "required" }
++"-m" = {}
++"-O" = {}
++"-p" = { value = "required" }
++"-q" = {}
++"-s" = { value = "required", effects = [{ effect = "runs-text", grammar = "sh" }] }
++"-S" = { value = "required" }
++"-t" = { value = "required" }
++"-T" = { value = "required" }
++"-U" = {}
++"-v" = {}
++"-4" = {}
++"-6" = {}
++
++[[command]]
++names = ["script"]
++example = "script -c true"
++parse = "gnu"
++effects = [{ effect = "opens-shell", unless = ["-c"] }]
++note = "With no -c it opens $SHELL."
++
++[command.options]
++"-c|--command" = { value = "required", effects = [{ effect = "runs-text", grammar = "bash" }] }
++"-a|--append" = {}
++"-e|--return" = {}
++"-f|--flush" = {}
++"--force" = {}
++"-q|--quiet" = {}
++"-E|--echo" = { value = "required" }
++"-m|--logging-format" = { value = "required" }
++"-o|--output-limit" = { value = "required" }
++"-t|--timing" = { value = "optional" }
++"-T|--log-timing" = { value = "required" }
++"-I|--log-in" = { value = "required" }
++"-O|--log-out" = { value = "required" }
++"-B|--log-io" = { value = "required" }
++"-h|--help" = {}
++"-V|--version" = {}
++
++[[command]]
++names = ["tmux"]
++example = "tmux ls"
++fixed = true
++effects = ["opens-shell", { effect = "runs-text", grammar = "tmux" }]
++note = "Not installed on 26.04. Every tmux command can run shell commands (new-session, run-shell, ~/.tmux.conf)."
++
++[[command]]
++names = ["x-terminal-emulator"]
++example = "x-terminal-emulator -e true"
++prefix = "x-terminal-emulator -e"
++parse = "posix"
++effects = [{ effect = "opens-shell", unless = ["-e"] }]
++no_command = "nothing"
++terminal_stdin = "inherits"
++note = "Debian policy: every x-terminal-emulator takes -e and -T."
++
++[command.options]
++"-e" = { effects = [{ effect = "runs-command-at", at = "after" }] }
++"-T" = { value = "required" }
++
++[[command]]
++names = ["ptyxis"]
++example = "ptyxis -s"
++prefix = "ptyxis --"
++parse = "gnu"
++effects = [
++  { effect = "runs-command-at", at = 0 },
++  { effect = "opens-shell", unless = ["-x", "--preferences", "--import-palette"] },
++]
++no_command = "nothing"
++terminal_stdin = "inherits"
++note = "The x-terminal-emulator on 26.04. A command goes after `--`, or as text with -x."
++
++[command.options]
++"-x|--execute" = { value = "required", effects = [{ effect = "runs-text", grammar = "sh" }] }
++"-d|--working-directory" = { value = "required" }
++"--preferences" = {}
++"--new-window" = {}
++"--tab" = {}
++"--tab-with-profile" = { value = "required" }
++"-s|--standalone" = {}
++"-T|--title" = { value = "required" }
++"--maximize" = {}
++"--fullscreen" = {}
++"--import-palette" = { value = "required" }
++"-h|--help|--help-all|--help-gapplication" = {}
++
++[[command]]
++names = ["sg"]
++example = "sg users -c true"
++parse = "posix"
++effects = [{ effect = "runs-text", grammar = "sh", if = "operand", at = 1 }]
++note = "Not installed on 26.04. `sg group [-c] command`: the command is text for sh."
++
++[command.options]
++"-" = {}
++
++[[command]]
++names = ["newgrp"]
++example = "newgrp users"
++fixed = true
++effects = ["opens-shell"]
++note = "Not installed on 26.04. It always starts a new shell."
++
++[[command]]
++names = ["at", "batch"]
++example = "at -l"
++parse = "gnu"
++effects = [
++  { effect = "runs-stdin-as-code", grammar = "sh", unless = ["-f", "-l", "-c", "-d", "-V"] },
++]
++terminal_stdin = "runs-code"
++note = "Not installed on 26.04. The job is read from stdin, or from -f."
++
++[command.options]
++"-V" = {}
++"-q" = { value = "required" }
++"-f" = { value = "required", effects = [{ effect = "runs-file-as-code", grammar = "sh" }] }
++"-m" = {}
++"-M" = {}
++"-l" = {}
++"-d|-r" = {}
++"-v" = {}
++"-c" = {}
++"-t" = { value = "required" }
++"-b" = {}
++"-u" = { value = "required" }
++
++[[command]]
++names = ["crontab"]
++example = "crontab -l"
++parse = "gnu"
++effects = [{ effect = "stores-code", grammar = "sh", unless = ["-l", "-r"] }]
++note = "setgid. A crontab file (an operand, or stdin) is code cron runs later."
++
++[command.options]
++"-u" = { value = "required" }
++"-l" = {}
++"-r" = { effects = [{ effect = "destroys", reason = "crontab -r removes the crontab" }] }
++"-e" = {}
++"-i" = {}
++"-n" = { value = "required" }
++
++# --- interpreters ----------------------------------------------------------------------
++
++[[command]]
++names = ["python3", "python3.14"]
++example = "python3 -c pass"
++parse = "posix"
++effects = [
++  { effect = "runs-file-as-code", grammar = "python", if = "operand", unless = ["-c", "-m"] },
++  { effect = "runs-stdin-as-code", grammar = "python", if = "no-operand", unless = ["-c", "-m"] },
++]
++terminal_stdin = "opens-shell"
++
++[command.options]
++"-c" = { value = "required", last = true, effects = [{ effect = "runs-text", grammar = "python" }] }
++"-m" = { value = "required", last = true, effects = [{ effect = "runs-file-as-code", grammar = "python" }] }
++"-b" = {}
++"-B" = {}
++"-d" = {}
++"-E" = {}
++"-h|-?|--help" = {}
++"-i" = { effects = ["opens-shell"] }
++"-I" = {}
++"-O" = {}
++"-OO" = {}
++"-P" = {}
++"-q" = {}
++"-R" = {}
++"-s" = {}
++"-S" = {}
++"-u" = {}
++"-v" = {}
++"-V|--version" = {}
++"-x" = {}
++"-W" = { value = "required" }
++"-X" = { value = "required" }
++"--check-hash-based-pycs" = { value = "required" }
++"--help-env" = {}
++"--help-xoptions" = {}
++"--help-all" = {}
++"-" = { last = true }
++
++[[command]]
++names = ["python3-config", "python3.14-config", "x86_64-linux-gnu-python3-config", "x86_64-linux-gnu-python3.14-config"]
++example = "python3-config --cflags"
++fixed = true
++reason = "not allowlisted (prints build settings)"
++
++[[command]]
++names = ["perl", "perl5.40.1", "perl5.40-x86_64-linux-gnu"]
++example = "perl -e 1"
++parse = "posix"
++effects = [
++  { effect = "runs-file-as-code", grammar = "perl", if = "operand", unless = ["-e", "-E"] },
++  { effect = "runs-stdin-as-code", grammar = "perl", if = "no-operand", unless = ["-e", "-E"] },
++]
++terminal_stdin = "opens-shell"
++
++[command.options]
++"-e" = { value = "required", effects = [{ effect = "runs-text", grammar = "perl" }] }
++"-E" = { value = "required", effects = [{ effect = "runs-text", grammar = "perl" }] }
++"-M" = { value = "required", effects = [{ effect = "runs-text", grammar = "perl" }] }
++"-m" = { value = "required", effects = [{ effect = "runs-text", grammar = "perl" }] }
++"-I" = { value = "required" }
++"-x" = { value = "optional" }
++"-0" = { value = "optional" }
++"-l" = { value = "optional" }
++"-i" = { value = "optional" }
++"-d" = { value = "optional", effects = [{ effect = "runs-text", grammar = "perl" }] }
++"-D" = { value = "optional" }
++"-C" = { value = "optional" }
++"-V" = { value = "optional" }
++"-F" = { value = "required" }
++"-a" = {}
++"-c" = {}
++"-f" = {}
++"-h" = {}
++"-n" = {}
++"-p" = {}
++"-s" = {}
++"-S" = {}
++"-t" = {}
++"-T" = {}
++"-u" = {}
++"-U" = {}
++"-v" = {}
++"-w" = {}
++"-W" = {}
++"-X" = {}
++"-" = { last = true }
++
++[[command]]
++names = ["perlbug", "perlthanks"]
++example = "perlbug -d"
++fixed = true
++effects = [{ effect = "runs-text", grammar = "sh", reason = "perlbug starts an editor and a mailer it is told to use" }]
++
++[[command]]
++names = ["perldoc"]
++example = "perldoc perl"
++fixed = true
++effects = [{ effect = "runs-text", grammar = "perl", reason = "perldoc loads the formatter and modules its options name, and runs a pager" }]
++
++[[command]]
++names = ["perli11ndoc"]
++example = "perli11ndoc Gtk3"
++fixed = true
++reason = "not allowlisted (shows GObject introspection docs)"
++
++[[command]]
++names = ["perlivp"]
++example = "perlivp"
++fixed = true
++effects = [{ effect = "runs-file-as-code", grammar = "perl", reason = "perlivp runs the installed perl's test scripts" }]
++
++[[command]]
++names = ["perltex"]
++example = "perltex f.tex"
++fixed = true
++effects = [{ effect = "runs-text", grammar = "perl", reason = "perltex runs the perl code in a LaTeX file and the program --latex names" }]
++
++[[command]]
++names = ["tclsh", "tclsh8.6"]
++example = "tclsh f.tcl"
++parse = "long"
++effects = [
++  { effect = "runs-file-as-code", grammar = "tcl", if = "operand" },
++  { effect = "runs-stdin-as-code", grammar = "tcl", if = "no-operand" },
++]
++terminal_stdin = "opens-shell"
++
++[command.options]
++"-encoding" = { value = "required" }
++
++[[command]]
++names = ["wish", "wish8.6"]
++example = "wish f.tcl"
++parse = "long"
++effects = [
++  { effect = "runs-file-as-code", grammar = "tcl", if = "operand" },
++  { effect = "runs-stdin-as-code", grammar = "tcl", if = "no-operand" },
++]
++terminal_stdin = "opens-shell"
++
++[command.options]
++"-encoding" = { value = "required" }
++"-colormap" = { value = "required" }
++"-display" = { value = "required" }
++"-geometry" = { value = "required" }
++"-name" = { value = "required" }
++"-sync" = {}
++"-use" = { value = "required" }
++"-visual" = { value = "required" }
++
++[[command]]
++names = ["gjs", "gjs-console"]
++example = "gjs -c 1"
++parse = "gnu"
++effects = [
++  { effect = "runs-file-as-code", grammar = "js", if = "operand", unless = ["-c"] },
++  { effect = "runs-stdin-as-code", grammar = "js", if = "no-operand", unless = ["-c"] },
++]
++terminal_stdin = "opens-shell"
++
++[command.options]
++"-c|--command" = { value = "required", effects = [{ effect = "runs-text", grammar = "js" }] }
++"-I|--include-path" = { value = "required" }
++"-m|--module" = {}
++"--coverage-prefix" = { value = "required" }
++"--coverage-output" = { value = "required" }
++"--profile" = { value = "optional" }
++"-d|--debugger" = {}
++"--jsversion" = { value = "required" }
++"-h|--help" = {}
++"--version" = {}
++
++[[command]]
++names = ["gdb"]
++example = "gdb -batch -ex info"
++parse = "long"
++effects = [
++  { effect = "runs-file-as-code", grammar = "gdb", reason = "gdb runs ~/.gdbinit and scripts it auto-loads for the program" },
++  { effect = "opens-shell", unless = ["-batch", "-batch-silent"] },
++]
++
++[command.options]
++"-ex|--ex|-eval-command|--eval-command" = { value = "required", effects = [{ effect = "runs-text", grammar = "gdb" }] }
++"-iex|--iex|-init-eval-command|--init-eval-command" = { value = "required", effects = [{ effect = "runs-text", grammar = "gdb" }] }
++"-x|--x|-command|--command" = { value = "required", effects = [{ effect = "runs-file-as-code", grammar = "gdb" }] }
++"-ix|--ix|-init-command|--init-command" = { value = "required", effects = [{ effect = "runs-file-as-code", grammar = "gdb" }] }
++"-batch|--batch" = {}
++"-batch-silent|--batch-silent" = {}
++"-q|-quiet|-silent|--quiet|--silent" = {}
++"-nx|-n|--nx" = {}
++"-nh|--nh" = {}
++"-p|-pid|--pid" = { value = "required" }
++"-c|-core|--core" = { value = "required" }
++"-s|-symbols|--symbols" = { value = "required" }
++"-e|-exec|--exec" = { value = "required" }
++"-se|--se" = { value = "required" }
++"-d|-directory|--directory" = { value = "required" }
++"-cd|--cd" = { value = "required" }
++"-tty|--tty" = { value = "required" }
++"-args|--args" = { last = true }
++"-return-child-result|--return-child-result" = {}
++"-readnow|--readnow" = {}
++"-readnever|--readnever" = {}
++"-tui|--tui" = {}
++"-i|-interpreter|--interpreter" = { value = "required" }
++"-w|-write|--write" = {}
++"-nw|--nw" = {}
++"--configuration" = {}
++"-version|--version" = {}
++"-help|--help" = {}
++"-D|-data-directory|--data-directory" = { value = "required" }
++"-f|-fullname|--fullname" = {}
++"-b" = { value = "required" }
++"-l" = { value = "required" }
++
++[[command]]
++names = ["busybox"]
++example = "busybox true"
++prefix = "busybox"
++parse = "posix"
++effects = [
++  { effect = "runs-command-at", at = 0 },
++  { effect = "opens-shell", reason = "busybox: its applets include shells (sh, ash, hush)" },
++]
++no_command = "nothing"
++terminal_stdin = "inherits"
++note = "The applet is the inner command, classed by its own row."
++
++[command.options]
++"--list" = {}
++"--list-full" = {}
++"--help" = {}
++"--install" = {}
++"-s" = {}
++"--show" = { value = "required" }
++
++[[command]]
++names = ["cpp", "cpp-15", "x86_64-linux-gnu-cpp", "x86_64-linux-gnu-cpp-15"]
++example = "cpp f.c"
++fixed = true
++effects = [{ effect = "runs-file-as-code", grammar = "elf", reason = "cpp loads plugins (-fplugin) and runs programs (-wrapper) its options name" }]
++
++[[command]]
++names = ["bashbug"]
++example = "bashbug"
++fixed = true
++effects = [{ effect = "runs-text", grammar = "sh", reason = "bashbug starts $EDITOR and a mailer" }]
++
++[[command]]
++names = ["git-receive-pack", "git-upload-pack", "git-upload-archive"]
++example = "git-upload-pack ."
++fixed = true
++reason = "not allowlisted (git server side, the same file as git)"
++
++[[command]]
++names = ["perlcalls-bpfcc", "perlflow-bpfcc", "perlstat-bpfcc"]
++example = "perlstat-bpfcc"
++fixed = true
++reason = "not allowlisted (bcc tracing tool, needs root)"
++
++[[command]]
++names = ["clear_console"]
++example = "clear_console"
++fixed = true
++reason = "not allowlisted (clears the console)"
++
++[[command]]
++names = ["dh_bash-completion"]
++example = "dh_bash-completion"
++fixed = true
++effects = [{ effect = "runs-file-as-code", grammar = "sh", reason = "debhelper runs executable package files" }]
++
++# --- setuid, setgid and capability binaries that do not run a command as root ----------
++
++[[command]]
++names = ["passwd", "chfn", "chsh", "chage", "expiry", "gpasswd"]
++example = "passwd"
++fixed = true
++reason = "changes account settings"
++effects = ["reads-terminal"]
++note = "setuid or setgid; they change the caller's own account, and do not run a command."
++
++[[command]]
++names = ["mount", "umount", "fusermount", "fusermount3", "ntfs-3g", "mount.ntfs", "mount.ntfs-3g"]
++example = "mount"
++fixed = true
++reason = "mounts or unmounts a filesystem"
++
++[[command]]
++names = ["unix_chkpwd", "pam_extrausers_chkpwd"]
++example = "unix_chkpwd"
++fixed = true
++reason = "PAM password check helper"
++effects = ["reads-terminal"]
++
++[[command]]
++names = ["pppd"]
++example = "pppd"
++fixed = true
++effects = [{ effect = "runs-text", grammar = "sh", reason = "pppd runs the connect, init and disconnect scripts its options name" }]
++
++[[command]]
++names = ["ping", "ping4", "ping6", "mtr-packet", "nvtop"]
++example = "ping"
++fixed = true
++reason = "not allowlisted (file capability)"
++
++[[command]]
++names = ["ssh-agent"]
++example = "ssh-agent -k"
++prefix = "ssh-agent"
++parse = "posix"
++effects = [{ effect = "runs-command-at", at = 0 }]
++no_command = "nothing"
++terminal_stdin = "inherits"
++note = "setgid. With a command it runs it with the agent's environment."
++
++[command.options]
++"-a" = { value = "required" }
++"-c" = {}
++"-s" = {}
++"-D" = {}
++"-d" = {}
++"-k" = {}
++"-E" = { value = "required" }
++"-P" = { value = "required" }
++"-t" = { value = "required" }
++"-O" = { value = "required" }
++
++# --- wrappers (spec §4) ----------------------------------------------------------------
++
++[[command]]
++names = ["env"]
++example = "env A=1 true"
++prefix = "env"
++parse = "posix"
++effects = [{ effect = "runs-command-at", at = 0, assignments = true }]
++no_command = "nothing"
++terminal_stdin = "inherits"
++note = "uutils env 0.10.0: -a/--argv0 takes a value."
++
++[command.options]
++"-i|--ignore-environment|-" = {}
++"-0|--null" = {}
++"-u|--unset" = { value = "required", name = true }
++"-C|--chdir" = { value = "required" }
++"-S|--split-string" = { value = "required", effects = [{ effect = "runs-text", grammar = "env-split" }] }
++"-a|--argv0" = { value = "required" }
++"-v|--debug" = {}
++"--ignore-signal" = { value = "optional" }
++"--default-signal" = { value = "optional" }
++"--block-signal" = { value = "optional" }
++"--list-signal-handling" = {}
++"-h|--help" = {}
++"-V|--version" = {}
++
++[[command]]
++names = ["nice"]
++example = "nice true"
++prefix = "nice"
++parse = "posix"
++flag_patterns = ["-[0-9]+"]
++effects = [{ effect = "runs-command-at", at = 0 }]
++no_command = "nothing"
++terminal_stdin = "inherits"
++
++[command.options]
++"-n|--adjustment" = { value = "required" }
++"--help" = {}
++"--version" = {}
++
++[[command]]
++names = ["nohup"]
++example = "nohup true"
++prefix = "nohup"
++parse = "posix"
++effects = [{ effect = "runs-command-at", at = 0 }]
++no_command = "nothing"
++terminal_stdin = "inherits"
++
++[command.options]
++"--help" = {}
++"--version" = {}
++
++[[command]]
++names = ["timeout"]
++example = "timeout 5 true"
++prefix = "timeout 5"
++parse = "posix"
++effects = [{ effect = "runs-command-at", at = 1 }]
++no_command = "nothing"
++terminal_stdin = "inherits"
++
++[command.options]
++"--preserve-status" = {}
++"--foreground" = {}
++"-k|--kill-after" = { value = "required" }
++"-s|--signal" = { value = "required" }
++"-v|--verbose" = {}
++"--help" = {}
++"--version" = {}
++
++[[command]]
++names = ["time"]
++example = "time true"
++prefix = "time"
++parse = "posix"
++effects = [{ effect = "runs-command-at", at = 0 }]
++no_command = "nothing"
++terminal_stdin = "inherits"
++note = "The bash keyword and /usr/bin/time."
++
++[command.options]
++"-p|--portability" = {}
++"-f|--format" = { value = "required" }
++"-o|--output" = { value = "required" }
++"-a|--append" = {}
++"-v|--verbose" = {}
++"-q|--quiet" = {}
++"--help" = {}
++"-V|--version" = {}
++
++[[command]]
++names = ["xargs"]
++example = "xargs true"
++prefix = "xargs"
++parse = "posix"
++effects = [{ effect = "runs-command-at", at = 0, appends = true }]
++no_command = "nothing"
++terminal_stdin = "inherits"
++note = "Input becomes arguments, or replaces the replace string (-I, -i, --replace): the gate cannot read those words."
++
++[command.options]
++"-0|--null" = {}
++"-a|--arg-file" = { value = "required" }
++"-d|--delimiter" = { value = "required" }
++"-E" = { value = "required" }
++"-e|--eof" = { value = "optional" }
++"-I" = { value = "required", replace = "{}" }
++"-i|--replace" = { value = "optional", replace = "{}" }
++"-L" = { value = "required" }
++"-l|--max-lines" = { value = "optional" }
++"-n|--max-args" = { value = "required" }
++"-o|--open-tty" = {}
++"-P|--max-procs" = { value = "required" }
++"-p|--interactive" = {}
++"--process-slot-var" = { value = "required" }
++"-r|--no-run-if-empty" = {}
++"-s|--max-chars" = { value = "required" }
++"--show-limits" = {}
++"-t|--verbose" = {}
++"-x|--exit" = {}
++"--help" = {}
++"--version" = {}
++
++[[command]]
++names = ["watch"]
++example = "watch true"
++prefix = "watch"
++parse = "posix"
++effects = [
++  { effect = "runs-command-at", at = 0 },
++  { effect = "runs-text", grammar = "sh", if = "joined-special", unless = ["-x"] },
++]
++no_command = "nothing"
++terminal_stdin = "inherits"
++note = "Without -x, watch joins its words with spaces and runs them with sh -c."
++
++[command.options]
++"-b|--beep" = {}
++"-c|--color" = {}
++"-C|--no-color" = {}
++"-d|--differences" = { value = "optional" }
++"-e|--errexit" = {}
++"-g|--chgexit" = {}
++"-n|--interval" = { value = "required" }
++"-p|--precise" = {}
++"-q|--equexit" = { value = "required" }
++"-r|--no-rerun" = {}
++"-t|--no-title" = {}
++"-w|--no-wrap" = {}
++"-x|--exec" = {}
++"-h|--help" = {}
++"-v|--version" = {}
++
++[[command]]
++names = ["stdbuf"]
++example = "stdbuf -o0 true"
++prefix = "stdbuf -o0"
++parse = "posix"
++effects = [{ effect = "runs-command-at", at = 0 }]
++no_command = "nothing"
++terminal_stdin = "inherits"
++
++[command.options]
++"-i|--input" = { value = "required" }
++"-o|--output" = { value = "required" }
++"-e|--error" = { value = "required" }
++"--help" = {}
++"--version" = {}
++
++[[command]]
++names = ["setsid"]
++example = "setsid true"
++prefix = "setsid"
++parse = "posix"
++effects = [{ effect = "runs-command-at", at = 0 }]
++no_command = "nothing"
++terminal_stdin = "inherits"
++
++[command.options]
++"-c|--ctty" = {}
++"-f|--fork" = {}
++"-w|--wait" = {}
++"-h|--help" = {}
++"-V|--version" = {}
++
++[[command]]
++names = ["flock"]
++example = "flock /tmp/l true"
++prefix = "flock /tmp/l"
++parse = "gnu"
++effects = [{ effect = "runs-command-at", at = 1, unless = ["-c"] }]
++no_command = "nothing"
++terminal_stdin = "inherits"
++note = "`flock file -c text` runs the text with sh; flock reads -c right after the file."
++
++[command.options]
++"-s|--shared" = {}
++"-x|-e|--exclusive" = {}
++"-u|--unlock" = {}
++"-n|--nb|--nonblock" = {}
++"-w|--wait|--timeout" = { value = "required" }
++"-o|--close" = {}
++"-E|--conflict-exit-code" = { value = "required" }
++"-c|--command" = { value = "required", effects = [{ effect = "runs-text", grammar = "sh" }] }
++"-F|--no-fork" = {}
++"--verbose" = {}
++"-h|--help" = {}
++"-V|--version" = {}
++
++[[command]]
++names = ["chroot"]
++example = "chroot / true"
++prefix = "chroot /"
++parse = "posix"
++effects = [{ effect = "runs-command-at", at = 1 }]
++no_command = "opens-shell"
++terminal_stdin = "inherits"
++
++[command.options]
++"--groups" = { value = "required" }
++"--userspec" = { value = "required" }
++"--skip-chdir" = {}
++"--help" = {}
++"--version" = {}
++
++[[command]]
++names = ["unshare"]
++example = "unshare true"
++prefix = "unshare"
++parse = "posix"
++effects = [{ effect = "runs-command-at", at = 0 }]
++no_command = "opens-shell"
++terminal_stdin = "inherits"
++
++[command.options]
++"-m" = {}
++"--mount" = { value = "optional" }
++"-u" = {}
++"--uts" = { value = "optional" }
++"-i" = {}
++"--ipc" = { value = "optional" }
++"-n" = {}
++"--net" = { value = "optional" }
++"-p" = {}
++"--pid" = { value = "optional" }
++"-U" = {}
++"--user" = { value = "optional" }
++"-C" = {}
++"--cgroup" = { value = "optional" }
++"-T" = {}
++"--time" = { value = "optional" }
++"-f|--fork" = {}
++"--kill-child" = { value = "optional" }
++"--mount-proc" = { value = "optional" }
++"--mount-binfmt" = { value = "optional" }
++"--map-user" = { value = "required" }
++"--map-users" = { value = "required" }
++"--map-group" = { value = "required" }
++"--map-groups" = { value = "required" }
++"--map-auto" = {}
++"-r|--map-root-user" = {}
++"-c|--map-current-user" = {}
++"--propagation" = { value = "required" }
++"--setgroups" = { value = "required" }
++"--keep-caps" = {}
++"-R|--root" = { value = "required" }
++"-w|--wd" = { value = "required" }
++"-S|--setuid" = { value = "required" }
++"-G|--setgid" = { value = "required" }
++"--monotonic" = { value = "required" }
++"--boottime" = { value = "required" }
++"-l|--load-interp" = { value = "required" }
++"-h|--help" = {}
++"-V|--version" = {}
++
++[[command]]
++names = ["setpriv"]
++example = "setpriv --no-new-privs true"
++prefix = "setpriv"
++parse = "posix"
++effects = [{ effect = "runs-command-at", at = 0 }]
++no_command = "nothing"
++terminal_stdin = "inherits"
++
++[command.options]
++"-d|--dump" = {}
++"--no-new-privs" = {}
++"--ambient-caps" = { value = "required" }
++"--inh-caps" = { value = "required" }
++"--bounding-set" = { value = "required" }
++"--clear-groups" = {}
++"--groups" = { value = "required" }
++"--keep-groups" = {}
++"--init-groups" = {}
++"--regid" = { value = "required" }
++"--reuid" = { value = "required" }
++"--rgid" = { value = "required" }
++"--ruid" = { value = "required" }
++"--egid" = { value = "required" }
++"--euid" = { value = "required" }
++"--securebits" = { value = "required" }
++"--pdeathsig" = { value = "required" }
++"--selinux-label" = { value = "required" }
++"--apparmor-profile" = { value = "required" }
++"--landlock-access" = { value = "required" }
++"--landlock-rule" = { value = "required" }
++"--seccomp-filter" = { value = "required" }
++"--reset-env" = {}
++"-h|--help" = {}
++"-V|--version" = {}
++
++[[command]]
++names = ["runuser"]
++example = "runuser -u root true"
++prefix = "runuser -u root"
++parse = "posix"
++effects = [
++  { effect = "runs-command-at", at = 0, when = ["-u"] },
++  { effect = "opens-shell", unless = ["-u", "-c", "-C"] },
++  { effect = "runs-text", grammar = "sh", if = "operand", at = 1, unless = ["-u"] },
++]
++no_command = "opens-shell"
++terminal_stdin = "inherits"
++note = "Only root can run it. With -u the rest is a command; without, it works like su."
++
++[command.options]
++"-c|--command" = { value = "required", effects = [{ effect = "runs-text", grammar = "sh" }] }
++"-C|--session-command" = { value = "required", effects = [{ effect = "runs-text", grammar = "sh" }] }
++"-f|--fast" = {}
++"-g|--group" = { value = "required" }
++"-G|--supp-group" = { value = "required" }
++"-l|--login|-" = {}
++"-m|-p|--preserve-environment" = {}
++"-P|--pty" = {}
++"-T|--no-pty" = {}
++"-s|--shell" = { value = "required" }
++"-u|--user" = { value = "required" }
++"-w|--whitelist-environment" = { value = "required" }
++"-h|--help" = {}
++"-V|--version" = {}
++
++[[command]]
++names = ["strace"]
++example = "strace true"
++prefix = "strace"
++parse = "posix"
++effects = [{ effect = "runs-command-at", at = 0 }]
++no_command = "nothing"
++terminal_stdin = "inherits"
++
++[command.options]
++"-o|--output" = { value = "required", effects = [{ effect = "runs-text", grammar = "sh", reason = "strace -o runs a command when its value starts with | or !" }] }
++"-A|--output-append-mode" = {}
++"-c|--summary-only" = {}
++"-C|--summary" = {}
++"-d" = {}
++"-D|--daemonize" = {}
++"-f|--follow-forks" = {}
++"-F" = {}
++"-h|--help" = {}
++"-i|--instruction-pointer" = {}
++"-k|--stack-trace" = {}
++"-n|--syscall-number" = {}
++"-q|--quiet" = {}
++"-r|--relative-timestamps" = {}
++"-t|--absolute-timestamps" = {}
++"-T|--syscall-times" = {}
++"-v|--no-abbrev" = {}
++"-V|--version" = {}
++"-w|--summary-wall-clock" = {}
++"-x" = {}
++"-y|--decode-fds" = {}
++"-z|--successful-only" = {}
++"-Z|--failed-only" = {}
++"--seccomp-bpf" = {}
++"--output-separately" = {}
++"-a|--columns" = { value = "required" }
++"-b|--detach-on" = { value = "required" }
++"-e" = { value = "required" }
++"--trace|--signal|--status|--raw|--read|--write|--inject|--fault|--abbrev|--verbose" = { value = "required" }
++"-E|--env" = { value = "required" }
++"-I" = { value = "required" }
++"-O" = { value = "required" }
++"-p|--attach" = { value = "required" }
++"-P|--trace-path" = { value = "required" }
++"-s|--string-limit" = { value = "required" }
++"-S|--summary-sort-by" = { value = "required" }
++"-u|--user" = { value = "required" }
++"-U|--summary-columns" = { value = "required" }
++"-X|--const-print-style" = { value = "required" }
++
++[[command]]
++names = ["find"]
++example = "find . -name x"
++prefix = "find . -exec"
++parse = "long"
++flag_patterns = ["-newer[aBcmt][aBcmt]"]
++no_command = "nothing"
++terminal_stdin = "inherits"
++note = "-exec and the like run argv up to `;`, or `{} +`. `{}` is a word the gate cannot read."
++
++[command.options]
++"-H" = {}
++"-L" = {}
++"-P" = {}
++"-D" = { value = "required" }
++"-O0|-O1|-O2|-O3" = {}
++"-exec|-execdir|-ok|-okdir" = { effects = [{ effect = "runs-command-at", at = "after", until = [";", "+"] }] }
++"-delete" = { effects = [{ effect = "destroys", reason = "destructive command: find -delete" }] }
++"-fprint|-fprint0|-fls" = { value = "required" }
++"-fprintf" = { value = 2 }
++"-name|-iname|-path|-ipath|-wholename|-iwholename|-regex|-iregex|-regextype" = { value = "required" }
++"-type|-xtype|-size|-mtime|-mmin|-atime|-amin|-ctime|-cmin|-used" = { value = "required" }
++"-newer|-anewer|-cnewer|-samefile|-lname|-ilname" = { value = "required" }
++"-user|-group|-uid|-gid|-perm|-links|-inum" = { value = "required" }
++"-maxdepth|-mindepth|-fstype|-context|-printf|-files0-from" = { value = "required" }
++"-print|-print0|-ls|-prune|-quit|-true|-false|-empty" = {}
++"-readable|-writable|-executable|-nouser|-nogroup" = {}
++"-xdev|-mount|-depth|-d|-follow|-noleaf|-daystart" = {}
++"-ignore_readdir_race|-noignore_readdir_race|-warn|-nowarn" = {}
++"-help|--help|-version|--version" = {}
++"-not|-a|-and|-o|-or|(|)|!|," = {}
++
++# --- destructive commands (spec §4) ----------------------------------------------------
++
++[[command]]
++names = ["rm", "gnurm"]
++example = "rm x"
++parse = "gnu"
++effects = [{ effect = "destroys", if = "nonliteral-operand", reason = "destructive command: rm with an operand the gate cannot read (a glob or an expansion)" }]
++note = "/usr/bin/rm is the file gnurm."
++
++[command.options]
++"-r|-R|--recursive" = { effects = ["destroys"] }
++"-f|--force" = {}
++"-i" = {}
++"-I" = {}
++"--interactive" = { value = "optional" }
++"--one-file-system" = {}
++"--no-preserve-root" = {}
++"--preserve-root" = { value = "optional" }
++"-d|--dir" = {}
++"-v|--verbose" = {}
++"--help" = {}
++"--version" = {}
++
++[[command]]
++names = ["halt", "poweroff", "reboot", "shutdown"]
++example = "reboot"
++fixed = true
++effects = ["destroys"]
++note = "The same file as systemctl; it stops the system."
++
++[[command]]
++names = ["dd"]
++example = "dd if=a of=b"
++fixed = true
++effects = ["destroys"]
++
++[[command]]
++names = ["mke2fs", "mkswap", "mkdosfs", "mkntfs"]
++patterns = ["mkfs*"]
++example = "mkfs.ext4 /dev/null"
++fixed = true
++effects = ["destroys"]
++
++[[command]]
++names = ["wipefs", "shred", "truncate"]
++example = "truncate -s 0 f"
++fixed = true
++effects = ["destroys"]
++
++[[command]]
++names = ["fdisk", "sfdisk", "cfdisk", "parted", "gdisk", "sgdisk", "cgdisk", "fixparts"]
++example = "fdisk -l"
++fixed = true
++effects = ["destroys"]
++
++[[command]]
++names = ["chmod"]
++example = "chmod 644 f"
++parse = "gnu"
++flag_patterns = ["-[rwxXst]+(,.*)?"]
++note = "A mode may start with '-' (`chmod -x f`): flag_patterns reads it as a mode."
++
++[command.options]
++"-R|--recursive" = { effects = ["destroys"] }
++"-c|--changes" = {}
++"-f|--silent|--quiet" = {}
++"-v|--verbose" = {}
++"--no-preserve-root" = {}
++"--preserve-root" = {}
++"--reference" = { value = "required" }
++"--help" = {}
++"--version" = {}
++
++[[command]]
++names = ["chown", "chgrp"]
++example = "chown u f"
++parse = "gnu"
++
++[command.options]
++"-R|--recursive" = { effects = ["destroys"] }
++"-c|--changes" = {}
++"-f|--silent|--quiet" = {}
++"-v|--verbose" = {}
++"-h|--no-dereference" = {}
++"--dereference" = {}
++"-H" = {}
++"-L" = {}
++"-P" = {}
++"--from" = { value = "required" }
++"--no-preserve-root" = {}
++"--preserve-root" = {}
++"--reference" = { value = "required" }
++"--help" = {}
++"--version" = {}
++
++[[command]]
++names = ["kill"]
++example = "kill 1234"
++parse = "posix"
++flag_patterns = ["-[0-9]+", "-(SIG)?[A-Z][A-Z0-9+-]*"]
++effects = [{ effect = "destroys", if = "word:-1", reason = "destructive command: kill -1 signals every process the user can reach" }]
++note = "The bash builtin and /usr/bin/kill."
++
++[command.options]
++"-l|-L|--list|--table" = {}
++"-s|--signal" = { value = "required" }
++"-n" = { value = "required" }
++"-q|--queue" = { value = "required" }
++"-a|--all" = {}
++"-p|--pid" = {}
++"-r|--require-handler" = {}
++"--verbose" = {}
++"--timeout" = { value = 2 }
++"-h|--help" = {}
++"-V|--version" = {}
++
++[[command]]
++names = ["systemctl"]
++example = "systemctl status ssh"
++parse = "gnu"
++
++[command.options]
++"-h|--help" = {}
++"--version" = {}
++"--system" = {}
++"--user" = {}
++"--global" = {}
++"-H|--host" = { value = "required" }
++"-M|--machine" = { value = "required" }
++"-C|--capsule" = { value = "required" }
++"-t|--type" = { value = "required" }
++"--state" = { value = "required" }
++"-p|--property" = { value = "required" }
++"-P" = { value = "required" }
++"-a|--all" = {}
++"-l|--full" = {}
++"-r|--recursive" = {}
++"--reverse" = {}
++"--after" = {}
++"--before" = {}
++"--with-dependencies" = {}
++"--job-mode" = { value = "required" }
++"-T|--show-transaction" = {}
++"--show-types" = {}
++"--value" = {}
++"--check-inhibitors" = { value = "required" }
++"-i" = {}
++"-s|--signal" = { value = "required" }
++"--kill-whom" = { value = "required" }
++"--kill-value" = { value = "required" }
++"--what" = { value = "required" }
++"--now" = {}
++"--dry-run" = {}
++"-q|--quiet" = {}
++"--no-warn" = {}
++"--wait" = {}
++"--no-block" = {}
++"--no-wall" = {}
++"--no-reload" = {}
++"--no-legend" = {}
++"--no-pager" = {}
++"--no-ask-password" = {}
++"--runtime" = {}
++"-f|--force" = {}
++"--message" = { value = "required" }
++"--root" = { value = "required" }
++"--image" = { value = "required" }
++"--image-policy" = { value = "required" }
++"--preset-mode" = { value = "required" }
++"-n|--lines" = { value = "required" }
++"-o|--output" = { value = "required" }
++"--plain" = {}
++"--failed" = {}
++"--firmware-setup" = {}
++"--boot-loader-menu" = { value = "required" }
++"--boot-loader-entry" = { value = "required" }
++"--reboot-argument" = { value = "required" }
++"--timestamp" = { value = "required" }
++"--mkdir" = {}
++"--marked" = {}
++"--read-only" = {}
++"--drop-in" = { value = "required" }
++"--when" = { value = "required" }
++"--legend" = { value = "required" }
++
++[command.subcommands."disable|mask|stop|kill|isolate|poweroff|reboot|halt|kexec|soft-reboot|rescue|emergency|default|switch-root|exit|suspend|hibernate|hybrid-sleep|suspend-then-hibernate|sleep|clean|freeze"]
++effects = ["destroys"]
++
++[[command]]
++names = ["git"]
++example = "git status"
++parse = "posix"
++note = "Only clean, reset and push are described; every other subcommand is the row's default (Conformance rows 8 and 27). The global options -c, --config-env and --exec-path can run code: the class-7 gap (spec §4.1)."
++
++[command.options]
++"-v|--version" = {}
++"-h|--help" = {}
++"-C" = { value = "required" }
++"-c" = { value = "required", gap = "class-7" }
++"--config-env" = { value = "required", gap = "class-7" }
++"--exec-path" = { value = "optional", gap = "class-7" }
++"--html-path" = {}
++"--man-path" = {}
++"--info-path" = {}
++"-p|--paginate" = {}
++"-P|--no-pager" = {}
++"--no-replace-objects" = {}
++"--no-lazy-fetch" = {}
++"--no-optional-locks" = {}
++"--no-advice" = {}
++"--bare" = {}
++"--git-dir" = { value = "required" }
++"--work-tree" = { value = "required" }
++"--namespace" = { value = "required" }
++"--literal-pathspecs" = {}
++"--glob-pathspecs" = {}
++"--noglob-pathspecs" = {}
++"--icase-pathspecs" = {}
++"--list-cmds" = { value = "required" }
++"--attr-source" = { value = "required" }
++
++[command.subcommands.clean]
++parse = "gnu"
++effects = ["destroys"]
++
++[command.subcommands.clean.options]
++"-d" = {}
++"-f|--force" = {}
++"-i|--interactive" = {}
++"-n|--dry-run" = {}
++"-q|--quiet" = {}
++"-e|--exclude" = { value = "required" }
++"-x" = {}
++"-X" = {}
++
++[command.subcommands.reset]
++parse = "gnu"
++
++[command.subcommands.reset.options]
++"--hard" = { effects = ["destroys"] }
++"--keep" = {}
++"--merge" = {}
++"--mixed" = {}
++"--soft" = {}
++"-q|--quiet" = {}
++"--no-quiet" = {}
++"-p|--patch" = {}
++"-N|--intent-to-add" = {}
++"--recurse-submodules" = { value = "optional" }
++"--no-recurse-submodules" = {}
++"--pathspec-from-file" = { value = "required" }
++"--pathspec-file-nul" = {}
++"--refresh" = {}
++"--no-refresh" = {}
++"-U|--unified" = { value = "required" }
++"--inter-hunk-context" = { value = "required" }
++
++[command.subcommands.push]
++parse = "gnu"
++effects = [
++  { effect = "destroys", if = "operand-prefix:+", reason = "destructive command: git push of a +refspec (a force push)" },
++  { effect = "destroys", if = "operand-prefix::", reason = "destructive command: git push of a :refspec (deletes a remote branch)" },
++]
++
++[command.subcommands.push.options]
++"-f|--force" = { effects = ["destroys"] }
++"--force-with-lease" = { value = "optional", effects = ["destroys"] }
++"--force-if-includes" = { effects = ["destroys"] }
++"--mirror" = { effects = ["destroys"] }
++"-d|--delete" = { effects = ["destroys"] }
++"--prune" = { effects = ["destroys"] }
++"--all|--branches" = {}
++"--tags" = {}
++"--follow-tags" = {}
++"--no-follow-tags" = {}
++"-n|--dry-run" = {}
++"--porcelain" = {}
++"-u|--set-upstream" = {}
++"--thin" = {}
++"--no-thin" = {}
++"-q|--quiet" = {}
++"-v|--verbose" = {}
++"--progress" = {}
++"--no-progress" = {}
++"--no-verify" = {}
++"--verify" = {}
++"--atomic" = {}
++"--no-atomic" = {}
++"-4|--ipv4" = {}
++"-6|--ipv6" = {}
++"--signed" = { value = "optional" }
++"--no-signed" = {}
++"-o|--push-option" = { value = "required" }
++"--repo" = { value = "required" }
++"--receive-pack|--exec" = { value = "required", effects = [{ effect = "runs-text", grammar = "remote-sh" }] }
++"--recurse-submodules" = { value = "required" }
++"--no-recurse-submodules" = {}
++
++[[command]]
++names = ["tar"]
++example = "tar -tf a.tar"
++parse = "gnu"
++old_style = true
++note = "--to-command is the class-7 gap (spec §4.1); the other code-running options are text effects."
++
++[command.options]
++"--to-command" = { value = "required", gap = "class-7" }
++"-I|--use-compress-program" = { value = "required", effects = [{ effect = "runs-text", grammar = "sh" }] }
++"--checkpoint-action" = { value = "required", effects = [{ effect = "runs-text", grammar = "sh" }] }
++"--rsh-command|--rmt-command" = { value = "required", effects = [{ effect = "runs-text", grammar = "sh" }] }
++"-F|--info-script|--new-volume-script" = { value = "required", effects = [{ effect = "runs-file-as-code", grammar = "sh" }] }
++"--remove-files" = { effects = [{ effect = "destroys", reason = "destructive command: tar --remove-files" }] }
++"-A|--catenate|--concatenate" = {}
++"-c|--create" = {}
++"-d|--diff|--compare" = {}
++"--delete" = {}
++"-r|--append" = {}
++"-t|--list" = {}
++"--test-label" = {}
++"-u|--update" = {}
++"-x|--extract|--get" = {}
++"-f|--file" = { value = "required" }
++"-C|--directory" = { value = "required" }
++"-v|--verbose" = {}
++"-z|--gzip|--gunzip|--ungzip" = {}
++"-j|--bzip2" = {}
++"-J|--xz" = {}
++"--zstd" = {}
++"--lzma" = {}
++"--lzip" = {}
++"--lzop" = {}
++"-Z|--compress|--uncompress" = {}
++"-a|--auto-compress" = {}
++"-p|--preserve-permissions|--same-permissions" = {}
++"--same-owner" = {}
++"--no-same-owner" = {}
++"--no-same-permissions" = {}
++"-k|--keep-old-files" = {}
++"--keep-newer-files" = {}
++"--skip-old-files" = {}
++"--overwrite" = {}
++"--overwrite-dir" = {}
++"--no-overwrite-dir" = {}
++"-U|--unlink-first" = {}
++"--recursive-unlink" = {}
++"-m|--touch" = {}
++"-O|--to-stdout" = {}
++"-P|--absolute-names" = {}
++"-h|--dereference" = {}
++"--hard-dereference" = {}
++"-S|--sparse" = {}
++"-W|--verify" = {}
++"-w|--interactive|--confirmation" = {}
++"-T|--files-from" = { value = "required" }
++"-X|--exclude-from" = { value = "required" }
++"--exclude" = { value = "required" }
++"--exclude-vcs" = {}
++"--exclude-vcs-ignores" = {}
++"--exclude-caches" = {}
++"--exclude-backups" = {}
++"--strip-components" = { value = "required" }
++"--transform|--xform" = { value = "required" }
++"--wildcards" = {}
++"--no-wildcards" = {}
++"--anchored" = {}
++"--no-anchored" = {}
++"--owner" = { value = "required" }
++"--group" = { value = "required" }
++"--mode" = { value = "required" }
++"--mtime" = { value = "required" }
++"--numeric-owner" = {}
++"--one-file-system" = {}
++"-g|--listed-incremental" = { value = "required" }
++"-G|--incremental" = {}
++"-l|--check-links" = {}
++"-b|--blocking-factor" = { value = "required" }
++"-B|--read-full-records" = {}
++"-i|--ignore-zeros" = {}
++"-M|--multi-volume" = {}
++"-L|--tape-length" = { value = "required" }
++"-N|--newer|--after-date" = { value = "required" }
++"--newer-mtime" = { value = "required" }
++"-R|--block-number" = {}
++"-s|--preserve-order|--same-order" = {}
++"-V|--label" = { value = "required" }
++"--totals" = { value = "optional" }
++"--checkpoint" = { value = "optional" }
++"--show-transformed-names" = {}
++"--no-recursion" = {}
++"--recursion" = {}
++"--null" = {}
++"--warning" = { value = "required" }
++"-H|--format" = { value = "required" }
++"--posix" = {}
++"--acls" = {}
++"--no-acls" = {}
++"--xattrs" = {}
++"--no-xattrs" = {}
++"--selinux" = {}
++"--no-selinux" = {}
++"--sort" = { value = "required" }
++"--ignore-failed-read" = {}
++"--force-local" = {}
++"-?|--help" = {}
++"--usage" = {}
++"--version" = {}
++
++[[command]]
++names = ["ssh"]
++example = "ssh h"
++parse = "posix"
++effects = [{ effect = "runs-text", grammar = "remote-sh", if = "operand", at = 1 }]
++note = "Words after the host are a command for the remote shell. -o is the class-7 gap (spec §4.1)."
++
++[command.options]
++"-o" = { value = "required", gap = "class-7" }
++"-F" = { value = "required", effects = [{ effect = "runs-file-as-code", grammar = "ssh-config" }] }
++"-I" = { value = "required", effects = [{ effect = "runs-file-as-code", grammar = "elf" }] }
++"-4" = {}
++"-6" = {}
++"-A" = {}
++"-a" = {}
++"-C" = {}
++"-f" = {}
++"-G" = {}
++"-g" = {}
++"-K" = {}
++"-k" = {}
++"-M" = {}
++"-N" = {}
++"-n" = {}
++"-q" = {}
++"-s" = {}
++"-T" = {}
++"-t" = {}
++"-V" = {}
++"-v" = {}
++"-X" = {}
++"-x" = {}
++"-Y" = {}
++"-y" = {}
++"-B" = { value = "required" }
++"-b" = { value = "required" }
++"-c" = { value = "required" }
++"-D" = { value = "required" }
++"-E" = { value = "required" }
++"-e" = { value = "required" }
++"-i" = { value = "required" }
++"-J" = { value = "required" }
++"-L" = { value = "required" }
++"-l" = { value = "required" }
++"-m" = { value = "required" }
++"-O" = { value = "required" }
++"-P" = { value = "required" }
++"-p" = { value = "required" }
++"-Q" = { value = "required" }
++"-R" = { value = "required" }
++"-S" = { value = "required" }
++"-W" = { value = "required" }
++"-w" = { value = "required" }
++
++# --- builtins (spec §3) ----------------------------------------------------------------
++
++[[command]]
++names = ["alias"]
++example = "alias ll='ls -l'"
++parse = "posix"
++effects = ["alters-session"]
++
++[command.options]
++"-p" = {}
++
++[[command]]
++names = ["unalias"]
++example = "unalias ll"
++parse = "posix"
++effects = ["alters-session"]
++
++[command.options]
++"-a" = {}
++
++[[command]]
++names = ["source", "."]
++example = ". ./f"
++parse = "posix"
++effects = ["alters-session", { effect = "runs-file-as-code", grammar = "bash", if = "operand" }]
++
++[command.options]
++"-p" = { value = "required" }
++
++[[command]]
++names = ["eval"]
++example = "eval true"
++parse = "posix"
++effects = ["alters-session", { effect = "runs-text", grammar = "bash", if = "operand" }]
++
++[[command]]
++names = ["exec"]
++example = "exec true"
++prefix = "exec"
++parse = "posix"
++effects = ["alters-session", { effect = "runs-command-at", at = 0 }]
++no_command = "nothing"
++terminal_stdin = "inherits"
++
++[command.options]
++"-c" = {}
++"-l" = {}
++"-a" = { value = "required" }
++
++[[command]]
++names = ["trap"]
++example = "trap -p"
++parse = "posix"
++effects = ["alters-session", { effect = "stores-code", grammar = "bash", if = "operand" }]
++
++[command.options]
++"-l" = {}
++"-p" = {}
++"-P" = {}
++
++[[command]]
++names = ["enable"]
++example = "enable -n test"
++parse = "posix"
++effects = ["alters-session"]
++
++[command.options]
++"-a" = {}
++"-d" = {}
++"-n" = {}
++"-p" = {}
++"-s" = {}
++"-f" = { value = "required", effects = [{ effect = "runs-file-as-code", grammar = "elf" }] }
++
++[[command]]
++names = ["set"]
++example = "set -e"
++parse = "posix"
++plus = true
++effects = ["alters-session"]
++
++[command.options]
++"-a" = {}
++"-b" = {}
++"-e" = {}
++"-f" = {}
++"-h" = {}
++"-k" = {}
++"-m" = {}
++"-n" = {}
++"-p" = {}
++"-t" = {}
++"-u" = {}
++"-v" = {}
++"-x" = {}
++"-B" = {}
++"-C" = {}
++"-E" = {}
++"-H" = {}
++"-P" = {}
++"-T" = {}
++"-o" = { value = "required" }
++
++[[command]]
++names = ["shopt"]
++example = "shopt -s nullglob"
++parse = "posix"
++effects = ["alters-session"]
++
++[command.options]
++"-p" = {}
++"-q" = {}
++"-s" = {}
++"-u" = {}
++"-o" = {}
++
++[[command]]
++names = ["bind"]
++example = "bind -l"
++parse = "posix"
++effects = ["alters-session"]
++
++[command.options]
++"-m" = { value = "required" }
++"-l" = {}
++"-p" = {}
++"-P" = {}
++"-s" = {}
++"-S" = {}
++"-v" = {}
++"-V" = {}
++"-X" = {}
++"-q" = { value = "required" }
++"-u" = { value = "required" }
++"-r" = { value = "required" }
++"-f" = { value = "required" }
++"-x" = { value = "required", effects = [{ effect = "stores-code", grammar = "bash" }] }
++
++[[command]]
++names = ["complete"]
++example = "complete -p"
++parse = "posix"
++effects = ["alters-session"]
++
++[command.options]
++"-a" = {}
++"-b" = {}
++"-c" = {}
++"-d" = {}
++"-e" = {}
++"-f" = {}
++"-g" = {}
++"-j" = {}
++"-k" = {}
++"-s" = {}
++"-u" = {}
++"-v" = {}
++"-D" = {}
++"-E" = {}
++"-I" = {}
++"-p" = {}
++"-r" = {}
++"-o" = { value = "required" }
++"-A" = { value = "required" }
++"-G" = { value = "required" }
++"-X" = { value = "required" }
++"-P" = { value = "required" }
++"-S" = { value = "required" }
++"-F" = { value = "required" }
++"-W" = { value = "required", effects = [{ effect = "stores-code", grammar = "bash" }] }
++"-C" = { value = "required", effects = [{ effect = "stores-code", grammar = "bash" }] }
++
++[[command]]
++names = ["hash"]
++example = "hash -r"
++parse = "posix"
++effects = ["alters-session"]
++
++[command.options]
++"-r" = {}
++"-d" = {}
++"-l" = {}
++"-t" = {}
++"-p" = { value = "required" }
++
++[[command]]
++names = ["builtin"]
++example = "builtin true"
++prefix = "builtin"
++parse = "posix"
++effects = ["alters-session", { effect = "runs-command-at", at = 0 }]
++no_command = "nothing"
++terminal_stdin = "inherits"
++
++[[command]]
++names = ["command"]
++example = "command true"
++prefix = "command"
++parse = "posix"
++effects = [
++  { effect = "alters-session", unless = ["-v", "-V"] },
++  { effect = "runs-command-at", at = 0, unless = ["-v", "-V"] },
++]
++no_command = "nothing"
++terminal_stdin = "inherits"
++note = "command -v and -V only look a name up (spec §3)."
++
++[command.options]
++"-p" = {}
++"-v" = {}
++"-V" = {}
++
++[[command]]
++names = ["export"]
++example = "export A=1"
++parse = "posix"
++effects = ["alters-session", { effect = "sets-variable", scope = "session", name = true }]
++
++[command.options]
++"-f" = {}
++"-n" = {}
++"-p" = {}
++
++[[command]]
++names = ["declare", "typeset", "local"]
++example = "declare A=1"
++parse = "posix"
++plus = true
++effects = [{ effect = "sets-variable", scope = "session", if = "assignment", name = true }]
++note = "Session-altering with an assignment (spec §3)."
++
++[command.options]
++"-a" = {}
++"-A" = {}
++"-f" = {}
++"-F" = {}
++"-g" = {}
++"-i" = {}
++"-I" = {}
++"-l" = {}
++"-n" = {}
++"-r" = {}
++"-t" = {}
++"-u" = {}
++"-x" = {}
++"-p" = {}
++
++[[command]]
++names = ["readonly"]
++example = "readonly A=1"
++parse = "posix"
++effects = [{ effect = "sets-variable", scope = "session", if = "assignment", name = true }]
++
++[command.options]
++"-a" = {}
++"-A" = {}
++"-f" = {}
++"-p" = {}
++
++[[command]]
++names = ["unset"]
++example = "unset A"
++parse = "posix"
++effects = ["alters-session", { effect = "sets-variable", scope = "session", name = true }]
++
++[command.options]
++"-f" = {}
++"-v" = {}
++"-n" = {}
+diff --git a/targets/ubuntu-26.04/gate-vectors.toml b/targets/ubuntu-26.04/gate-vectors.toml
+index 722ae35..cddcab7 100644
+--- a/targets/ubuntu-26.04/gate-vectors.toml
++++ b/targets/ubuntu-26.04/gate-vectors.toml
+@@ -1,9 +1,10 @@
+ # Policy-gate conformance vectors for the ubuntu-26.04 target
+ # (docs/design/specs/policy-gate/v1.md, Conformance). Loaded by nl_shell.gate.vectors.
+ #
+-# This file holds the rows landed so far: the shell-layer rows of #196. It is not the
+-# complete set the spec's Conformance section asks for; it becomes complete only when
+-# #192 (live-session resolution) lands. #197 and #198 add their rows here.
++# This file holds the rows landed so far: the shell-layer rows of #196 and the
++# command-layer rows of #204 (appended at the end). It is not the complete set the
++# spec's Conformance section asks for; it becomes complete only when #192 (live-session
++# resolution) lands. #198 adds its rows here.
+ #
+ # Keys: command, origin ("proposal" | "typed"), rejected; class (required unless
+ # rejected, absent when rejected); optional reason (a substring some reason must
+@@ -46,7 +47,7 @@ row = 16
+ command = "$'\\x72m' -rf ~"
+ origin = "typed"
+ rejected = false
+-class = "mutating"
++class = "destructive"
+ reason = "command word is not a literal"
+ 
+ [[vector]]
+@@ -77,3 +78,137 @@ origin = "typed"
+ rejected = false
+ class = "mutating"
+ reason = "unparseable"
++
++# --- command layer (#204) ---------------------------------------------------------------
++
++[[vector]]
++row = 8
++command = "git -c core.pager=sh log"
++origin = "typed"
++rejected = false
++class = "mutating"
++reason = "not allowlisted"
++
++[[vector]]
++row = 9
++command = 'find . -exec rm {} \;'
++origin = "typed"
++rejected = false
++class = "destructive"
++reason = "rm with an operand the gate cannot read"
++
++[[vector]]
++row = 10
++command = "awk 'BEGIN{system(\"id\")}'"
++origin = "typed"
++rejected = false
++class = "mutating"
++reason = "not allowlisted"
++
++[[vector]]
++row = 11
++command = "sed '1e id' f"
++origin = "typed"
++rejected = false
++class = "mutating"
++reason = "not allowlisted"
++
++[[vector]]
++row = 12
++command = "sort --compress-program=sh f"
++origin = "typed"
++rejected = false
++class = "mutating"
++reason = "not allowlisted"
++
++[[vector]]
++row = 17
++command = "\"r\"m -rf ~"
++origin = "typed"
++rejected = false
++class = "destructive"
++reason = "destructive command: rm -r"
++
++[[vector]]
++row = 18
++command = "ls; rm -rf ~"
++origin = "typed"
++rejected = false
++class = "destructive"
++reason = "destructive command: rm -r"
++
++[[vector]]
++row = 21
++command = "sudo -S true"
++origin = "typed"
++rejected = true
++reason = "sudo -S"
++
++[[vector]]
++row = 21
++command = "sudo -p x true"
++origin = "typed"
++rejected = true
++reason = "sudo -p"
++
++[[vector]]
++row = 21
++command = "sudo -A true"
++origin = "typed"
++rejected = true
++reason = "sudo -A"
++
++[[vector]]
++row = 22
++command = "echo pw | sudo -S true"
++origin = "typed"
++rejected = true
++reason = "pipe, here-doc or here-string into sudo"
++
++[[vector]]
++row = 24
++command = "sudo apt update"
++origin = "typed"
++rejected = false
++class = "privileged"
++reason = "elevating command: sudo"
++
++[[vector]]
++row = 26
++command = "rm -rf build"
++origin = "typed"
++rejected = false
++class = "destructive"
++reason = "destructive command: rm -r"
++
++[[vector]]
++row = 27
++command = "git status"
++origin = "typed"
++rejected = false
++class = "mutating"
++reason = "not allowlisted"
++
++[[vector]]
++row = 29
++command = "systemctl stop ssh"
++origin = "typed"
++rejected = false
++class = "destructive"
++reason = "destructive command: systemctl stop"
++
++[[vector]]
++row = 32
++command = "env rm -rf x"
++origin = "typed"
++rejected = false
++class = "destructive"
++reason = "destructive command: rm -r"
++
++[[vector]]
++row = 33
++command = "alias ll='ls -l'"
++origin = "typed"
++rejected = false
++class = "session-altering"
++reason = "builtin alters the session: alias"
+diff --git a/targets/ubuntu-26.04/inventory.toml b/targets/ubuntu-26.04/inventory.toml
+new file mode 100644
+index 0000000..43d5226
+--- /dev/null
++++ b/targets/ubuntu-26.04/inventory.toml
+@@ -0,0 +1,674 @@
++# Binaries on the ubuntu-26.04 target that elevate, or that run a shell or an
++# interpreter (spec policy-gate/v1 §4.1, class 1). Every name here MUST have a row in
++# commands.toml (tests/test_gate_commands.py checks it).
++#
++# GENERATED by scripts/harvest_inventory.py on the reference host; do not edit by hand.
++# Reviewed like an allowlist change. Drift against the host is judged by a human at
++# review (re-run the script there and diff), not by a test.
++
++host_version = "26.04.1 LTS (Resolute Raccoon)"
++
++[[binary]]
++name = "bash"
++paths = ["/bin/bash", "/usr/bin/bash"]
++why = ["/etc/shells", "a row's binary", "dpkg package bash", "same file as /usr/bin/bash"]
++
++[[binary]]
++name = "bashbug"
++paths = ["/usr/bin/bashbug"]
++why = ["a row's binary", "dpkg package bash"]
++
++[[binary]]
++name = "busybox"
++paths = ["/usr/bin/busybox"]
++why = ["a row's binary", "dpkg package busybox-static", "name pattern"]
++
++[[binary]]
++name = "cfdisk"
++paths = ["/usr/sbin/cfdisk"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "cgdisk"
++paths = ["/usr/sbin/cgdisk"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "chage"
++paths = ["/usr/bin/chage"]
++why = ["a row's binary", "setgid"]
++
++[[binary]]
++name = "chfn"
++paths = ["/usr/bin/chfn"]
++why = ["a row's binary", "setuid"]
++
++[[binary]]
++name = "chgrp"
++paths = ["/usr/bin/chgrp"]
++why = ["same file as /usr/lib/cargo/bin/coreutils/chgrp"]
++
++[[binary]]
++name = "chmod"
++paths = ["/usr/bin/chmod"]
++why = ["same file as /usr/lib/cargo/bin/coreutils/chmod"]
++
++[[binary]]
++name = "chown"
++paths = ["/usr/bin/chown"]
++why = ["same file as /usr/lib/cargo/bin/coreutils/chown"]
++
++[[binary]]
++name = "chroot"
++paths = ["/usr/bin/chroot"]
++why = ["same file as /usr/lib/cargo/bin/coreutils/chroot"]
++
++[[binary]]
++name = "chsh"
++paths = ["/usr/bin/chsh"]
++why = ["a row's binary", "setuid"]
++
++[[binary]]
++name = "clear_console"
++paths = ["/usr/bin/clear_console"]
++why = ["a row's binary", "dpkg package bash"]
++
++[[binary]]
++name = "cpp"
++paths = ["/usr/bin/cpp"]
++why = ["dpkg package cpp", "same file as /usr/bin/x86_64-linux-gnu-cpp-15"]
++
++[[binary]]
++name = "cpp-15"
++paths = ["/usr/bin/cpp-15"]
++why = ["dpkg package cpp-15", "same file as /usr/bin/x86_64-linux-gnu-cpp-15"]
++
++[[binary]]
++name = "crontab"
++paths = ["/usr/bin/crontab"]
++why = ["a row's binary", "setgid"]
++
++[[binary]]
++name = "dash"
++paths = ["/usr/bin/dash"]
++why = ["/etc/shells", "a row's binary", "dpkg package dash"]
++
++[[binary]]
++name = "dd"
++paths = ["/usr/bin/dd"]
++why = ["same file as /usr/lib/cargo/bin/coreutils/dd"]
++
++[[binary]]
++name = "dh_bash-completion"
++paths = ["/usr/bin/dh_bash-completion"]
++why = ["a row's binary", "dpkg package bash-completion"]
++
++[[binary]]
++name = "env"
++paths = ["/usr/bin/env"]
++why = ["same file as /usr/lib/cargo/bin/coreutils/env"]
++
++[[binary]]
++name = "expiry"
++paths = ["/usr/bin/expiry"]
++why = ["a row's binary", "setgid"]
++
++[[binary]]
++name = "fdisk"
++paths = ["/usr/sbin/fdisk"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "find"
++paths = ["/usr/bin/find"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "fixparts"
++paths = ["/usr/sbin/fixparts"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "flock"
++paths = ["/usr/bin/flock"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "fusermount"
++paths = ["/usr/bin/fusermount"]
++why = ["same file as /usr/bin/fusermount3"]
++
++[[binary]]
++name = "fusermount3"
++paths = ["/usr/bin/fusermount3"]
++why = ["a row's binary", "setuid"]
++
++[[binary]]
++name = "gdb"
++paths = ["/usr/bin/gdb"]
++why = ["a row's binary", "name pattern"]
++
++[[binary]]
++name = "gdisk"
++paths = ["/usr/sbin/gdisk"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "git"
++paths = ["/usr/bin/git"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "git-receive-pack"
++paths = ["/usr/bin/git-receive-pack"]
++why = ["same file as /usr/bin/git"]
++
++[[binary]]
++name = "git-upload-archive"
++paths = ["/usr/bin/git-upload-archive"]
++why = ["same file as /usr/bin/git"]
++
++[[binary]]
++name = "git-upload-pack"
++paths = ["/usr/bin/git-upload-pack"]
++why = ["same file as /usr/bin/git"]
++
++[[binary]]
++name = "gjs"
++paths = ["/usr/bin/gjs"]
++why = ["dpkg package gjs", "same file as /usr/bin/gjs-console"]
++
++[[binary]]
++name = "gjs-console"
++paths = ["/usr/bin/gjs-console"]
++why = ["a row's binary", "dpkg package gjs"]
++
++[[binary]]
++name = "gnurm"
++paths = ["/usr/bin/gnurm"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "gpasswd"
++paths = ["/usr/bin/gpasswd"]
++why = ["a row's binary", "setuid"]
++
++[[binary]]
++name = "halt"
++paths = ["/usr/sbin/halt"]
++why = ["same file as /usr/bin/systemctl"]
++
++[[binary]]
++name = "kill"
++paths = ["/usr/bin/kill"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "mkdosfs"
++paths = ["/usr/sbin/mkdosfs"]
++why = ["same file as /usr/sbin/mkfs.fat"]
++
++[[binary]]
++name = "mke2fs"
++paths = ["/usr/sbin/mke2fs"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "mkfs"
++paths = ["/usr/sbin/mkfs"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "mkfs.exfat"
++paths = ["/usr/sbin/mkfs.exfat"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "mkfs.ext2"
++paths = ["/usr/sbin/mkfs.ext2"]
++why = ["same file as /usr/sbin/mke2fs"]
++
++[[binary]]
++name = "mkfs.ext3"
++paths = ["/usr/sbin/mkfs.ext3"]
++why = ["same file as /usr/sbin/mke2fs"]
++
++[[binary]]
++name = "mkfs.ext4"
++paths = ["/usr/sbin/mkfs.ext4"]
++why = ["same file as /usr/sbin/mke2fs"]
++
++[[binary]]
++name = "mkfs.fat"
++paths = ["/usr/sbin/mkfs.fat"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "mkfs.msdos"
++paths = ["/usr/sbin/mkfs.msdos"]
++why = ["same file as /usr/sbin/mkfs.fat"]
++
++[[binary]]
++name = "mkfs.ntfs"
++paths = ["/usr/sbin/mkfs.ntfs"]
++why = ["same file as /usr/sbin/mkntfs"]
++
++[[binary]]
++name = "mkfs.vfat"
++paths = ["/usr/sbin/mkfs.vfat"]
++why = ["same file as /usr/sbin/mkfs.fat"]
++
++[[binary]]
++name = "mkntfs"
++paths = ["/usr/sbin/mkntfs"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "mkswap"
++paths = ["/usr/sbin/mkswap"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "mount"
++paths = ["/usr/bin/mount"]
++why = ["a row's binary", "setuid"]
++
++[[binary]]
++name = "mount.ntfs"
++paths = ["/usr/sbin/mount.ntfs"]
++why = ["same file as /usr/bin/ntfs-3g"]
++
++[[binary]]
++name = "mount.ntfs-3g"
++paths = ["/usr/sbin/mount.ntfs-3g"]
++why = ["same file as /usr/bin/ntfs-3g"]
++
++[[binary]]
++name = "mtr-packet"
++paths = ["/usr/bin/mtr-packet"]
++why = ["a row's binary", "file capability"]
++
++[[binary]]
++name = "nice"
++paths = ["/usr/bin/nice"]
++why = ["same file as /usr/lib/cargo/bin/coreutils/nice"]
++
++[[binary]]
++name = "nohup"
++paths = ["/usr/bin/nohup"]
++why = ["same file as /usr/lib/cargo/bin/coreutils/nohup"]
++
++[[binary]]
++name = "ntfs-3g"
++paths = ["/usr/bin/ntfs-3g"]
++why = ["a row's binary", "setuid"]
++
++[[binary]]
++name = "nvtop"
++paths = ["/usr/bin/nvtop"]
++why = ["a row's binary", "file capability"]
++
++[[binary]]
++name = "pam_extrausers_chkpwd"
++paths = ["/usr/sbin/pam_extrausers_chkpwd"]
++why = ["a row's binary", "setgid"]
++
++[[binary]]
++name = "parted"
++paths = ["/usr/sbin/parted"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "passwd"
++paths = ["/usr/bin/passwd"]
++why = ["a row's binary", "setuid"]
++
++[[binary]]
++name = "perl"
++paths = ["/usr/bin/perl"]
++why = ["a row's binary", "name pattern"]
++
++[[binary]]
++name = "perl5.40-x86_64-linux-gnu"
++paths = ["/usr/bin/perl5.40-x86_64-linux-gnu"]
++why = ["a row's binary", "name pattern"]
++
++[[binary]]
++name = "perl5.40.1"
++paths = ["/usr/bin/perl5.40.1"]
++why = ["a row's binary", "name pattern"]
++
++[[binary]]
++name = "perlbug"
++paths = ["/usr/bin/perlbug"]
++why = ["a row's binary", "name pattern"]
++
++[[binary]]
++name = "perlcalls-bpfcc"
++paths = ["/usr/sbin/perlcalls-bpfcc"]
++why = ["a row's binary", "name pattern"]
++
++[[binary]]
++name = "perldoc"
++paths = ["/usr/bin/perldoc"]
++why = ["a row's binary", "name pattern"]
++
++[[binary]]
++name = "perlflow-bpfcc"
++paths = ["/usr/sbin/perlflow-bpfcc"]
++why = ["a row's binary", "name pattern"]
++
++[[binary]]
++name = "perli11ndoc"
++paths = ["/usr/bin/perli11ndoc"]
++why = ["a row's binary", "name pattern"]
++
++[[binary]]
++name = "perlivp"
++paths = ["/usr/bin/perlivp"]
++why = ["a row's binary", "name pattern"]
++
++[[binary]]
++name = "perlstat-bpfcc"
++paths = ["/usr/sbin/perlstat-bpfcc"]
++why = ["a row's binary", "name pattern"]
++
++[[binary]]
++name = "perltex"
++paths = ["/usr/bin/perltex"]
++why = ["name pattern", "same file as /usr/share/texlive/texmf-dist/scripts/perltex/perltex.pl"]
++
++[[binary]]
++name = "perlthanks"
++paths = ["/usr/bin/perlthanks"]
++why = ["a row's binary", "name pattern"]
++
++[[binary]]
++name = "ping"
++paths = ["/usr/bin/ping"]
++why = ["a row's binary", "file capability"]
++
++[[binary]]
++name = "ping4"
++paths = ["/usr/bin/ping4"]
++why = ["same file as /usr/bin/ping"]
++
++[[binary]]
++name = "ping6"
++paths = ["/usr/bin/ping6"]
++why = ["same file as /usr/bin/ping"]
++
++[[binary]]
++name = "pkexec"
++paths = ["/usr/bin/pkexec"]
++why = ["a row's binary", "setuid"]
++
++[[binary]]
++name = "poweroff"
++paths = ["/usr/sbin/poweroff"]
++why = ["same file as /usr/bin/systemctl"]
++
++[[binary]]
++name = "pppd"
++paths = ["/usr/sbin/pppd"]
++why = ["a row's binary", "setuid"]
++
++[[binary]]
++name = "ptyxis"
++paths = ["/usr/bin/ptyxis"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "python3"
++paths = ["/usr/bin/python3"]
++why = ["name pattern", "same file as /usr/bin/python3.14"]
++
++[[binary]]
++name = "python3-config"
++paths = ["/usr/bin/python3-config"]
++why = ["name pattern", "same file as /usr/bin/x86_64-linux-gnu-python3.14-config"]
++
++[[binary]]
++name = "python3.14"
++paths = ["/usr/bin/python3.14"]
++why = ["a row's binary", "name pattern"]
++
++[[binary]]
++name = "python3.14-config"
++paths = ["/usr/bin/python3.14-config"]
++why = ["name pattern", "same file as /usr/bin/x86_64-linux-gnu-python3.14-config"]
++
++[[binary]]
++name = "rbash"
++paths = ["/bin/rbash", "/usr/bin/rbash"]
++why = ["/etc/shells", "dpkg package bash", "same file as /usr/bin/bash"]
++
++[[binary]]
++name = "reboot"
++paths = ["/usr/sbin/reboot"]
++why = ["same file as /usr/bin/systemctl"]
++
++[[binary]]
++name = "rm"
++paths = ["/usr/bin/rm"]
++why = ["same file as /usr/bin/gnurm"]
++
++[[binary]]
++name = "run0"
++paths = ["/usr/bin/run0"]
++why = ["same file as /usr/bin/systemd-run"]
++
++[[binary]]
++name = "runuser"
++paths = ["/usr/sbin/runuser"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "screen"
++paths = ["/usr/bin/screen"]
++why = ["/etc/shells", "a row's binary"]
++
++[[binary]]
++name = "script"
++paths = ["/usr/bin/script"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "setpriv"
++paths = ["/usr/bin/setpriv"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "setsid"
++paths = ["/usr/bin/setsid"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "sfdisk"
++paths = ["/usr/sbin/sfdisk"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "sgdisk"
++paths = ["/usr/sbin/sgdisk"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "sh"
++paths = ["/bin/sh", "/usr/bin/sh"]
++why = ["/etc/shells", "dpkg package dash", "same file as /usr/bin/dash"]
++
++[[binary]]
++name = "shred"
++paths = ["/usr/bin/shred"]
++why = ["same file as /usr/lib/cargo/bin/coreutils/shred"]
++
++[[binary]]
++name = "shutdown"
++paths = ["/usr/sbin/shutdown"]
++why = ["same file as /usr/bin/systemctl"]
++
++[[binary]]
++name = "ssh"
++paths = ["/usr/bin/ssh"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "ssh-agent"
++paths = ["/usr/bin/ssh-agent"]
++why = ["a row's binary", "setgid"]
++
++[[binary]]
++name = "static-sh"
++paths = ["/usr/bin/static-sh"]
++why = ["dpkg package busybox-static", "same file as /usr/bin/busybox"]
++
++[[binary]]
++name = "stdbuf"
++paths = ["/usr/bin/stdbuf"]
++why = ["same file as /usr/lib/cargo/bin/coreutils/stdbuf"]
++
++[[binary]]
++name = "strace"
++paths = ["/usr/bin/strace"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "su"
++paths = ["/usr/bin/su", "/usr/lib/cargo/bin/su"]
++why = ["a row's binary", "setuid"]
++
++[[binary]]
++name = "su-rs"
++paths = ["/usr/bin/su-rs"]
++why = ["same file as /usr/lib/cargo/bin/su"]
++
++[[binary]]
++name = "sudo"
++paths = ["/usr/bin/sudo", "/usr/lib/cargo/bin/sudo"]
++why = ["a row's binary", "same file as /usr/lib/cargo/bin/sudo", "setuid"]
++
++[[binary]]
++name = "sudo-rs"
++paths = ["/usr/bin/sudo-rs"]
++why = ["same file as /usr/lib/cargo/bin/sudo"]
++
++[[binary]]
++name = "sudo.ws"
++paths = ["/usr/bin/sudo.ws"]
++why = ["a row's binary", "setuid"]
++
++[[binary]]
++name = "sudoedit"
++paths = ["/usr/bin/sudoedit"]
++why = ["same file as /usr/lib/cargo/bin/sudo"]
++
++[[binary]]
++name = "sudoedit-rs"
++paths = ["/usr/bin/sudoedit-rs"]
++why = ["same file as /usr/lib/cargo/bin/sudo"]
++
++[[binary]]
++name = "systemctl"
++paths = ["/usr/bin/systemctl"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "systemd-run"
++paths = ["/usr/bin/systemd-run"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "tar"
++paths = ["/usr/bin/tar"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "tclsh"
++paths = ["/usr/bin/tclsh"]
++why = ["dpkg package tcl", "same file as /usr/bin/tclsh8.6"]
++
++[[binary]]
++name = "tclsh8.6"
++paths = ["/usr/bin/tclsh8.6"]
++why = ["a row's binary", "dpkg package tcl8.6"]
++
++[[binary]]
++name = "time"
++paths = ["/usr/bin/time"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "timeout"
++paths = ["/usr/bin/timeout"]
++why = ["same file as /usr/lib/cargo/bin/coreutils/timeout"]
++
++[[binary]]
++name = "truncate"
++paths = ["/usr/bin/truncate"]
++why = ["same file as /usr/lib/cargo/bin/coreutils/truncate"]
++
++[[binary]]
++name = "umount"
++paths = ["/usr/bin/umount"]
++why = ["a row's binary", "setuid"]
++
++[[binary]]
++name = "unix_chkpwd"
++paths = ["/usr/sbin/unix_chkpwd"]
++why = ["a row's binary", "setgid"]
++
++[[binary]]
++name = "unshare"
++paths = ["/usr/bin/unshare"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "watch"
++paths = ["/usr/bin/watch"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "wipefs"
++paths = ["/usr/sbin/wipefs"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "wish"
++paths = ["/usr/bin/wish"]
++why = ["dpkg package tk", "same file as /usr/bin/wish8.6"]
++
++[[binary]]
++name = "wish8.6"
++paths = ["/usr/bin/wish8.6"]
++why = ["a row's binary", "dpkg package tk8.6"]
++
++[[binary]]
++name = "x-terminal-emulator"
++paths = ["/usr/bin/x-terminal-emulator"]
++why = ["same file as /usr/bin/ptyxis"]
++
++[[binary]]
++name = "x86_64-linux-gnu-cpp"
++paths = ["/usr/bin/x86_64-linux-gnu-cpp"]
++why = ["dpkg package cpp-x86-64-linux-gnu", "same file as /usr/bin/x86_64-linux-gnu-cpp-15"]
++
++[[binary]]
++name = "x86_64-linux-gnu-cpp-15"
++paths = ["/usr/bin/x86_64-linux-gnu-cpp-15"]
++why = ["a row's binary", "dpkg package cpp-15-x86-64-linux-gnu"]
++
++[[binary]]
++name = "x86_64-linux-gnu-python3-config"
++paths = ["/usr/bin/x86_64-linux-gnu-python3-config"]
++why = ["same file as /usr/bin/x86_64-linux-gnu-python3.14-config"]
++
++[[binary]]
++name = "x86_64-linux-gnu-python3.14-config"
++paths = ["/usr/bin/x86_64-linux-gnu-python3.14-config"]
++why = ["a row's binary"]
++
++[[binary]]
++name = "xargs"
++paths = ["/usr/bin/xargs"]
++why = ["a row's binary"]
+diff --git a/tests/test_gate_commands.py b/tests/test_gate_commands.py
+new file mode 100644
+index 0000000..2c0a7bd
+--- /dev/null
++++ b/tests/test_gate_commands.py
+@@ -0,0 +1,677 @@
++"""The policy gate's command layer (issue #204, spec ``policy-gate/v1`` §4, §4.1, §5).
++
++Every case goes through the public ``nl_shell.gate.classify``. ``nl_shell.gate`` and the
++table loader are imported inside each test, and the command table and the inventory are
++read inside each test, so a tree without them fails tests instead of failing to collect.
++
++Each case asserts a class (exact, or a floor), a reason substring, and that no reason is
++"could not class" (decision C), except where a case is about decision C.
++"""
++
++from __future__ import annotations
++
++import ast
++import tomllib
++from pathlib import Path
++
++import pytest
++
++REPO_ROOT = Path(__file__).resolve().parents[1]
++TARGET = REPO_ROOT / "targets" / "ubuntu-26.04"
++RANK = {
++    "read-only": 0,
++    "mutating": 1,
++    "session-altering": 1,
++    "destructive": 2,
++    "privileged": 3,
++}
++COULD_NOT = "could not class"
++NA = "not allowlisted"
++CANNOT_READ = "runs code the gate cannot read"
++UNKNOWN_OPTION = "option the gate does not know"
++PIPE_INTO = "pipe, here-doc or here-string into"
++UNDECLARED = "--pdca-undeclared"
++ELEVATING = "elevating command"
++NAMES_ELEVATING = "argument names an elevating command"
++ROOT_SHELL = "root shell"
++
++
++def classify(command: str, origin: str = "typed"):
++    from nl_shell import render
++    from nl_shell.gate import classify as gate_classify
++
++    result = gate_classify(command, origin=origin)
++    for reason in result.reasons:  # Rule 6 holds for the new reasons too
++        for char in reason:
++            code = ord(char)
++            assert not (code < 0x20 or 0x7F <= code <= 0x9F), (command, reason)
++            assert not render.is_hidden(char), (command, reason)
++    return result
++
++
++def has_reason(result, needle: str) -> bool:
++    return any(needle in reason for reason in result.reasons)
++
++
++def check(
++    command: str,
++    *,
++    floor: str | None = None,
++    exact: str | None = None,
++    reason: str | None = None,
++    rejected: bool | None = None,
++    origin: str = "typed",
++    decision_c: bool = False,
++):
++    result = classify(command, origin)
++    where = (command, origin, result)
++    if exact is not None:
++        assert result.cls == exact, where
++    if floor is not None:
++        assert RANK[result.cls] >= RANK[floor], where
++    if rejected is not None:
++        assert result.rejected is rejected, where
++    if reason is not None:
++        assert has_reason(result, reason), where
++    if not decision_c:
++        assert not has_reason(result, COULD_NOT), where
++    return result
++
++
++def rejected_proposal(command: str, reason: str):
++    return check(
++        command, exact="privileged", reason=reason, rejected=True, origin="proposal"
++    )
++
++
++def table_doc() -> dict:
++    return tomllib.loads((TARGET / "commands.toml").read_text(encoding="utf-8"))
++
++
++def effect_names(effects) -> set[str]:
++    return {e if isinstance(e, str) else e["effect"] for e in effects or []}
++
++
++@pytest.fixture
++def fresh_table():
++    """Clear the loader's cache before and after, so a test's table never leaks."""
++    from nl_shell.gate import commands
++
++    commands.table.cache_clear()
++    yield commands
++    commands.table.cache_clear()
++
++
++# --- class 1: coverage -----------------------------------------------------------------
++
++REQUIRED_INVENTORY = (
++    "sudo",
++    "sudo.ws",
++    "sudo-rs",
++    "sudoedit-rs",
++    "su",
++    "su-rs",
++    "pkexec",
++    "passwd",
++    "chsh",
++    "crontab",
++    "mount",
++    "sh",
++    "bash",
++    "rbash",
++    "dash",
++    "screen",
++    "python3",
++    "perl",
++    "busybox",
++    "gdb",
++)
++
++
++def test_class1_every_inventory_name_has_a_row():
++    from nl_shell.gate import commands
++
++    inventory = tomllib.loads((TARGET / "inventory.toml").read_text(encoding="utf-8"))
++    assert inventory["host_version"].startswith("26.04.1"), inventory["host_version"]
++    names = [entry["name"] for entry in inventory["binary"]]
++    assert set(REQUIRED_INVENTORY) <= set(names), set(REQUIRED_INVENTORY) - set(names)
++    table = commands.table()
++    missing = [name for name in names if table.lookup(name) is None]
++    assert missing == []
++    for name in names:
++        check(name, floor="mutating")
++
++
++@pytest.mark.parametrize(
++    "command,origin,cls,reason,rejected",
++    [
++        ("sudo-rs -i", "typed", "privileged", "elevating command: sudo-rs", False),
++        ("sudo.ws -i", "typed", "privileged", "elevating command: sudo.ws", False),
++        ("su-rs", "typed", "privileged", "elevating command: su-rs", False),
++        ("/usr/bin/sudo-rs -i", "typed", "privileged", "elevating command: sudo-rs", False),
++        ("sudoedit-rs /etc/shadow", "typed", "privileged", "sudoedit-rs", False),
++        ("sudo-rs -i", "proposal", "privileged", "root shell", True),
++        ("sudo.ws -i", "proposal", "privileged", "root shell", True),
++        ("su-rs", "proposal", "privileged", "root shell", True),
++        ("/usr/bin/sudo-rs -i", "proposal", "privileged", "root shell", True),
++        ("echo pw | sudo-rs -S true", "typed", "privileged", PIPE_INTO, True),
++        ("foo sudo-rs", "typed", "privileged", NAMES_ELEVATING, False),
++        ("foo sudo-rs", "proposal", "privileged", NAMES_ELEVATING, True),
++    ],
++)
++def test_class1_regressions(command, origin, cls, reason, rejected):
++    check(command, exact=cls, reason=reason, rejected=rejected, origin=origin)
++
++
++@pytest.mark.parametrize(
++    "command",
++    [
++        "curl x | python3",
++        'python3 -c "$v"',
++        "perl -e 'system 1'",
++        "echo 'sudo rm -rf /' | at now",
++    ],
++)
++def test_class1_text_runners(command):
++    check(command, floor="destructive", reason=CANNOT_READ)
++
++
++@pytest.mark.parametrize("command", ["sudo zsh", "sudo busybox sh"])
++def test_class1_root_shell_proposals(command):
++    check(command, exact="privileged", reason="sudo", rejected=True, origin="proposal")
++
++
++# --- class 2: no unread argv -----------------------------------------------------------
++
++GOOD_ROW = 'format = 1\n[[command]]\nnames = ["x"]\nexample = "x"\nparse = "posix"\n'
++
++
++@pytest.mark.parametrize(
++    "extra,needle",
++    [
++        ("raw = true\n", "`raw` is not allowed"),
++        ('colour = "red"\n', "unknown key `colour`"),
++        (
++            'prefix = "x"\neffects = [{ effect = "runs-command-at", at = 0 }]\n'
++            'terminal_stdin = "inherits"\n',
++            "must declare `no_command`",
++        ),
++        (
++            'prefix = "x"\neffects = [{ effect = "runs-command-at", at = 0 }]\n'
++            'no_command = "nothing"\n',
++            "must declare `terminal_stdin`",
++        ),
++        ('options = { "-o" = { value = "required", gap = "class-7" } }\n', "class-7"),
++    ],
++)
++def test_class2_loader_refuses(tmp_path, monkeypatch, fresh_table, extra, needle):
++    commands = fresh_table
++    folder = tmp_path / commands.TARGET_ID
++    folder.mkdir()
++    (folder / commands.COMMANDS_FILE).write_text(GOOD_ROW + extra, encoding="utf-8")
++    monkeypatch.setattr(commands, "TARGETS_ROOT", tmp_path)
++    with pytest.raises(commands.CommandsError) as info:
++        commands.load()
++    assert needle in str(info.value)
++    # Through the gate: decision C, never a silent mutating.
++    check("x", exact="privileged", rejected=True, reason=COULD_NOT, decision_c=True)
++
++
++def undeclared_cases() -> list[tuple[str, bool]]:
++    """``(command, elevating)``: each row's example with ``--pdca-undeclared`` right after
++    the command word, and right after each described subcommand."""
++    out = []
++    for row in table_doc()["command"]:
++        if row.get("fixed"):
++            continue
++        word, _, rest = row["example"].partition(" ")
++        elevating = "elevates" in effect_names(row.get("effects"))
++        out.append((f"{word} {UNDECLARED} {rest}".strip(), elevating))
++        for key, sub in (row.get("subcommands") or {}).items():
++            sub_elevating = elevating or "elevates" in effect_names(sub.get("effects"))
++            for name in key.split("|"):
++                out.append((f"{word} {name} {UNDECLARED}", sub_elevating))
++    return out
++
++
++def test_class2_undeclared_option_on_every_row():
++    cases = undeclared_cases()
++    assert len(cases) > 80
++    assert ("git clean " + UNDECLARED, False) in cases
++    for command, elevating in cases:
++        check(command, floor="destructive", reason=UNKNOWN_OPTION)
++        if elevating:
++            check(command, floor="privileged", rejected=True, origin="proposal")
++
++
++def test_class2_every_row_has_an_example():
++    rows = table_doc()["command"]
++    assert all(isinstance(row.get("example"), str) and row["example"] for row in rows)
++    for row in rows:
++        check(row["example"], floor="mutating")
++
++
++def no_command_shells() -> list[str]:
++    out = []
++    for row in table_doc()["command"]:
++        grammars = [row, *(row.get("subcommands") or {}).values()]
++        if any(g.get("no_command") == "opens-shell" for g in grammars):
++            out.append(row["prefix"])
++    return out
++
++
++def test_class2_no_command_opens_a_shell_under_sudo():
++    prefixes = no_command_shells()
++    assert {"chroot /", "unshare", "pkexec", "screen"} <= set(prefixes)
++    for prefix in prefixes:
++        check(f"sudo {prefix}", exact="privileged", rejected=True, origin="proposal")
++
++
++@pytest.mark.parametrize(
++    "command",
++    [
++        "sudo bash -s x",
++        "sudo bash -is x",
++        "sudo dash -s x",
++        "sudo env bash -s x",
++        "pkexec bash -s x",
++        "sudo bash /dev/stdin",
++        "sudo chroot /",
++        "sudo unshare",
++    ],
++)
++def test_class2_regressions(command):
++    check(command, exact="privileged", reason="shell", rejected=True, origin="proposal")
++
++
++def test_class2_enable_loads_code():
++    check("enable -f /tmp/x.so foo", floor="destructive", reason=CANNOT_READ)
++
++
++# --- class 7 and the floor: documented, not raised -------------------------------------
++
++
++@pytest.mark.parametrize(
++    "command",
++    [
++        "foo 'sudo -i'",
++        "git -c core.pager=sh log",
++        "git status",
++        "tar --to-command=sh -xf a.tar",
++        "ssh -o ProxyCommand=sh h",
++    ],
++)
++def test_class7_floor_documented_not_raised(command):
++    check(command, exact="mutating", reason=NA, rejected=False)
++
++
++# --- spec §4: privileged ---------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "command",
++    [
++        "sudo apt update",
++        "su",
++        "pkexec",
++        "doas",
++        "run0",
++        "machinectl shell",
++        "machinectl shell root@",
++        "//usr/bin/sudo true",
++    ],
++)
++def test_spec4_privileged(command):
++    check(command, exact="privileged", reason=ELEVATING)
++
++
++# --- spec §4: destructive --------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "command,reason",
++    [
++        ("rm -rf build", "destructive command: rm -r"),
++        ('"r"m -rf ~', "destructive command: rm -r"),
++        ("ls; rm -rf ~", "destructive command: rm -r"),
++        ("systemctl stop ssh", "destructive command: systemctl stop"),
++        # Row 9 (derived): `{}` is a word the gate cannot read, and rm with such an
++        # operand is classed like rm with a glob.
++        ("find . -exec rm {} \\;", "rm with an operand the gate cannot read"),
++        ("dd if=a of=b", "destructive command: dd"),
++        ("mkfs.ext4 /dev/sdz1", "destructive command: mkfs.ext4"),
++        ("wipefs -a /dev/sdz", "destructive command: wipefs"),
++        ("shred f", "destructive command: shred"),
++        ("truncate -s 0 f", "destructive command: truncate"),
++        ("chmod -R 755 d", "destructive command: chmod -R"),
++        ("find . -delete", "find -delete"),
++        ("git clean -fd", "destructive command: git clean"),
++        ("git reset --hard", "destructive command: git reset --hard"),
++        ("git push --force", "destructive command: git push --force"),
++        ("kill -9 -1", "kill -1"),
++    ],
++)
++def test_spec4_destructive(command, reason):
++    check(command, exact="destructive", reason=reason)
++
++
++# --- spec §4: wrappers -----------------------------------------------------------------
++
++
++def wrapper_prefixes() -> list[str]:
++    out = []
++    for row in table_doc()["command"]:
++        grammars = [row, *(row.get("subcommands") or {}).values()]
++        effects = set()
++        for grammar in grammars:
++            effects |= effect_names(grammar.get("effects"))
++            for option in (grammar.get("options") or {}).values():
++                effects |= effect_names(option.get("effects"))
++        if "runs-command-at" in effects:
++            assert row.get("prefix"), row["names"]
++            out.append(row["prefix"])
++    return out
++
++
++def test_spec4_every_wrapper_classes_its_inner_command():
++    prefixes = wrapper_prefixes()
++    assert {"env", "nice", "nohup", "timeout 5", "time", "xargs", "watch"} <= set(prefixes)
++    assert {"find . -exec", "sudo", "busybox", "exec", "command"} <= set(prefixes)
++    for prefix in prefixes:
++        check(f"{prefix} rm -rf x", floor="destructive", reason="rm")
++        check(f"{prefix} sudo -i", exact="privileged", rejected=True, origin="proposal")
++
++
++@pytest.mark.parametrize(
++    "command",
++    ["nice true", "nohup true", "timeout 5 true", "time true", "xargs true", "watch true"],
++)
++def test_spec4_wrappers_are_at_least_mutating(command):
++    check(command, floor="mutating", reason=NA)
++
++
++@pytest.mark.parametrize(
++    "command",
++    [
++        "nice rm -rf x",
++        "nohup rm -rf x",
++        "timeout 5 rm -rf x",
++        "time rm -rf x",
++        "watch rm -rf x",
++    ],
++)
++def test_spec4_wrappers_take_the_inner_class(command):
++    check(command, exact="destructive", reason="destructive command: rm -r")
++
++
++def test_spec4_named_wrappers():
++    check("env rm -rf x", exact="destructive", reason="destructive command: rm -r")
++    check("env - rm -rf ~", exact="destructive", reason="destructive command: rm -r")
++    check("xargs $x", floor="destructive", reason="inner command the gate cannot read")
++    check("find . -exec $x {} \\;", floor="destructive", reason="inner command the gate")
++    for command in (
++        "env - sudo -i",
++        "env 'A=1' sudo -i",
++        "env -a x sudo -i",
++        "exec -a x sudo -i",
++        "nice -n5 sudo -i",
++        "timeout -s9 5 sudo -i",
++        "stdbuf -o0 sudo -i",
++        "setsid sudo -i",
++        "flock /tmp/l sudo -i",
++    ):
++        rejected_proposal(command, ROOT_SHELL)
++
++
++def test_spec4_xargs_replace_strings():
++    for command in ("xargs -I% sudo % true", "xargs -o -I% sudo %"):
++        rejected_proposal(command, "cannot read")
++    for command in (
++        "xargs -I% git reset %",
++        "xargs -I% chown % bob /",
++        "xargs --replace=@ chown @ x",
++    ):
++        check(command, floor="destructive", reason="cannot read")
++
++
++def test_spec4_ten_nested_envs():
++    command = "env " * 10 + "sudo -i"
++    result = classify(command, "proposal")
++    assert result.cls == "privileged" and result.rejected, result
++    assert has_reason(result, "root shell") or has_reason(result, COULD_NOT), result
++
++
++# --- spec §5: sudo rules ---------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "command,reason",
++    [
++        ("sudo -S true", "sudo -S"),
++        ("sudo -p x true", "sudo -p"),
++        ("sudo -A true", "sudo -A"),
++        ("echo pw | sudo -S true", PIPE_INTO),
++        ('sudo "-S" true', "sudo -S"),
++        ("sudo $'-S' true", "sudo -S"),
++        ('sudo "$P" true', "cannot read where sudo takes options"),
++        ("sudo -s <<<x", PIPE_INTO),
++        ("printf x | sudo -i", PIPE_INTO),
++        ("echo x | sudo true", PIPE_INTO),
++        ("sudo true <<<x", PIPE_INTO),
++        ("sudo true <<E\nx\nE", PIPE_INTO),
++        ("echo x | su", PIPE_INTO),
++        ("su <<<x", PIPE_INTO),
++        ("echo x | pkexec true", PIPE_INTO),
++        ("pkexec true <<<x", PIPE_INTO),
++        ("echo x | doas true", PIPE_INTO),
++        ("doas true <<E\nx\nE", PIPE_INTO),
++        ("cat <<E | sudo tee /x\nx\nE", PIPE_INTO),
++        ("cat <<E | doas id\nx\nE", PIPE_INTO),
++    ],
++)
++def test_spec5_rejected(command, reason):
++    for origin in ("typed", "proposal"):
++        check(command, exact="privileged", reason=reason, rejected=True, origin=origin)
++
++
++@pytest.mark.parametrize(
++    "command", ["sudo -i", "sudo -s", "sudo su", "sudo bash", "su", "pkexec bash"]
++)
++def test_spec5_root_shells(command):
++    rejected_proposal(command, ROOT_SHELL)
++    check(command, exact="privileged", reason="interactive shell", rejected=False)
++
++
++# --- decision A ------------------------------------------------------------------------
++
++
++def test_decision_a():
++    check("foo sudo x", exact="privileged", reason=NAMES_ELEVATING, rejected=False)
++    rejected_proposal("foo sudo x", NAMES_ELEVATING)
++    check("foo rm -rf x", floor="destructive", reason="names a destructive command")
++    # ANSI-C words decode like any quoted word.
++    rejected_proposal("$'\\x73udo' -i", ROOT_SHELL)
++    check("echo pw | $'\\x73udo' -S true", exact="privileged", reason="-S", rejected=True)
++    check("foo $'\\x73udo'", exact="privileged", reason=NAMES_ELEVATING)
++    # bash stops an ANSI-C string at a NUL; so does the decoder.
++    rejected_proposal("$'sudo\\0ignored' -i", ROOT_SHELL)
++    check("$'rm\\0ignored' -rf build", exact="destructive", reason="rm -r")
++    check("foo $'sudo\\0ignored'", exact="privileged", reason=NAMES_ELEVATING)
++
++
++@pytest.mark.parametrize(
++    "command",
++    [
++        "sudo bash $x",
++        "sudo env $x bash",
++        "sudo nice $x bash",
++        "sudo xargs -o bash",
++        "sudo busybox --pdca",
++        "sudo script",
++        "sudo strace bash",
++        "sudo setpriv bash",
++        "sudo runuser -u root bash",
++    ],
++)
++def test_elevation_reaches_inner_commands(command):
++    check(command, exact="privileged", reason="proposal", rejected=True, origin="proposal")
++
++
++# --- text effects are decision B -------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "command", ["x | sh", "bash < f", "bash f.sh", 'bash -c "$v"', 'eval "$v"', ". ./f"]
++)
++def test_text_effects_are_decision_b(command):
++    check(command, floor="destructive", reason=CANNOT_READ)
++
++
++# --- decision C on table failure -------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "body",
++    [None, "format = 1\n[[command]\n", 'format = 2\n[[command]]\nnames = ["x"]\n', ""],
++)
++def test_decision_c_on_table_failure(tmp_path, monkeypatch, fresh_table, body):
++    commands = fresh_table
++    folder = tmp_path / commands.TARGET_ID
++    folder.mkdir()
++    if body is not None:
++        (folder / commands.COMMANDS_FILE).write_text(body, encoding="utf-8")
++    monkeypatch.setattr(commands, "TARGETS_ROOT", tmp_path)
++    for command in ("ls", "rm -rf build", "sudo -i", "true", "foo sudo"):
++        result = check(
++            command, exact="privileged", rejected=True, reason=COULD_NOT, decision_c=True
++        )
++        assert result.reasons[0] == COULD_NOT, result
++
++
++# --- the fixed load location -----------------------------------------------------------
++
++
++def test_loader_reads_only_the_fixed_path():
++    from nl_shell import targets
++    from nl_shell.gate import commands
++
++    assert commands.TARGET_ID == "ubuntu-26.04"
++    assert commands.TARGETS_ROOT == targets.TARGETS_ROOT
++    source = Path(commands.__file__).read_text(encoding="utf-8")
++    tree = ast.parse(source)
++    banned = {"environ", "getenv", "cwd", "getcwd", "home", "expanduser"}
++    for node in ast.walk(tree):
++        if isinstance(node, ast.Attribute):
++            assert node.attr not in banned, ast.unparse(node)
++        if isinstance(node, ast.Name):
++            assert node.id not in banned | {"open"}, node.id
++        if isinstance(node, (ast.Import, ast.ImportFrom)):
++            names = [a.name for a in node.names] + [getattr(node, "module", None) or ""]
++            assert "os" not in names, ast.unparse(node)
++    reads = [
++        node
++        for node in ast.walk(tree)
++        if isinstance(node, ast.Call)
++        and isinstance(node.func, ast.Attribute)
++        and node.func.attr in ("read_bytes", "read_text", "open", "readlink")
++    ]
++    assert len(reads) == 1, [ast.unparse(r) for r in reads]
++    (load,) = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "load"]
++    assert not load.args.args and not load.args.kwonlyargs and not load.args.vararg
++    assert ast.unparse(reads[0]) == "path.read_bytes()"
++    assigned = {
++        target.id: ast.unparse(node.value)
++        for node in ast.walk(load)
++        if isinstance(node, ast.Assign)
++        for target in node.targets
++        if isinstance(target, ast.Name)
++    }
++    assert assigned["root"] == "TARGETS_ROOT"
++    assert assigned["path"] == "root / TARGET_ID / COMMANDS_FILE"
++    module_level = {
++        target.id: ast.unparse(node.value)
++        for node in tree.body
++        if isinstance(node, ast.Assign)
++        for target in node.targets
++        if isinstance(target, ast.Name)
++    }
++    assert module_level["TARGETS_ROOT"] == "targets.TARGETS_ROOT"
++    assert module_level["COMMANDS_FILE"] == "'commands.toml'"
++
++
++def test_loader_ignores_cwd_and_environment(tmp_path, monkeypatch, fresh_table):
++    harmless = 'format = 1\n[[command]]\nnames = ["sudo"]\nexample = "sudo"\nfixed = true\n'
++    for folder in (
++        tmp_path,
++        tmp_path / "targets" / "ubuntu-26.04",
++        tmp_path / "nl-shell",
++        tmp_path / "nl-shell" / "targets" / "ubuntu-26.04",
++    ):
++        folder.mkdir(parents=True, exist_ok=True)
++        (folder / "commands.toml").write_text(harmless, encoding="utf-8")
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setenv("NL_SHELL_COMMANDS", str(tmp_path / "commands.toml"))
++    monkeypatch.setenv("NL_SHELL_TARGETS", str(tmp_path / "targets"))
++    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
++    monkeypatch.setenv("HOME", str(tmp_path))
++    check("sudo -i", exact="privileged", reason="elevating command: sudo")
++    check("sudo -i", exact="privileged", rejected=True, origin="proposal")
++
++
++def test_loader_refuses_a_path_outside_the_root(tmp_path, monkeypatch, fresh_table):
++    commands = fresh_table
++    root = tmp_path / "root"
++    root.mkdir()
++    outside = tmp_path / "elsewhere"
++    outside.mkdir()
++    (outside / commands.COMMANDS_FILE).write_text(
++        'format = 1\n[[command]]\nnames = ["sudo"]\nexample = "sudo"\nfixed = true\n',
++        encoding="utf-8",
++    )
++    (root / commands.TARGET_ID).symlink_to(outside)
++    monkeypatch.setattr(commands, "TARGETS_ROOT", root)
++    with pytest.raises(commands.CommandsError, match="outside"):
++        commands.load()
++    check("sudo true", exact="privileged", rejected=True, reason=COULD_NOT, decision_c=True)
++
++
++# --- spec §3 builtins (floor only) -----------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "command",
++    [
++        "alias ll='ls -l'",
++        "unalias ll",
++        "source f",
++        ". f",
++        "eval true",
++        "exec true",
++        "trap - INT",
++        "enable -n test",
++        "set -e",
++        "shopt -s nullglob",
++        "bind -l",
++        "complete -p",
++        "hash -r",
++        "builtin true",
++        "command true",
++        "export A=1",
++        "declare A=1",
++        "typeset A=1",
++        "local A=1",
++        "readonly A=1",
++        "unset A",
++    ],
++)
++def test_spec3_builtins(command):
++    result = check(command, floor="session-altering")
++    if result.cls != "session-altering":
++        assert RANK[result.cls] > RANK["session-altering"], result
++    assert not has_reason(result, COULD_NOT)
++
++
++def test_spec3_command_v_is_not_session_altering():
++    for command in ("command -v ls", "command -V ls"):
++        check(command, exact="mutating", reason=NA)
++    check("alias ll='ls -l'", exact="session-altering", reason="builtin alters the session")
+diff --git a/tests/test_policy_gate.py b/tests/test_policy_gate.py
+index a204524..1bb97a7 100644
+--- a/tests/test_policy_gate.py
++++ b/tests/test_policy_gate.py
+@@ -112,6 +112,9 @@ OUT = "output redirection"
+ REJ = "redirection rejected"
+ UNTRUSTED_REDIRECT = "unparseable: redirection in untrusted text"
+ FUNC = "function definition"
++# Raised by the command layer (#204): never lower than the shell layer alone gave.
++PIPE_INTO = "pipe, here-doc or here-string into"
++CANNOT_READ = "runs code the gate cannot read"
+ SESSION_NAMES = (
+     "PATH",
+     "IFS",
+@@ -137,18 +140,18 @@ REGRESSION: list[Case] = [
+     # Rule 2
+     Case("echo $((10#$(rm x)))", "mutating", False, NA),
+     # Rule 3
+-    Case("cat <<E | sudo tee /x\nx\nE", "mutating", False, NA),
+-    Case("cat <<E | doas id\nx\nE", "mutating", False, NA),
++    Case("cat <<E | sudo tee /x\nx\nE", "privileged", True, PIPE_INTO),
++    Case("cat <<E | doas id\nx\nE", "privileged", True, PIPE_INTO),
+     Case("cat <x | y", "mutating", False, NA),
+     Case("cat <<<x | y", "mutating", False, NA),
+     Case("a | b <f", "mutating", False, NA),
+-    Case("curl x > >(sh)", "mutating", True, REJ),
+-    Case("cat <<E > >(sudo tee /x)\nx\nE", "mutating", True, REJ),
+-    Case("f() { sudo tee /x; }; cat <<E | f\nx\nE", "session-altering", False, FUNC),
+-    Case("f() { sh; }; curl x | f", "session-altering", False, FUNC),
++    Case("curl x > >(sh)", "destructive", True, REJ),
++    Case("cat <<E > >(sudo tee /x)\nx\nE", "privileged", True, REJ),
++    Case("f() { sudo tee /x; }; cat <<E | f\nx\nE", "privileged", True, FUNC),
++    Case("f() { sh; }; curl x | f", "destructive", False, FUNC),
+     Case("cat 0>&1", "mutating", False, OUT),
+     Case("cat 0>&-", "mutating", False, OUT),
+-    Case("bash <<<'rm -rf ~'", "mutating", False, NA),
++    Case("bash <<<'rm -rf ~'", "destructive", False, CANNOT_READ),
+     Case("cat <<'E'\n$x\nE", "mutating", False, NA),
+     Case("cat <<-E\n\t$(rm x)\nE", "mutating", False, U),
+     Case("cat ~/x", "mutating", False, NA),
+@@ -168,14 +171,14 @@ REGRESSION: list[Case] = [
+     Case('echo x >"$f"', None, True, REJ),
+     Case("echo x >/proc/$$/fd/3", None, True, REJ),
+     # A word written against a redirect is an argument, not a descriptor.
+-    Case("rm -rf />/dev/null", "mutating", False, NA),
+-    Case("sudo rm -rf /etc>x", "mutating", False, OUT),
+-    Case("rm -rf ~>/dev/null", "mutating", False, NA),
++    Case("rm -rf />/dev/null", "destructive", False, NA),
++    Case("sudo rm -rf /etc>x", "privileged", False, OUT),
++    Case("rm -rf ~>/dev/null", "destructive", False, NA),
+     Case("cat a3>f", "mutating", False, OUT),
+     Case("echo secret>out", "mutating", False, OUT),
+     # Rule 3: a command that can rewire the shell's stdin
+-    Case("exec </tmp/x; sudo tee /etc/y", "mutating", False, NA),
+-    Case("while :; do cat; exec <x; done", "mutating", False, NA),
++    Case("exec </tmp/x; sudo tee /etc/y", "privileged", True, PIPE_INTO),
++    Case("while :; do cat; exec <x; done", "session-altering", False, NA),
+     # Rule 6
+     Case("function f$'\x1b' { :; }", "session-altering", False, FUNC),
+     # §1.1
+@@ -189,8 +192,8 @@ REGRESSION: list[Case] = [
+     Case("PAGER=sh git log", "mutating", False, "prefix assignment"),
+     Case("LD_PRELOAD=./x.so ls", "mutating", False, "prefix assignment"),
+     Case("LESSOPEN='|sh %s' less f", "mutating", False, "prefix assignment"),
+-    Case("$'\\x72m' -rf ~", "mutating", False, "command word is not a literal"),
+-    Case("$(echo rm) -rf ~", "mutating", False, "command word is not a literal"),
++    Case("$'\\x72m' -rf ~", "destructive", False, "command word is not a literal"),
++    Case("$(echo rm) -rf ~", "destructive", False, "command word is not a literal"),
+     Case("diff <(ls) <(ls)", "mutating", False, "process substitution"),
+     Case("/tmp/rm x", "mutating", False, "path outside the system directories"),
+     Case("./rm x", "mutating", False, "path outside the system directories"),
+@@ -227,7 +230,7 @@ REGRESSION: list[Case] = [
+     Case("while a; do b; done; for i in 1; do c; done", "mutating", False, NA),
+     Case("case x in a) b;; esac", "mutating", False, NA),
+     Case("echo $(id) `pwd`", "mutating", False, NA),
+-    Case("declare -x A=1; unset A", "mutating", False, NA),
++    Case("declare -x A=1; unset A", "session-altering", False, NA),
+ ]
+ 
+ 
+@@ -746,7 +749,9 @@ def test_rule5_work_budget_and_failures(monkeypatch):
+     with monkeypatch.context() as m:
+         from nl_shell.gate import rules
+ 
+-        m.setattr(rules, "classify", lambda inv: (_ for _ in ()).throw(RuntimeError("x")))
++        m.setattr(
++            rules, "classify", lambda inv, **_: (_ for _ in ()).throw(RuntimeError("x"))
++        )
+         assert classify("ls").reasons[0] == COULD_NOT
+     for bad in (None, 3, b"ls"):
+         assert gate().classify(bad).reasons[0] == COULD_NOT
+@@ -805,7 +810,7 @@ def read_only_for(word: str):
+     """A command layer that calls ``word`` read-only and everything else mutating."""
+     from nl_shell.gate import rules
+ 
+-    def fake(invocation):
++    def fake(invocation, origin="typed"):
+         if invocation.words[0].text == word:
+             return rules.Verdict("read-only")
+         return rules.Verdict("mutating", (NA,))
+@@ -845,7 +850,7 @@ def test_walk_reaches_every_simple_command(monkeypatch):
+ 
+     seen = []
+ 
+-    def record(invocation):
++    def record(invocation, origin="typed"):
+         seen.append((invocation.kind, invocation.words[0].text))
+         return rules.Verdict("mutating", (NA,))
+ 
+diff --git a/tests/test_targets.py b/tests/test_targets.py
+index 10b3268..c54106c 100644
+--- a/tests/test_targets.py
++++ b/tests/test_targets.py
+@@ -677,6 +677,11 @@ def test_real_ubuntu_target_is_selected_on_a_matching_os(tmp_path):
+ OS_NAME = re.compile(r"ubuntu|26\.04", re.IGNORECASE)
+ 
+ 
++# The gate's command-table loader fixes its target id until the target is chosen from
++# os-release (#204): this exact line, and no other, may name one.
++FIXED_TARGET_ID = ("src/nl_shell/gate/commands.py", 'TARGET_ID = "ubuntu-26.04"')
++
++
+ def test_no_os_name_in_package_code():
+     sources = sorted((REPO / "src" / "nl_shell").rglob("*.py"))
+     assert sources
+@@ -685,6 +690,7 @@ def test_no_os_name_in_package_code():
+         for path in sources
+         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+         if OS_NAME.search(line)
++        and (str(path.relative_to(REPO)), line.strip()) != FIXED_TARGET_ID
+     ]
+     assert hits == []
+ 

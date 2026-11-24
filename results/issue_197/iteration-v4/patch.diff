@@ -1,0 +1,4666 @@
+diff --git a/.oss-scanner/threat_model.md b/.oss-scanner/threat_model.md
+index 8de5b07..9cd1ce5 100644
+--- a/.oss-scanner/threat_model.md
++++ b/.oss-scanner/threat_model.md
+@@ -191,8 +191,30 @@ Trusted:
+   `/dev/fd` or `/proc/*/fd` path, or a non-literal target. (5) Input over 8 KiB is
+   decision C before it is parsed, and the walk has a node and depth budget; any internal
+   error is decision C, and `classify` never raises. (6) No reason string carries a raw
+-  control or hidden character from the input. The command layer, §7 and §8 are still
+-  stubs that fail closed: every simple command is at least `mutating`.
++  control or hidden character from the input. The command layer (#197, policy-gate v1
++  §4.1) is one engine over a reviewed table, `targets/<id>/commands.toml`: a command gets
++  a meaning only from a row there. The table is read from one fixed place (the target
++  named in `targets/gate.toml`), never from the environment, the cwd or a config file,
++  and a missing or invalid table is decision C for every command. A command with no row
++  is at least `mutating`; an argument word that names an elevating row makes it
++  `privileged` and a proposal is rejected, and one that names a destroying row makes it
++  at least `destructive` (decision A). Each row declares its argv grammar: an option the
++  row does not declare, or a word the gate cannot read where the row takes options, is at
++  least `destructive`, and on a row with rejected options it is rejected (`sudo "$P"`
++  may be `-S`). The inner command of a wrapper (`env`, `nice`, `timeout`, `xargs`,
++  `find -exec`, …) is classed by the same engine with the stdin it gets, so a wrapper
++  does not hide `sudo -i`, `sudo -S` or a pipe into sudo; an elevating row whose command
++  opens an interactive shell, itself or through its inner command (`sudo bash -s x`,
++  `sudo chroot /`), is a root shell and a proposal is rejected. Text, stdin or a file run
++  as code (`bash -c`, `eval`, `python3 -c`, `alias` and `trap` text) is not read yet: it
++  is at least `destructive`, "runs code the gate cannot read". Every binary in the
++  checked-in inventory of the reference host (`targets/<id>/inventory.toml`: setuid,
++  setgid and capability binaries, shells, interpreters, and every other name for the same
++  file, such as `sudo-rs`) has a row. Accepted gap: an unknown command that takes
++  command text as one quoted word (`foo 'sudo -i'`), and the code-running options
++  `git -c`, `tar --to-command` and `ssh -o`, stay `mutating`, "not allowlisted", and go
++  to the confirm. §7 and §8 are still stubs that fail closed: every simple command is at
++  least `mutating`.
+ - **The command model and the reader have no network**; the model server listens only on
+   a `0600` Unix socket (ADR-0018).
+ - **Locally complete**: no telemetry and no outbound connection in the default config.
+diff --git a/docs/design/specs/policy-gate/v1.md b/docs/design/specs/policy-gate/v1.md
+index a75a121..be48366 100644
+--- a/docs/design/specs/policy-gate/v1.md
++++ b/docs/design/specs/policy-gate/v1.md
+@@ -119,7 +119,89 @@ class produced by any step:
+ - Wrappers MUST be classed by their inner command: `env [assignments] cmd`, `nice`,
+   `nohup`, `timeout`, `time`, `xargs`, `find -exec/-execdir/-ok/-okdir`, `bash -c`,
+   `sh -c`, `watch`. Each is at least `mutating` itself; `xargs` and `find -exec` with a
+-  non-literal inner command are at least `destructive`.
++  non-literal inner command are at least `destructive`. `find` puts paths unknown at
++  classification time where `{}` stands (and `xargs` appends its input, or puts it where
++  the `-I` string stands), so `{}` is a non-literal operand of the inner command, and
++  `rm` with a non-literal operand is classed like `rm` with a glob operand: row 9
++  (`find . -exec rm {} \;`) is `destructive`.
++
++The rules of this section, §3's builtins and §5's sudo rules are expressed as rows of the
++command table (§4.1); the engine names no command.
++
++### 4.1 The command table
++
++1. **The table.** Each target has a command table, `targets/<id>/commands.toml`, reviewed
++   like the allowlist. A command gets a meaning in the gate only from a row there
++   (decision A covers the rest). The gate reads the table of the one target named in
++   `targets/gate.toml`, from that fixed place only: never from the environment, the cwd,
++   the home folder or a config file, and never chosen from `/etc/os-release`. A table
++   that is missing, is not valid TOML, or breaks a rule below is a gate failure
++   (decision C) for every command.
++2. **Rows.** A row names its command words (a command word that is a path is looked up by
++   its last component) and gives a minimal example invocation, its own class (at least
++   `mutating`, by default `mutating`, "not allowlisted"), its argv grammar, and its
++   effects. The grammar lists options without a value, with a value (`-u x`, `-ux`,
++   `--user=x`, `--user x`), and long options with an optional `=value`; whether options
++   may follow operands; whether `--` ends them; where described subcommands start; and
++   where an inner command starts. A unique prefix of a long option is that option. The
++   effects come from one fixed set: `elevates`, `destroys`, `runs-command-at`,
++   `runs-text`, `runs-stdin-as-code`, `runs-file-as-code`, `stores-code`,
++   `sets-variable`, `reads-terminal`, `opens-shell`, `alters-session` and `rejected`,
++   each with optional conditions on the options, operands and stdin. Every effect that
++   runs or stores text (`runs-text`, `runs-stdin-as-code`, `stores-code`) names the
++   grammar its text is in (`bash`, `sh`, `env-split`, `arithmetic`, or a named grammar
++   the gate has no parser for, such as `python`); a row that takes variable
++   names marks them (`sets-variable`). The loader MUST refuse an unknown key, effect,
++   condition or grammar.
++3. **Decision A (opaque commands).** A command with no row and no allowlist entry is at
++   least `mutating`, "not allowlisted". If an argument word, after quote removal, names a
++   row with `elevates` (by itself, as a path, or after an `=`), the command is
++   `privileged` and a proposal is rejected; if it names a row with `destroys`, it is at
++   least `destructive`. Decision A does not split a quoted word.
++4. **Decision C.** A gate failure (an unhandled node, the work budget, a missing or
++   invalid table, an internal error) is `privileged`, rejected, "could not class".
++5. **Coverage (class 1).** Every binary on the target that elevates, or runs a shell or
++   an interpreter, MUST have a row, including every other name for the same file
++   (`sudo-rs`, `sudo.ws`, `sudoedit-rs`, `su-rs`). `targets/<id>/inventory.toml`,
++   written on the reference host by `scripts/harvest_inventory.py` and reviewed like an
++   allowlist change, lists them: setuid, setgid and file-capability binaries in
++   `/usr/bin`, `/usr/sbin` and `/usr/lib/cargo/bin`; `/etc/shells`; the binaries of dpkg
++   packages in the sections `shells` and `interpreters`; `python3*`, `perl*`, `busybox`,
++   `gdb`; and every name in those folders whose `realpath` is the same file as one of
++   them or as a row's binary. A row for a binary that does not elevate MAY just say so.
++6. **No unread argv (class 2).** No row skips argv parsing. An option a row does not
++   declare, or a word the gate cannot read where the row takes options, is at least
++   `destructive`, "option the gate does not know"; on an elevating row a proposal with
++   it is rejected, and on a row with `rejected` options it is rejected (it may be one of
++   them). A row MAY describe only some subcommands (`git clean|reset|push`); the others
++   get the row's own class, so rows 8 and 27 stay `mutating`. A row whose effects do not
++   depend on argv MAY say so and give a fixed class (at least `mutating`); decision A
++   still reads its words. Every row that runs an inner command or reads code from stdin
++   MUST declare what it does with no command (`chroot` and `unshare` start a shell) and
++   when stdin is the terminal (`bash -s x` is an interactive shell).
++7. **Inner commands.** The inner command of a `runs-command-at` row is argv, classed by
++   the same rules, with the stdin it gets (the wrapper's, a pipe for `coproc`,
++   `/dev/null` for `xargs` and `systemd-run`, a terminal for `screen`). A non-literal
++   inner command word is at least `destructive`. A row that elevates and opens an
++   interactive shell, itself or through its inner command (`sudo -i`, `sudo bash -s x`,
++   `sudo env bash`, `sudo chroot /`), opens an interactive root shell (§5).
++8. **Text the gate does not read yet.** In this version every text effect
++   (`runs-text`, `runs-stdin-as-code`, `runs-file-as-code`, `stores-code`) is at least
++   `destructive`, "runs code the gate cannot read" (decision B). Until the text-reading
++   layer lands, stored code is read the same way, so row 33 (`alias ll='ls -l'`) is
++   classed `destructive`, which is higher than the table below and so compatible.
++9. **Real text-runners have rows; the gap is written down (class 7).** `busybox` (the
++   applet is the inner command), `python3`, `perl`, `tclsh`, `gjs`, `gdb`, `screen`,
++   `sg`, `newgrp`, `at`, `batch`, `zsh`, `tmux` and `x-terminal-emulator` have rows with
++   their text effects. Accepted gap: an unknown command that takes command text as one
++   quoted word (`foo 'sudo -i'`) stays `mutating`, "not allowlisted"; so do the
++   code-running options of the commands rows 8, 10 and 11 leave at the floor: `git`'s
++   `-c`, `--config-env` and `--exec-path`, `tar --to-command` and `ssh -o`. The table
++   marks those options `class_7_gap`; the loader MUST refuse that marker on any other
++   option. These commands go to the confirm.
++10. **Words.** ANSI-C quoting (`$'\x73udo'`) is quote removal like any other: it is
++    decoded as bash decodes it. An escape the gate does not decode (a NUL, a byte above
++    `\x7f`, a code point that is not a character) leaves the word non-literal.
+ 
+ ### 5. Rejected
+ 
+@@ -236,7 +318,9 @@ which is out of scope.
+ ## Versioning and compatibility
+ 
+ Adding an allowlist entry, or raising a class, is a compatible change within v1 but MUST
+-be reviewed by a human (nl-shell-pdca INTEGRATION §4). Adding a target is compatible; each
++be reviewed by a human (nl-shell-pdca INTEGRATION §4). Rows of `commands.toml` and
++`inventory.toml` (§4.1) are reviewed the same way; removing a row or an effect can lower
++a class, so it requires v2. Adding a target is compatible; each
+ entry in its allowlist is reviewed the same way, even when copied from another target.
+ Lowering any class, removing a rule from §2–§5, or changing §7 requires v2.
+ 
+diff --git a/scripts/harvest_inventory.py b/scripts/harvest_inventory.py
+new file mode 100644
+index 0000000..320a1ae
+--- /dev/null
++++ b/scripts/harvest_inventory.py
+@@ -0,0 +1,191 @@
++"""Write ``targets/ubuntu-26.04/inventory.toml`` from this host (#197, policy-gate/v1 §4.1).
++
++The inventory is the list the gate's coverage test (class 1) checks ``commands.toml``
++against: every name on it must have a row. It lists, from the host it runs on:
++
++- setuid, setgid and file-capability binaries in ``/usr/bin``, ``/usr/sbin`` and
++  ``/usr/lib/cargo/bin``;
++- every shell in ``/etc/shells``;
++- the binaries (in those folders) of dpkg packages in the sections ``shells`` and
++  ``interpreters``;
++- the names in those folders matching ``python3*``, ``perl*``, ``busybox``, ``gdb``;
++- every name in those folders whose ``realpath`` is the same file as one of the above or
++  as the binary of a ``commands.toml`` row (``sudo-rs`` -> ``/usr/lib/cargo/bin/sudo``).
++
++Usage::
++
++    python3 scripts/harvest_inventory.py [--output PATH]
++
++The file is checked in and reviewed like an allowlist change; no test runs this script.
++It records the host's os-release ``VERSION`` line, so a reviewer can tell which release
++it describes. Re-running it on the reference host and diffing against the checked-in
++file is the reviewer's check that the inventory is current.
++"""
++
++from __future__ import annotations
++
++import argparse
++import fnmatch
++import os
++import stat
++import subprocess
++import sys
++import tomllib
++from pathlib import Path
++
++REPO = Path(__file__).resolve().parents[1]
++TARGET = REPO / "targets" / "ubuntu-26.04"
++OUTPUT = TARGET / "inventory.toml"
++COMMANDS = TARGET / "commands.toml"
++FOLDERS = ("/usr/bin", "/usr/sbin", "/usr/lib/cargo/bin")
++PATTERNS = ("python3*", "perl*", "busybox", "gdb")
++SECTIONS = ("shells", "interpreters")
++HEADER = """\
++# The binaries on the ubuntu-26.04 reference host that the gate's command table MUST
++# cover (spec policy-gate/v1 §4.1, class 1). GENERATED by scripts/harvest_inventory.py;
++# do not edit by hand. Reviewed like an allowlist change: a name added here needs a row
++# in commands.toml, and removing a name needs a reason in the review.
++"""
++
++
++def folder_entries() -> dict[str, list[Path]]:
++    """Every entry name in the folders, with each path it appears at."""
++    out: dict[str, list[Path]] = {}
++    for folder in FOLDERS:
++        try:
++            names = sorted(os.listdir(folder))
++        except OSError:
++            continue
++        for name in names:
++            out.setdefault(name, []).append(Path(folder) / name)
++    return out
++
++
++def has_capability(path: Path) -> bool:
++    try:
++        return bool(os.getxattr(path, "security.capability", follow_symlinks=False))
++    except OSError:
++        return False
++
++
++def privileged(entries: dict[str, list[Path]]) -> dict[str, str]:
++    found: dict[str, str] = {}
++    for name, paths in entries.items():
++        for path in paths:
++            try:
++                info = path.lstat()
++            except OSError:
++                continue
++            if not stat.S_ISREG(info.st_mode):
++                continue
++            if info.st_mode & stat.S_ISUID:
++                found[name] = f"setuid {path}"
++            elif info.st_mode & stat.S_ISGID:
++                found[name] = f"setgid {path}"
++            elif has_capability(path):
++                found[name] = f"file capability {path}"
++    return found
++
++
++def shells() -> dict[str, str]:
++    found: dict[str, str] = {}
++    for line in Path("/etc/shells").read_text(encoding="utf-8").splitlines():
++        line = line.strip()
++        if line and not line.startswith("#"):
++            found[Path(line).name] = f"/etc/shells {line}"
++    return found
++
++
++def package_binaries() -> dict[str, str]:
++    listing = subprocess.run(
++        ["dpkg-query", "-W", "-f", "${Package}\t${Section}\n"],
++        check=True,
++        capture_output=True,
++        text=True,
++    ).stdout
++    found: dict[str, str] = {}
++    for line in sorted(listing.splitlines()):
++        package, _, section = line.partition("\t")
++        if section.rsplit("/", 1)[-1] not in SECTIONS:
++            continue
++        files = subprocess.run(
++            ["dpkg-query", "-L", package], check=True, capture_output=True, text=True
++        ).stdout
++        for path in files.splitlines():
++            if str(Path(path).parent) in FOLDERS:
++                found.setdefault(Path(path).name, f"dpkg {package} ({section})")
++    return found
++
++
++def patterned(entries: dict[str, list[Path]]) -> dict[str, str]:
++    return {
++        name: f"name matches {pattern}"
++        for name in entries
++        for pattern in PATTERNS
++        if fnmatch.fnmatchcase(name, pattern)
++    }
++
++
++def row_names() -> list[str]:
++    if not COMMANDS.exists():
++        return []
++    doc = tomllib.loads(COMMANDS.read_text(encoding="utf-8"))
++    return sorted({n for row in doc.get("command", []) for n in row.get("names", [])})
++
++
++def harvest() -> dict[str, list[str]]:
++    entries = folder_entries()
++    listed: dict[str, list[str]] = {}
++    for source in (privileged(entries), shells(), package_binaries(), patterned(entries)):
++        for name, why in source.items():
++            listed.setdefault(name, []).append(why)
++    sources: dict[str, set[str]] = {}
++    for name in set(listed) | set(row_names()):
++        for path in entries.get(name, []):
++            sources.setdefault(os.path.realpath(path), set()).add(name)
++    aliases: dict[str, list[str]] = {}
++    for name, paths in entries.items():
++        for path in paths:
++            real = os.path.realpath(path)
++            for other in sorted(sources.get(real, set()) - {name}):
++                why = f"same file as {other} ({real})"
++                if why not in aliases.get(name, []):
++                    aliases.setdefault(name, []).append(why)
++    for name, whys in aliases.items():
++        listed.setdefault(name, []).extend(w for w in whys if w not in listed.get(name, []))
++    return listed
++
++
++def host_version() -> str:
++    for line in Path("/etc/os-release").read_text(encoding="utf-8").splitlines():
++        if line.startswith("VERSION="):
++            return line
++    raise SystemExit("no VERSION line in /etc/os-release")
++
++
++def quote(text: str) -> str:
++    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
++
++
++def render(listed: dict[str, list[str]], version: str) -> str:
++    lines = [HEADER, f"host = {quote(version)}", ""]
++    for name in sorted(listed):
++        lines.append("[[binary]]")
++        lines.append(f"name = {quote(name)}")
++        lines.append("why = [" + ", ".join(quote(w) for w in listed[name]) + "]")
++        lines.append("")
++    return "\n".join(lines)
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    parser.add_argument("--output", type=Path, default=OUTPUT)
++    args = parser.parse_args(argv)
++    text = render(harvest(), host_version())
++    args.output.write_text(text, encoding="utf-8")
++    print(f"wrote {args.output}", file=sys.stderr)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/src/nl_shell/gate/__init__.py b/src/nl_shell/gate/__init__.py
+index d7ecc55..7f745cd 100644
+--- a/src/nl_shell/gate/__init__.py
++++ b/src/nl_shell/gate/__init__.py
+@@ -9,8 +9,8 @@ parse and walk (``nl_shell.gate.parse``, Rules 1-5), and the shell-level rules o
+ and §5 that need no per-command meaning. The later steps are stubs the pipeline already
+ calls, for the issues that replace them:
+ 
+-- ``rules`` (the command layer, #197/#198): every simple command is ``mutating``,
+-  "not allowlisted" (decision A's floor);
++- ``rules`` (the command layer, #197): one engine over the reviewed command table
++  ``targets/<id>/commands.toml`` (decisions A and C, §4/§5; the allowlist is #198);
+ - ``live`` (§7, #192): every simple command still ``read-only`` becomes ``mutating``,
+   "live-session resolution not implemented";
+ - ``sensitive`` (§8, #190) and ``words`` (#191): no-ops.
+@@ -193,7 +193,7 @@ def _classify(command: str, origin: str, label: str | None) -> Result:
+ 
+     for invocation in layer.invocations:
+         _shell_rules(tally, invocation)
+-        verdict = rules.classify(invocation)
++        verdict = rules.classify(invocation, origin)
+         verdict = live.resolve(invocation, verdict)
+         tally.verdict(verdict)
+         for step in (sensitive.check, words.check):
+diff --git a/src/nl_shell/gate/commands.py b/src/nl_shell/gate/commands.py
+new file mode 100644
+index 0000000..3eae4b2
+--- /dev/null
++++ b/src/nl_shell/gate/commands.py
+@@ -0,0 +1,589 @@
++"""Loading the gate's command table, ``targets/<id>/commands.toml`` (issue #197).
++
++Spec ``policy-gate/v1`` §4.1. The command table is reviewed data, like the allowlist: a
++command gets a meaning in the gate only from a row here. Each ``[[command]]`` row gives
++the command's argv grammar (its options, where operands and an inner command start) and
++its effects from one fixed set (``EFFECT_KINDS``). The engine in ``nl_shell.gate.rules``
++reads the rows; it names no command itself.
++
++The location is fixed. ``load()`` takes no path: it reads
++``ROOT / TARGET_ID / "commands.toml"`` and refuses a resolved path outside ``ROOT``, the
++way ``nl_shell.targets.load`` refuses a target folder outside its root. Nothing in the
++environment, the cwd, the home folder or a config file can point it elsewhere. v1 ships
++one target, and ``nl_shell.gate.classify`` has no target argument, so ``TARGET_ID`` is a
++module constant, read once at import from ``targets/gate.toml`` in the repository (code
++names no OS, ADR-0023). It is not chosen from ``/etc/os-release``.
++
++The loader is strict, so that a row cannot quietly mean less than it says: an unknown
++key (including v2's ``raw``), an unknown effect, condition or grammar, a row that runs an
++inner command but does not say what it does with no command or with the terminal as
++stdin, or a ``class_7_gap`` marker outside the spec's class-7 list, all refuse the whole
++table. A refused or missing table is decision C for every command (``rules.classify``).
++"""
++
++from __future__ import annotations
++
++import functools
++import re
++import tomllib
++from collections.abc import Mapping
++from dataclasses import dataclass, field
++from pathlib import Path
++from types import MappingProxyType
++from typing import Any
++
++from nl_shell import targets
++from nl_shell.gate.parse import RANK
++
++ROOT = targets.TARGETS_ROOT
++GATE_FILE = "gate.toml"  # names the one target whose table the gate reads
++COMMANDS_FILE = "commands.toml"
++
++
++def _fixed_target_id(root: Path) -> str | None:
++    """The target id in ``root/gate.toml`` (one key, ``target``), or None when the file is
++    missing or invalid (then ``load`` refuses, and every command is decision C)."""
++    try:
++        doc = tomllib.loads((root / GATE_FILE).read_text(encoding="utf-8"))
++    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
++        return None
++    value = doc.get("target")
++    if set(doc) != {"target"} or not isinstance(value, str) or not targets.is_plain_id(value):
++        return None
++    return value
++
++
++# Read once, from the repository's own targets/ folder: a module constant, not a choice
++# made per call or from the host. It lives in data because code names no OS (ADR-0023).
++TARGET_ID = _fixed_target_id(targets.TARGETS_ROOT)
++
++EFFECT_KINDS = (
++    "elevates",  # runs as another user (root): the command is `privileged`
++    "destroys",  # at least `destructive`
++    "runs-command-at",  # an inner command starts at `at`; it is classed too
++    "runs-text",  # runs text (at `at`) as code in `grammar`
++    "runs-stdin-as-code",  # reads its program from stdin, in `grammar`
++    "runs-file-as-code",  # runs a file (at `at`, or a place the gate cannot see) as code
++    "stores-code",  # keeps text (at `at`, in `grammar`) to run later
++    "sets-variable",  # the words at `at` are variable names it assigns
++    "reads-terminal",  # prompts on the terminal: stdin fed to it is rejected (§5)
++    "opens-shell",  # starts an interactive shell
++    "alters-session",  # §3: at least `session-altering`
++    "rejected",  # §5: the command is rejected (`reason` says why)
++)
++TEXT_KINDS = ("runs-text", "runs-stdin-as-code", "runs-file-as-code", "stores-code")
++# Grammars the gate has (or will have, #197 child-2) a parser for, and named grammars
++# it has none for. In this version every text effect is decision B whatever its grammar.
++PARSED_GRAMMARS = ("bash", "sh", "env-split", "arithmetic")
++UNPARSED_GRAMMARS = (
++    "python",
++    "perl",
++    "tcl",
++    "js",
++    "gdb",
++    "screen",
++    "tmux",
++    "readline",
++    "crontab",
++    "zsh",
++    "shell-arguments",
++)
++GRAMMARS = PARSED_GRAMMARS + UNPARSED_GRAMMARS
++NO_COMMAND = ("nothing", "opens-shell")
++TERMINAL_STDIN = ("passes-to-inner", "opens-shell")
++INNER_STDIN = ("inherit", "pipe", "null", "terminal")
++# The spec's class-7 accepted gap (§4.1): the only options that may carry
++# `class_7_gap`. They run code but stay at the row's default ("not allowlisted").
++CLASS_7_GAP = frozenset(
++    {
++        ("git", "-c"),
++        ("git", "--config-env"),
++        ("git", "--exec-path"),
++        ("tar", "--to-command"),
++        ("ssh", "-o"),
++    }
++)
++
++_ROW_KEYS = frozenset(
++    (
++        "names",
++        "example",
++        "prefix",
++        "class",
++        "reason",
++        "argv",
++        "flags",
++        "values",
++        "optional",
++        "class_7_gap",
++        "number_option",
++        "signal_option",
++        "plus",
++        "permute",
++        "end_of_options",
++        "max_options",
++        "bundle_first",
++        "modes",
++        "final",
++        "no_command",
++        "terminal_stdin",
++        "subcommands",
++        "inherit",
++        "effect",
++    )
++)
++_SUB_KEYS = _ROW_KEYS - {"names", "example", "argv", "subcommands", "inherit"}
++_EFFECT_KEYS = frozenset(
++    (
++        "kind",
++        "when",
++        "at",
++        "grammar",
++        "reason",
++        "inner_stdin",
++        "appends",
++        "placeholder",
++        "skip",
++        "joined",
++        "terminators",
++    )
++)
++_CONDITION = re.compile(
++    r"(?:(flag|no-flag):(\S+)"
++    r"|(operands|no-operands|inner|no-inner|operand-nonliteral|stdin-terminal|stdin-fed)"
++    r"|(operand|operand-prefix|operand-contains):(\S+)"
++    r"|operands>=([0-9]+))"
++)
++_AT = re.compile(r"(operand|operands):([0-9]+)|(value|until|rest):(\S+)")
++_OPTION = re.compile(r"(?:--?|\+)[^\s=]+|-")
++_NAME = re.compile(r"[A-Za-z0-9_.+-][A-Za-z0-9_.+:-]*|\.|\[")
++
++
++class CommandsError(Exception):
++    """The command table is missing or invalid; the message says where and why."""
++
++
++@dataclass(frozen=True)
++class Effect:
++    kind: str
++    when: tuple[str, ...] = ()
++    at: str | None = None
++    grammar: str | None = None
++    reason: str | None = None
++    inner_stdin: str = "inherit"
++    appends: bool = False
++    placeholder: tuple[str, ...] = ()
++    skip: str | None = None
++    joined: str | None = None
++    terminators: tuple[str, ...] = ()
++
++
++@dataclass(frozen=True)
++class Argv:
++    """A row's (or subcommand's) option grammar."""
++
++    flags: frozenset[str] = frozenset()
++    values: frozenset[str] = frozenset()
++    optional: frozenset[str] = frozenset()
++    gap: frozenset[str] = frozenset()
++    number_option: bool = False
++    signal_option: bool = False
++    plus: bool = False
++    permute: bool = True
++    end_of_options: bool = True
++    max_options: int | None = None
++    bundle_first: bool = False
++    modes: bool = False
++    final: frozenset[str] = frozenset()
++
++    @property
++    def spellings(self) -> frozenset[str]:
++        return self.flags | self.values | self.optional
++
++
++@dataclass(frozen=True)
++class Row:
++    names: tuple[str, ...]
++    example: str
++    cls: str
++    reason: str
++    fixed: bool
++    argv: Argv
++    effects: tuple[Effect, ...]
++    prefix: str | None = None
++    no_command: str | None = None
++    terminal_stdin: str | None = None
++    subcommands: Mapping[str, Row] = field(default_factory=dict)
++    inherit: bool = False
++    where: str = ""
++
++    def all_effects(self) -> tuple[Effect, ...]:
++        out = list(self.effects)
++        for sub in self.subcommands.values():
++            out.extend(sub.all_effects())
++        return tuple(out)
++
++
++@dataclass(frozen=True)
++class Table:
++    rows: tuple[Row, ...]
++    by_name: Mapping[str, Row]
++    elevating: frozenset[str]  # names of rows with an `elevates` effect (decision A)
++    destroying: frozenset[str]  # names of rows with a `destroys` effect (decision A)
++
++    def lookup(self, word: str) -> Row | None:
++        """The row for a command word; a path is looked up by its last component."""
++        name = word.rsplit("/", 1)[-1]
++        return self.by_name.get(name) if name else None
++
++
++def path() -> Path:
++    """The one place the table is read from."""
++    return ROOT / TARGET_ID / COMMANDS_FILE
++
++
++def load() -> Table:
++    """Load and validate the command table. Raises ``CommandsError``."""
++    if TARGET_ID is None or not targets.is_plain_id(TARGET_ID):
++        raise CommandsError(f"{targets.TARGETS_ROOT / GATE_FILE}: missing or invalid")
++    file = path()
++    try:
++        inside = file.resolve().is_relative_to(Path(ROOT).resolve())
++    except OSError as exc:
++        raise CommandsError(f"{file}: cannot resolve: {exc}") from None
++    if not inside:
++        raise CommandsError(f"{file}: resolves outside {ROOT}")
++    try:
++        data = file.read_bytes()
++    except FileNotFoundError:
++        raise CommandsError(f"{file}: missing") from None
++    except OSError as exc:
++        raise CommandsError(f"{file}: cannot read: {exc.strerror or exc}") from None
++    try:
++        doc = tomllib.loads(data.decode("utf-8"))
++    except UnicodeDecodeError:
++        raise CommandsError(f"{file}: not valid TOML: not valid UTF-8") from None
++    except tomllib.TOMLDecodeError as exc:
++        raise CommandsError(f"{file}: not valid TOML: {exc}") from None
++    return validate(doc, str(file))
++
++
++@functools.lru_cache(maxsize=1)
++def table() -> Table:
++    """The loaded table, cached. ``clear_cache()`` forgets it (tests)."""
++    return load()
++
++
++def clear_cache() -> None:
++    table.cache_clear()
++
++
++# --- validation ----------------------------------------------------------------------
++
++
++def validate(doc: dict[str, Any], where: str) -> Table:
++    extra = sorted(set(doc) - {"command"})
++    if extra:
++        raise CommandsError(f"{where}: unknown top-level key `{extra[0]}`")
++    entries = doc.get("command")
++    if not isinstance(entries, list) or not entries:
++        raise CommandsError(f"{where}: `command` must be a non-empty list of [[command]]")
++    rows: list[Row] = []
++    by_name: dict[str, Row] = {}
++    for n, entry in enumerate(entries, 1):
++        if not isinstance(entry, dict):
++            raise CommandsError(f"{where}: command {n} must be a table")
++        row = _row(entry, f"{where}: command {n}")
++        for name in row.names:
++            if name in by_name:
++                raise CommandsError(f"{row.where}: name {name!r} is already a row")
++            by_name[name] = row
++        rows.append(row)
++    elevating = frozenset(
++        name for row in rows if any(e.kind == "elevates" for e in row.all_effects())
++        for name in row.names
++    )
++    destroying = frozenset(
++        name for row in rows if any(e.kind == "destroys" for e in row.all_effects())
++        for name in row.names
++    )
++    return Table(
++        rows=tuple(rows),
++        by_name=MappingProxyType(by_name),
++        elevating=elevating,
++        destroying=destroying,
++    )
++
++
++def _strings(entry: Mapping[str, Any], key: str, where: str) -> tuple[str, ...]:
++    value = entry.get(key, [])
++    if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
++        raise CommandsError(f"{where}: `{key}` must be a list of non-empty strings")
++    return tuple(value)
++
++
++def _string(entry: Mapping[str, Any], key: str, where: str, default=None):
++    value = entry.get(key, default)
++    if value is default and key not in entry:
++        return default
++    if not isinstance(value, str) or not value:
++        raise CommandsError(f"{where}: `{key}` must be a non-empty string")
++    return value
++
++
++def _bool(entry: Mapping[str, Any], key: str, where: str, default: bool) -> bool:
++    value = entry.get(key, default)
++    if not isinstance(value, bool):
++        raise CommandsError(f"{where}: `{key}` must be a boolean")
++    return value
++
++
++def _check_keys(entry: Mapping[str, Any], allowed: frozenset[str], where: str) -> None:
++    if "raw" in entry:
++        raise CommandsError(f"{where}: unknown key `raw` (no row may skip argv parsing)")
++    unknown = sorted(set(entry) - allowed)
++    if unknown:
++        raise CommandsError(f"{where}: unknown key `{unknown[0]}`")
++
++
++def _row(entry: Mapping[str, Any], where: str) -> Row:
++    _check_keys(entry, _ROW_KEYS, where)
++    names = _strings(entry, "names", where)
++    if not names:
++        raise CommandsError(f"{where}: missing required key `names`")
++    for name in names:
++        if not _NAME.fullmatch(name):
++            raise CommandsError(f"{where}: name {name!r} is not a plain command name")
++    where = f"{where} ({names[0]})"
++    example = _string(entry, "example", where)
++    if example is None:
++        raise CommandsError(f"{where}: missing required key `example`")
++    if example.split()[0] not in names:
++        raise CommandsError(f"{where}: `example` must start with one of the row's names")
++    argv_kind = _string(entry, "argv", where, "parsed")
++    if argv_kind not in ("parsed", "fixed"):
++        raise CommandsError(f"{where}: `argv` must be \"parsed\" or \"fixed\"")
++    fixed = argv_kind == "fixed"
++    body = _body(entry, where, names, fixed)
++    subcommands: dict[str, Row] = {}
++    raw_subs = entry.get("subcommands", {})
++    if not isinstance(raw_subs, dict):
++        raise CommandsError(f"{where}: `subcommands` must be a table")
++    if raw_subs and fixed:
++        raise CommandsError(f"{where}: a fixed row cannot describe subcommands")
++    for sub_name, sub_entry in raw_subs.items():
++        sub_where = f"{where}: subcommand {sub_name!r}"
++        if not isinstance(sub_entry, dict):
++            raise CommandsError(f"{sub_where}: must be a table")
++        _check_keys(sub_entry, _SUB_KEYS, sub_where)
++        if not _NAME.fullmatch(sub_name):
++            raise CommandsError(f"{sub_where}: not a plain subcommand name")
++        sub = _body(sub_entry, sub_where, names, False)
++        subcommands[sub_name] = Row(
++            names=(sub_name,),
++            example=f"{names[0]} {sub_name}",
++            subcommands=MappingProxyType({}),
++            where=sub_where,
++            **sub,
++        )
++    inherit = _bool(entry, "inherit", where, False)
++    return Row(
++        names=names,
++        example=example,
++        subcommands=MappingProxyType(subcommands),
++        inherit=inherit,
++        where=where,
++        **body,
++    )
++
++
++def _body(entry: Mapping[str, Any], where: str, names: tuple[str, ...], fixed: bool) -> dict:
++    cls = _string(entry, "class", where, "mutating")
++    if cls not in RANK or RANK[cls] < RANK["mutating"]:
++        raise CommandsError(f"{where}: `class` must be a class of at least mutating")
++    reason = _string(entry, "reason", where, "not allowlisted")
++    option_keys = (
++        "flags",
++        "values",
++        "optional",
++        "class_7_gap",
++        "final",
++        "number_option",
++        "signal_option",
++        "plus",
++        "permute",
++        "end_of_options",
++        "max_options",
++        "bundle_first",
++        "modes",
++    )
++    if fixed and any(k in entry for k in option_keys):
++        raise CommandsError(f"{where}: a fixed row has no option grammar")
++    plus = _bool(entry, "plus", where, False)
++    flags = _options(entry, "flags", where, plus)
++    values = _options(entry, "values", where, plus)
++    optional = _options(entry, "optional", where, plus)
++    declared = flags | values | optional
++    if len(declared) != len(flags) + len(values) + len(optional):
++        raise CommandsError(f"{where}: an option is declared twice")
++    gap = _options(entry, "class_7_gap", where, plus)
++    for option in gap:
++        if option not in declared:
++            raise CommandsError(f"{where}: class_7_gap option {option} is not declared")
++        if not any((name, option) in CLASS_7_GAP for name in names):
++            raise CommandsError(
++                f"{where}: class_7_gap on {option} is outside the spec's class-7 list"
++            )
++    final = _options(entry, "final", where, plus)
++    if not final <= declared:
++        raise CommandsError(f"{where}: a `final` option is not declared")
++    max_options = entry.get("max_options")
++    if max_options is not None and (
++        not isinstance(max_options, int) or isinstance(max_options, bool) or max_options < 1
++    ):
++        raise CommandsError(f"{where}: `max_options` must be a positive integer")
++    argv = Argv(
++        flags=flags,
++        values=values,
++        optional=optional,
++        gap=gap,
++        number_option=_bool(entry, "number_option", where, False),
++        signal_option=_bool(entry, "signal_option", where, False),
++        plus=plus,
++        permute=_bool(entry, "permute", where, True),
++        end_of_options=_bool(entry, "end_of_options", where, True),
++        max_options=max_options,
++        bundle_first=_bool(entry, "bundle_first", where, False),
++        modes=_bool(entry, "modes", where, False),
++        final=final,
++    )
++    raw_effects = entry.get("effect", [])
++    if not isinstance(raw_effects, list):
++        raise CommandsError(f"{where}: `effect` must be a list of [[...effect]] tables")
++    effects = tuple(
++        _effect(e, f"{where}: effect {n}", fixed, declared)
++        for n, e in enumerate(raw_effects, 1)
++    )
++    prefix = _string(entry, "prefix", where)
++    no_command = _string(entry, "no_command", where)
++    terminal_stdin = _string(entry, "terminal_stdin", where)
++    if no_command is not None and no_command not in NO_COMMAND:
++        raise CommandsError(f"{where}: `no_command` must be one of {', '.join(NO_COMMAND)}")
++    if terminal_stdin is not None and terminal_stdin not in TERMINAL_STDIN:
++        raise CommandsError(
++            f"{where}: `terminal_stdin` must be one of {', '.join(TERMINAL_STDIN)}"
++        )
++    kinds = {e.kind for e in effects}
++    if "runs-command-at" in kinds or "runs-stdin-as-code" in kinds:
++        if no_command is None or terminal_stdin is None:
++            raise CommandsError(
++                f"{where}: a row that runs an inner command or reads code from stdin must "
++                "declare `no_command` and `terminal_stdin`"
++            )
++    if "runs-command-at" in kinds:
++        if prefix is None or prefix.split()[0] not in names:
++            raise CommandsError(
++                f"{where}: a row with runs-command-at needs a `prefix` starting with one "
++                "of the row's names"
++            )
++        positional = any(
++            e.kind == "runs-command-at" and (e.at or "").startswith("operand:")
++            for e in effects
++        )
++        if positional and argv.permute:
++            raise CommandsError(
++                f"{where}: an inner command at an operand needs permute = false (the "
++                "inner command's own options are not this row's)"
++            )
++    return {
++        "cls": cls,
++        "reason": reason,
++        "fixed": fixed,
++        "argv": argv,
++        "effects": effects,
++        "prefix": prefix,
++        "no_command": no_command,
++        "terminal_stdin": terminal_stdin,
++    }
++
++
++def _options(entry: Mapping[str, Any], key: str, where: str, plus: bool) -> frozenset[str]:
++    out = _strings(entry, key, where)
++    for option in out:
++        if not _OPTION.fullmatch(option) or (option.startswith("+") and not plus):
++            raise CommandsError(f"{where}: `{key}` entry {option!r} is not an option")
++    return frozenset(out)
++
++
++def _effect(entry: Any, where: str, fixed: bool, declared: frozenset[str]) -> Effect:
++    if not isinstance(entry, dict):
++        raise CommandsError(f"{where}: must be a table")
++    _check_keys(entry, _EFFECT_KEYS, where)
++    kind = _string(entry, "kind", where)
++    if kind not in EFFECT_KINDS:
++        raise CommandsError(f"{where}: unknown effect kind {kind!r}")
++    when = entry.get("when", [])
++    if isinstance(when, str):
++        when = [when]
++    if not isinstance(when, list) or not all(isinstance(w, str) for w in when):
++        raise CommandsError(f"{where}: `when` must be a string or a list of strings")
++    for condition in when:
++        match = _CONDITION.fullmatch(condition)
++        if match is None:
++            raise CommandsError(f"{where}: unknown condition {condition!r}")
++        if match.group(2):
++            for option in match.group(2).split("|"):
++                if option not in declared:
++                    raise CommandsError(f"{where}: condition names undeclared {option}")
++    at = _string(entry, "at", where)
++    if at is not None:
++        match = _AT.fullmatch(at)
++        if match is None:
++            raise CommandsError(f"{where}: unknown `at` {at!r}")
++        if match.group(3):
++            for option in match.group(4).split("|"):
++                if option not in declared:
++                    raise CommandsError(f"{where}: `at` names undeclared {option}")
++    grammar = _string(entry, "grammar", where)
++    if grammar is not None and grammar not in GRAMMARS:
++        raise CommandsError(f"{where}: unknown grammar {grammar!r}")
++    if kind in ("runs-text", "runs-stdin-as-code", "stores-code") and grammar is None:
++        raise CommandsError(f"{where}: a {kind} effect must name its `grammar`")
++    if kind in ("runs-command-at", "runs-text", "stores-code", "sets-variable") and at is None:
++        raise CommandsError(f"{where}: a {kind} effect needs `at`")
++    inner_stdin = _string(entry, "inner_stdin", where, "inherit")
++    if inner_stdin not in INNER_STDIN:
++        raise CommandsError(f"{where}: `inner_stdin` must be one of {', '.join(INNER_STDIN)}")
++    skip = _string(entry, "skip", where)
++    if skip is not None and skip != "assignments":
++        raise CommandsError(f"{where}: `skip` must be \"assignments\"")
++    joined = _string(entry, "joined", where)
++    if joined is not None and joined not in GRAMMARS:
++        raise CommandsError(f"{where}: unknown grammar {joined!r} in `joined`")
++    placeholder = _strings(entry, "placeholder", where)
++    for option in placeholder:
++        if option not in declared:
++            raise CommandsError(f"{where}: placeholder option {option} is not declared")
++    terminators = _strings(entry, "terminators", where)
++    if at is not None and at.startswith("until:") and not terminators:
++        raise CommandsError(f"{where}: `until:` needs `terminators`")
++    if fixed and (when or at is not None or kind == "runs-command-at"):
++        raise CommandsError(f"{where}: a fixed row's effects take no `when` or `at`")
++    if kind != "runs-command-at" and (
++        inner_stdin != "inherit" or skip or joined or placeholder or terminators
++        or entry.get("appends")
++    ):
++        raise CommandsError(f"{where}: inner-command keys on a {kind} effect")
++    return Effect(
++        kind=kind,
++        when=tuple(when),
++        at=at,
++        grammar=grammar,
++        reason=_string(entry, "reason", where),
++        inner_stdin=inner_stdin,
++        appends=_bool(entry, "appends", where, False),
++        placeholder=placeholder,
++        skip=skip,
++        joined=joined,
++        terminators=terminators,
++    )
+diff --git a/src/nl_shell/gate/parse.py b/src/nl_shell/gate/parse.py
+index bff918b..404ceff 100644
+--- a/src/nl_shell/gate/parse.py
++++ b/src/nl_shell/gate/parse.py
+@@ -199,7 +199,9 @@ def lex_word(source: str) -> tuple[str, frozenset[str]]:
+ 
+     Returns the text and the set of causes that make it non-literal (empty means
+     literal). ``tilde`` alone, at the very start and followed by ``/`` or nothing, is
+-    reported as ``leading-tilde`` so a redirect target may allow it (Rule 4).
++    reported as ``leading-tilde`` so a redirect target may allow it (Rule 4). ANSI-C
++    quoting (``$'\\x73udo'``) is decoded like any other quoting (#197); an escape the gate
++    does not decode leaves the word non-literal.
+     """
+     out: list[str] = []
+     causes: set[str] = set()
+@@ -249,6 +251,17 @@ def lex_word(source: str) -> tuple[str, frozenset[str]]:
+             if not closed:
+                 causes.add("unclosed quote")
+             continue
++        if c == "$" and source[i + 1 : i + 2] == "'":
++            # ANSI-C quoting is a fixed value, not an expansion: decode it as bash does.
++            decoded, end, ok = _ansi_c(source, i + 2)
++            out.append(decoded)
++            if end is None:
++                causes.add("unclosed quote")
++                break
++            if not ok:
++                causes.add("ANSI-C escape the gate cannot decode")
++            i = end
++            continue
+         if c in "$`":
+             causes.add("expansion")
+         elif c in "*?[":
+@@ -270,6 +283,84 @@ def lex_word(source: str) -> tuple[str, frozenset[str]]:
+     return "".join(out), frozenset(causes)
+ 
+ 
++_ANSI_C_SIMPLE = {
++    "a": "\a",
++    "b": "\b",
++    "e": "\x1b",
++    "E": "\x1b",
++    "f": "\f",
++    "n": "\n",
++    "r": "\r",
++    "t": "\t",
++    "v": "\v",
++    "\\": "\\",
++    "'": "'",
++    '"': '"',
++    "?": "?",
++}
++_ANSI_C_DIGITS = {"x": (16, 2), "u": (16, 4), "U": (16, 8)}
++
++
++def _ansi_c(source: str, i: int) -> tuple[str, int | None, bool]:
++    """Decode the body of ``$'…'`` starting at ``source[i]`` (bash 5.3 rules).
++
++    Returns the text, the index after the closing quote (None if unclosed) and whether
++    every escape decoded to a fixed value. A NUL (bash ends the word there), a code point
++    that is not a character, or a ``\\c`` with nothing after it is not decoded."""
++    out: list[str] = []
++    ok = True
++    n = len(source)
++    while i < n:
++        c = source[i]
++        if c == "'":
++            return "".join(out), i + 1, ok
++        if c != "\\" or i + 1 >= n:
++            out.append(c)
++            i += 1
++            continue
++        e = source[i + 1]
++        i += 2
++        if e in _ANSI_C_SIMPLE:
++            out.append(_ANSI_C_SIMPLE[e])
++            continue
++        if e in "01234567":
++            j = i
++            while j < n and j - i < 2 and source[j] in "01234567":
++                j += 1
++            code = int(e + source[i:j], 8) & 0xFF
++            i = j
++        elif e in _ANSI_C_DIGITS:
++            base, width = _ANSI_C_DIGITS[e]
++            j = i
++            while j < n and j - i < width and source[j] in "0123456789abcdefABCDEF":
++                j += 1
++            if j == i:
++                out.append("\\" + e)  # no digits: bash keeps the escape as written
++                continue
++            code = int(source[i:j], base)
++            i = j
++        elif e == "c":
++            if i >= n or source[i] in "'\\":
++                ok = False
++                continue
++            x = source[i]
++            i += 1
++            code = 0x7F if x == "?" else ord(x.upper()) & 0x1F
++        else:
++            out.append("\\" + e)  # an unknown escape keeps its backslash
++            continue
++        if code == 0 or code > 0x10FFFF or 0xD800 <= code <= 0xDFFF:
++            ok = False
++            continue
++        if code >= 0x80 and e not in "uU":
++            # `\xHH` and `\nnn` give one raw byte, which may be part of a UTF-8
++            # sequence: the gate does not rebuild those, so the word stays non-literal.
++            ok = False
++            continue
++        out.append(chr(code))
++    return "".join(out), None, ok
++
++
+ def make_word(source: str) -> Word:
+     text, causes = lex_word(source)
+     return Word(text=text, literal=not causes, source=source)
+diff --git a/src/nl_shell/gate/rules.py b/src/nl_shell/gate/rules.py
+index 27597dc..69bcb62 100644
+--- a/src/nl_shell/gate/rules.py
++++ b/src/nl_shell/gate/rules.py
+@@ -1,17 +1,66 @@
+-"""The policy gate's command layer: a stub (issue #196).
++"""The policy gate's command layer (spec ``policy-gate/v1`` §1 step 4, §3-§5, §4.1).
+ 
+-Spec ``policy-gate/v1`` §1 step 4: the static, session-altering, destructive and
+-privileged rules and the allowlist, per simple command. #197 (wrappers, sudo, destructive
+-commands, builtins, decisions A and B) and #198 (the allowlist, the terminal-read rule,
+-the here-doc exemption) replace this stub. Until then every simple command is
+-``mutating``, "not allowlisted": decision A's floor, so nothing is ``read-only``.
++One generic engine over the reviewed command table (``nl_shell.gate.commands``,
++``targets/<id>/commands.toml``). It names no command: wrappers, the sudo family,
++destructive commands, interpreters and builtins are rows, and every rule here works the
++same for every row.
++
++For one simple command the engine:
++
++1. looks the command word up in the table (a path by its last component);
++2. with no row, applies **decision A**: the command is at least ``mutating``, "not
++   allowlisted", and each argument word that names a row with ``elevates`` makes it
++   ``privileged`` (a proposal is rejected), one that names a row with ``destroys`` makes it
++   at least ``destructive``;
++3. with a row, reads argv with the row's grammar. An option the row does not declare, or
++   a word the gate cannot read where the row takes options, is at least ``destructive``,
++   "option the gate does not know" (rejected as a proposal on an elevating row; rejected
++   outright on a row with ``rejected`` options, because it may be one of them);
++4. applies the row's active effects. An inner command (``runs-command-at``) is classed by
++   the same engine, with the stdin it gets. Text, stdin or a file run as code is
++   **decision B**: at least ``destructive``, "runs code the gate cannot read" (#197's
++   text-reading layer will class literal text in a parsed grammar instead);
++5. a row that elevates and opens an interactive shell (itself, or through its inner
++   command) is a root shell: rejected as a proposal (§5).
++
++A missing or invalid table is a gate failure: ``parse.GateFailure``, which
++``nl_shell.gate.classify`` turns into decision C.
+ """
+ 
+ from __future__ import annotations
+ 
+-from dataclasses import dataclass
++import re
++from dataclasses import dataclass, field
++
++from nl_shell.gate import commands
++from nl_shell.gate.commands import Argv, Effect, Row, Table
++from nl_shell.gate.parse import MAX_WORK, RANK, GateFailure, Stdin, Word, lex_word
+ 
+ NOT_ALLOWLISTED = "not allowlisted"
++UNREADABLE_CODE = "runs code the gate cannot read"
++UNKNOWN_OPTION = "option the gate does not know"
++ROOT_SHELL = "opens an interactive root shell"
++OPENS_SHELL = "opens an interactive shell"
++TABLE_FAILURE = "command table missing or invalid"
++
++MAX_NESTING = 32  # inner commands inside inner commands
++# A backstop on the words read for one simple command, counted once per nesting level.
++# The walk's own budget (parse.MAX_WORK) bounds the words of the input.
++MAX_WORDS = MAX_NESTING * MAX_WORK
++
++# Paths that name the process's own stdin: a file run as code from one of them is code
++# read from stdin.
++STDIN_PATHS = frozenset(("-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"))
++# A word the shell would split, expand or treat specially if it were joined into text
++# (`watch` runs its words with `sh -c`).
++_SHELL_SPECIAL = re.compile(r"[\s|&;<>()$`\\\"'*?\[\]#~{}!]")
++_NUMBER = re.compile(r"-[0-9]+")
++_SIGNAL = re.compile(r"-(?:[0-9]+|(?:SIG)?[A-Z][A-Z0-9+-]*)")
++_MODE = re.compile(r"(?:[ugoa]*[-+=][rwxXstugo]*)(?:,[ugoa]*[-+=][rwxXstugo]*)*|-?[0-7]{1,4}")
++_ARGUMENTS_FROM_INPUT = Word(text="", literal=False, source="{arguments from input}")
++_NULL = Stdin("file", "/dev/null")
++_TERMINAL = Stdin("terminal")
++_PIPE = Stdin("pipe")
+ 
+ 
+ @dataclass(frozen=True)
+@@ -23,6 +72,660 @@ class Verdict:
+     rejected: bool = False
+ 
+ 
+-def classify(invocation) -> Verdict:
+-    """Class one ``nl_shell.gate.parse.Invocation``."""
+-    return Verdict("mutating", (NOT_ALLOWLISTED,))
++class _Outcome:
++    def __init__(self) -> None:
++        self.rank = -1
++        self.cls = "mutating"
++        self.reasons: list[str] = []
++        self.rejected = False
++        self.proposal_reasons: list[str] = []
++        self.words = 0
++
++    def raise_to(self, cls: str, reason: str) -> None:
++        rank = RANK[cls]
++        if rank > self.rank or (rank == self.rank and cls == "session-altering"):
++            self.rank, self.cls = rank, cls
++        if reason not in self.reasons:
++            self.reasons.append(reason)
++
++    def reject(self, reason: str) -> None:
++        self.rejected = True
++        self.raise_to("mutating", reason)
++
++    def reject_proposal(self, reason: str) -> None:
++        if reason not in self.proposal_reasons:
++            self.proposal_reasons.append(reason)
++
++    def count(self, n: int) -> None:
++        self.words += n
++        if self.words > MAX_WORDS:
++            raise GateFailure("work budget exceeded")
++
++    def verdict(self, proposal: bool) -> Verdict:
++        rejected = self.rejected
++        reasons = list(self.reasons)
++        if proposal and self.proposal_reasons:
++            rejected = True
++            reasons += [r for r in self.proposal_reasons if r not in reasons]
++        return Verdict(self.cls, tuple(reasons), rejected)
++
++
++def classify(invocation, origin: str = "typed") -> Verdict:
++    """Class one ``nl_shell.gate.parse.Invocation``; ``origin`` is ``proposal`` or
++    ``typed``."""
++    try:
++        table = commands.table()
++    except commands.CommandsError:
++        raise GateFailure(TABLE_FAILURE) from None
++    words = list(invocation.words)
++    if not words or not words[0].source:
++        return Verdict("mutating", (NOT_ALLOWLISTED,))
++    out = _Outcome()
++    _command(table, words, invocation.stdin, out, 0)
++    return out.verdict(origin == "proposal")
++
++
++# --- one command ---------------------------------------------------------------------
++
++
++def _command(table: Table, words: list[Word], stdin: Stdin, out: _Outcome, depth: int) -> bool:
++    """Class ``words`` (a command word and its arguments). Returns whether it opens an
++    interactive shell."""
++    if depth > MAX_NESTING:
++        raise GateFailure("nesting too deep")
++    out.count(len(words))
++    head = words[0]
++    if not head.literal and not _fixed_path(head):
++        if depth:
++            reason = f"inner command word the gate cannot read: {head.source}"
++            out.raise_to("destructive", reason)
++        out.raise_to("mutating", NOT_ALLOWLISTED)
++        _decision_a(table, words[1:], out)
++        return False
++    row = table.lookup(head.text)
++    if row is None:
++        out.raise_to("mutating", NOT_ALLOWLISTED)
++        _decision_a(table, words[1:], out)
++        return False
++    return _row(table, row, head.text.rsplit("/", 1)[-1], words[1:], stdin, out, depth)
++
++
++def _fixed_path(word: Word) -> bool:
++    """A word that is not literal only because of a tilde (`~/bin/x`): bash expands it to
++    a fixed home folder, not to text the gate cannot predict the shape of."""
++    _, causes = lex_word(word.source)
++    return bool(causes) and causes <= {"tilde", "leading-tilde"}
++
++
++def _unreadable(word: Word) -> bool:
++    """A word whose value the gate cannot know (an expansion, a glob, a brace)."""
++    return not word.literal and not _fixed_path(word)
++
++
++def _decision_a(table: Table, words: list[Word], out: _Outcome) -> None:
++    """Decision A over the argument words of a command with no row. A word names a row
++    by itself, as a path (`/usr/bin/sudo`), or after an `=` (`--exec=sudo`)."""
++    for word in words:
++        names = {word.text.rsplit("/", 1)[-1]}
++        if "=" in word.text:
++            names.add(word.text.split("=", 1)[1].rsplit("/", 1)[-1])
++        for name in sorted(names):
++            if name in table.elevating:
++                reason = f"argument names {name}, which runs commands as another user"
++                out.raise_to("privileged", reason)
++                out.reject_proposal(reason)
++            elif name in table.destroying:
++                out.raise_to("destructive", f"argument names {name}, which can destroy data")
++
++
++@dataclass
++class _Parsed:
++    options: list[tuple[str, Word | None]] = field(default_factory=list)
++    operands: list[Word] = field(default_factory=list)
++    undeclared: list[str] = field(default_factory=list)
++    abbreviates: set[str] = field(default_factory=set)
++    unreadable: list[Word] = field(default_factory=list)
++    inner: list[Word] | None = None
++    inner_at: int | None = None
++    captured: dict[str, list[list[Word]]] = field(default_factory=dict)
++    sub: tuple[str, Row, _Parsed] | None = None
++    unknown_sub: Word | None = None
++
++    @property
++    def spellings(self) -> set[str]:
++        return {s for s, _ in self.options}
++
++
++def _row(
++    table: Table,
++    row: Row,
++    name: str,
++    args: list[Word],
++    stdin: Stdin,
++    out: _Outcome,
++    depth: int,
++) -> bool:
++    out.raise_to(row.cls, row.reason)
++    if row.fixed:
++        _decision_a(table, args, out)
++        return _effects(table, row, name, _Parsed(), stdin, out, depth, row.effects, False)
++    parsed = _parse(row, row.argv, args)
++    elevated = any(
++        e.kind == "elevates" and _active(e, parsed, stdin) for e in row.effects
++    ) or bool(
++        parsed.sub
++        and any(
++            e.kind == "elevates" and _active(e, parsed.sub[2], stdin)
++            for e in parsed.sub[1].effects
++        )
++    )
++    _report_options(row, name, parsed, out, elevated)
++    opens = _effects(table, row, name, parsed, stdin, out, depth, row.effects, elevated)
++    if parsed.sub is not None:
++        sub_name, sub, sub_parsed = parsed.sub
++        out.raise_to(sub.cls, sub.reason)
++        _report_options(sub, f"{name} {sub_name}", sub_parsed, out, elevated)
++        label = f"{name} {sub_name}"
++        opens |= _effects(
++            table, sub, label, sub_parsed, stdin, out, depth, sub.effects, elevated
++        )
++    elif parsed.unknown_sub is not None:
++        shown = parsed.unknown_sub.source
++        out.raise_to("destructive", f"{name} subcommand the gate cannot read: {shown}")
++    return opens
++
++
++def _rejected_options(row: Row) -> set[str]:
++    out: set[str] = set()
++    for effect in row.all_effects():
++        if effect.kind == "rejected":
++            for condition in effect.when:
++                if condition.startswith("flag:"):
++                    out.update(condition[5:].split("|"))
++    return out
++
++
++def _report_options(
++    row: Row, name: str, parsed: _Parsed, out: _Outcome, elevated: bool
++) -> None:
++    rejected = _rejected_options(row)
++    for option in parsed.undeclared:
++        reason = f"{UNKNOWN_OPTION}: {name} {option}"
++        out.raise_to("destructive", reason)
++        if elevated:
++            out.reject_proposal(reason)
++    if parsed.abbreviates & rejected:
++        out.reject(f"{name} option that may abbreviate a rejected option")
++    for word in parsed.unreadable:
++        reason = f"{UNKNOWN_OPTION}: {name} {word.source} (a word the gate cannot read)"
++        out.raise_to("destructive", reason)
++        if rejected:
++            out.reject(f"{name} option the gate cannot read may be a rejected option")
++        elif elevated:
++            out.reject_proposal(reason)
++
++
++# --- argv ----------------------------------------------------------------------------
++
++
++def _merged(parent: Argv, sub: Argv) -> Argv:
++    return Argv(
++        flags=parent.flags | sub.flags,
++        values=parent.values | sub.values,
++        optional=parent.optional | sub.optional,
++        gap=parent.gap | sub.gap,
++        number_option=parent.number_option or sub.number_option,
++        signal_option=parent.signal_option or sub.signal_option,
++        plus=parent.plus or sub.plus,
++        permute=sub.permute,
++        end_of_options=sub.end_of_options,
++        max_options=sub.max_options,
++        modes=parent.modes or sub.modes,
++        final=parent.final | sub.final,
++    )
++
++
++def _captures(row: Row) -> tuple[dict[str, tuple[str, ...]], set[str]]:
++    """Options after which words are an inner command: ``until`` (up to a terminator)
++    and ``rest`` (every word after)."""
++    until: dict[str, tuple[str, ...]] = {}
++    rest: set[str] = set()
++    for effect in row.effects:
++        if effect.kind != "runs-command-at" or effect.at is None:
++            continue
++        kind, _, opts = effect.at.partition(":")
++        if kind == "until":
++            for option in opts.split("|"):
++                until[option] = effect.terminators
++        elif kind == "rest":
++            rest.update(opts.split("|"))
++    return until, rest
++
++
++def _inner_positions(row: Row) -> list[tuple[int, Effect]]:
++    out = []
++    for effect in row.effects:
++        if effect.kind == "runs-command-at" and effect.at and effect.at.startswith("operand:"):
++            out.append((int(effect.at.split(":")[1]), effect))
++    return out
++
++
++def _flag_conditions_hold(effect: Effect, spellings: set[str]) -> bool:
++    for condition in effect.when:
++        kind, _, opts = condition.partition(":")
++        if kind == "flag" and not spellings & set(opts.split("|")):
++            return False
++        if kind == "no-flag" and spellings & set(opts.split("|")):
++            return False
++    return True
++
++
++def _is_assignment(word: Word) -> bool:
++    return word.literal and "=" in word.text[1:] and not word.text.startswith("=")
++
++
++def _parse(row: Row, argv: Argv, args: list[Word]) -> _Parsed:
++    parsed = _Parsed()
++    until, rest = _captures(row)
++    positions = _inner_positions(row)
++    longs = sorted(s for s in argv.spellings | set(until) | rest if s.startswith("--"))
++    options_done = False
++    i, n = 0, len(args)
++
++    def counted(effect: Effect) -> int:
++        if effect.skip == "assignments":
++            return sum(1 for w in parsed.operands if not _is_assignment(w))
++        return len(parsed.operands)
++
++    def record(spelling: str, value: Word | None) -> None:
++        nonlocal options_done
++        parsed.options.append((spelling, value))
++        if spelling in argv.final:
++            options_done = True
++        if argv.max_options is not None and len(parsed.options) >= argv.max_options:
++            options_done = True
++
++    while i < n:
++        word = args[i]
++        in_options = not options_done and (argv.permute or not parsed.operands)
++        if in_options and not word.literal and _may_be_option(word, argv):
++            parsed.unreadable.append(word)
++        elif in_options and word.literal and _option_like(word.text, argv):
++            text = word.text
++            if text in until:
++                inner, i = _until(args, i + 1, until[text])
++                parsed.captured.setdefault(text, []).append(inner)
++                parsed.options.append((text, None))
++                continue
++            if text in rest:
++                parsed.captured.setdefault(text, []).append(args[i + 1 :])
++                parsed.options.append((text, None))
++                break
++            if text == "--" and argv.end_of_options:
++                options_done = True
++                i += 1
++                continue
++            i = _option(argv, args, i, longs, parsed, record)
++            continue
++        elif (
++            in_options
++            and argv.bundle_first
++            and not parsed.options
++            and not parsed.operands
++            and word.literal
++            and word.text
++        ):
++            i = _old_bundle(argv, args, i, parsed, record)
++            continue
++        # An operand.
++        if row.subcommands and not parsed.operands and parsed.sub is None:
++            if not word.literal:
++                parsed.unknown_sub = word
++                return parsed
++            sub = row.subcommands.get(word.text)
++            if sub is None:
++                return parsed  # an undescribed subcommand: the row's default
++            sub_argv = _merged(argv, sub.argv) if row.inherit else sub.argv
++            sub_parsed = _parse(sub, sub_argv, args[i + 1 :])
++            sub_parsed.options = list(parsed.options) + sub_parsed.options
++            parsed.sub = (word.text, sub, sub_parsed)
++            return parsed
++        for position, effect in positions:
++            if counted(effect) == position and _flag_conditions_hold(effect, parsed.spellings):
++                if effect.skip == "assignments" and _is_assignment(word):
++                    continue
++                parsed.inner = args[i:]
++                parsed.inner_at = position
++                return parsed
++        parsed.operands.append(word)
++        i += 1
++    return parsed
++
++
++def _may_be_option(word: Word, argv: Argv) -> bool:
++    """Whether a word the gate cannot read may expand to an option: its first character,
++    past any opening quotes, is a dash or something that expands (`$x`, a glob, a
++    brace). `~/x`, `a$b` or `/tmp/*.c` cannot start with a dash."""
++    source = word.source
++    i = 0
++    while i < len(source) and source[i] in "\"'":
++        i += 1
++    first = source[i : i + 1]
++    return first in ("", "-", "$", "`", "*", "?", "[", "{", "\\") or (
++        argv.plus and first == "+"
++    )
++
++
++def _option_like(text: str, argv: Argv) -> bool:
++    if text == "-":
++        return "-" in argv.spellings
++    if argv.modes and _MODE.fullmatch(text) and text not in argv.spellings:
++        return False
++    if text.startswith("-") and len(text) > 1:
++        return True
++    return argv.plus and text.startswith("+") and len(text) > 1
++
++
++def _until(args: list[Word], i: int, terminators: tuple[str, ...]) -> tuple[list[Word], int]:
++    start = i
++    while i < len(args):
++        if args[i].literal and args[i].text in terminators:
++            return args[start:i], i + 1
++        i += 1
++    return args[start:], i
++
++
++def _value_word(word: Word, text: str) -> Word:
++    return Word(text=text, literal=word.literal, source=text if word.literal else word.source)
++
++
++def _option(
++    argv: Argv, args: list[Word], i: int, longs: list[str], parsed: _Parsed, record
++) -> int:
++    """Read the option word ``args[i]``; return the index of the next word."""
++    word = args[i]
++    text = word.text
++    nxt = args[i + 1] if i + 1 < len(args) else None
++    if text in argv.flags or text in argv.optional:
++        record(text, None)
++        return i + 1
++    if text in argv.values:
++        record(text, nxt)
++        return i + 2
++    if text.startswith("--"):
++        name, eq, value = text.partition("=")
++        if eq:
++            if name in argv.values or name in argv.optional:
++                record(name, _value_word(word, value))
++            else:
++                # `--stdin=x` is not `--stdin` to getopt, but it is no safer.
++                parsed.undeclared.append(name)
++                parsed.abbreviates.update(s for s in longs if s.startswith(name))
++            return i + 1
++        matches = [s for s in longs if s.startswith(text)]
++        if len(matches) == 1 and matches[0] in argv.spellings:
++            spelling = matches[0]
++            if spelling in argv.values:
++                record(spelling, nxt)
++                return i + 2
++            record(spelling, None)
++            return i + 1
++        parsed.undeclared.append(text)
++        parsed.abbreviates.update(matches)
++        return i + 1
++    if argv.signal_option and _SIGNAL.fullmatch(text):
++        record("-SIGNAL", None)
++        return i + 1
++    if argv.number_option and _NUMBER.fullmatch(text):
++        record("-NUMBER", None)
++        return i + 1
++    # A bundle of short options (`-rf`, `-n5`, `+x`).
++    sign = text[0]
++    for j in range(1, len(text)):
++        spelling = sign + text[j]
++        rest = text[j + 1 :]
++        if spelling in argv.flags:
++            record(spelling, None)
++            continue
++        if spelling in argv.values:
++            if rest:
++                record(spelling, _value_word(word, rest))
++                return i + 1
++            record(spelling, nxt)
++            return i + 2
++        if spelling in argv.optional:
++            record(spelling, _value_word(word, rest) if rest else None)
++            return i + 1
++        parsed.undeclared.append(spelling if j == 1 else f"{spelling} (in {text})")
++        return i + 1
++    return i + 1
++
++
++def _old_bundle(argv: Argv, args: list[Word], i: int, parsed: _Parsed, record) -> int:
++    """A first word of option letters with no dash (`tar xzf a.tar`): value-taking
++    letters take the following words in order."""
++    word = args[i]
++    j = i + 1
++    for letter in word.text:
++        spelling = "-" + letter
++        if spelling in argv.flags:
++            record(spelling, None)
++        elif spelling in argv.values:
++            record(spelling, args[j] if j < len(args) else None)
++            j += 1
++        else:
++            parsed.undeclared.append(f"{spelling} (in {word.text})")
++    return j
++
++
++# --- effects -------------------------------------------------------------------------
++
++
++def _operand_matches(parsed: _Parsed, test) -> bool:
++    # A word the gate cannot read may be any value, so it matches.
++    return any(_unreadable(w) or test(w.text) for w in parsed.operands)
++
++
++def _active(effect: Effect, parsed: _Parsed, stdin: Stdin) -> bool:
++    spellings = parsed.spellings
++    for condition in effect.when:
++        kind, _, arg = condition.partition(":")
++        if kind == "flag":
++            ok = bool(spellings & set(arg.split("|")))
++        elif kind == "no-flag":
++            ok = not spellings & set(arg.split("|"))
++        elif kind == "operands":
++            ok = bool(parsed.operands)
++        elif kind == "no-operands":
++            ok = not parsed.operands
++        elif kind == "inner":
++            ok = bool(parsed.inner)
++        elif kind == "no-inner":
++            ok = not parsed.inner
++        elif kind == "operand-nonliteral":
++            ok = any(_unreadable(w) for w in parsed.operands)
++        elif kind == "stdin-terminal":
++            ok = stdin.kind == "terminal"
++        elif kind == "stdin-fed":
++            ok = stdin.kind != "terminal"
++        elif kind == "operand":
++            ok = _operand_matches(parsed, lambda t: t == arg)
++        elif kind == "operand-prefix":
++            ok = _operand_matches(parsed, lambda t: t.startswith(arg))
++        elif kind == "operand-contains":
++            ok = _operand_matches(parsed, lambda t: arg in t)
++        elif condition.startswith("operands>="):
++            ok = len(parsed.operands) >= int(condition[len("operands>=") :])
++        else:  # the loader refuses anything else
++            raise GateFailure("unknown condition in the command table")
++        if not ok:
++            return False
++    return True
++
++
++def _targets(effect: Effect, parsed: _Parsed) -> list[Word] | None:
++    """The words an effect acts on; None when its place is empty (the effect is off)."""
++    if effect.at is None:
++        return []
++    kind, _, arg = effect.at.partition(":")
++    if kind == "operand":
++        index = int(arg)
++        return [parsed.operands[index]] if index < len(parsed.operands) else None
++    if kind == "operands":
++        words = parsed.operands[int(arg) :]
++        return words or None
++    if kind == "value":
++        names = set(arg.split("|"))
++        words = [v for s, v in parsed.options if s in names and v is not None]
++        return words or None
++    return None
++
++
++def _decision_b(out: _Outcome) -> None:
++    out.raise_to("destructive", UNREADABLE_CODE)
++
++
++def _effects(
++    table: Table,
++    row: Row,
++    name: str,
++    parsed: _Parsed,
++    stdin: Stdin,
++    out: _Outcome,
++    depth: int,
++    effects: tuple[Effect, ...],
++    elevated: bool,
++) -> bool:
++    opens = False  # this row, or its inner command, opens an interactive shell
++    own_shell = False  # the shell is this row's own (it reads this row's stdin)
++    has_command = False
++    for effect in effects:
++        if not _active(effect, parsed, stdin):
++            continue
++        kind = effect.kind
++        if kind == "elevates":
++            default = row.reason if row.cls == "privileged" else None
++            out.raise_to(
++                "privileged",
++                effect.reason or default or f"{name} runs commands as another user",
++            )
++        elif kind == "destroys":
++            out.raise_to("destructive", effect.reason or f"destructive command: {name}")
++        elif kind == "alters-session":
++            reason = effect.reason or f"changes the shell session: {name}"
++            out.raise_to("session-altering", reason)
++        elif kind == "rejected":
++            out.reject(effect.reason or f"{name}: rejected")
++        elif kind == "reads-terminal":
++            if stdin.kind == "unknown" or (stdin.kind == "file" and not _plain_file(stdin)):
++                out.reject(f"pipe, here-doc or here-string into {name} (stdin not proven)")
++            elif stdin.kind not in ("terminal", "file"):
++                out.reject(f"pipe, here-doc or here-string into {name}")
++        elif kind == "opens-shell":
++            opens = own_shell = True
++        elif kind == "runs-command-at":
++            for inner in _inner_commands(effect, parsed):
++                if inner:
++                    has_command = True
++                    opens |= _inner(table, effect, parsed, inner, stdin, out, depth)
++        elif kind == "runs-stdin-as-code":
++            has_command = True
++            if stdin.kind == "terminal":
++                if row.terminal_stdin == "opens-shell":
++                    opens = True
++            else:
++                _decision_b(out)
++        elif kind == "runs-file-as-code":
++            words = _targets(effect, parsed)
++            if words is None:
++                continue
++            has_command = True
++            if words and all(w.literal and w.text in STDIN_PATHS for w in words):
++                if stdin.kind == "terminal":
++                    opens = True
++                else:
++                    _decision_b(out)
++            else:
++                _decision_b(out)
++        elif kind in ("runs-text", "stores-code"):
++            if _targets(effect, parsed) is None:
++                continue
++            has_command = True
++            _decision_b(out)
++        # sets-variable: names are read by the protected-variable rules (#197 child-3).
++    if not has_command and row.no_command == "opens-shell":
++        opens = own_shell = True
++    if own_shell and stdin.kind != "terminal":
++        _decision_b(out)  # the shell reads its commands from that stdin
++    if opens:
++        out.raise_to("mutating", OPENS_SHELL)
++        if elevated:
++            out.raise_to("privileged", ROOT_SHELL)
++            out.reject_proposal(ROOT_SHELL)
++    return opens
++
++
++def _inner_commands(effect: Effect, parsed: _Parsed) -> list[list[Word]]:
++    kind, _, arg = (effect.at or "").partition(":")
++    if kind == "operand":
++        return [parsed.inner] if parsed.inner and parsed.inner_at == int(arg) else []
++    if kind in ("until", "rest"):
++        out: list[list[Word]] = []
++        for option in arg.split("|"):
++            out.extend(parsed.captured.get(option, []))
++        return out
++    if kind == "value":
++        words = _targets(effect, parsed)
++        return [[w] for w in words or []]
++    return []
++
++
++def _plain_file(stdin: Stdin) -> bool:
++    """A stdin file that is not the shell's own stdin, a descriptor or a device the gate
++    cannot place (`</dev/stdin` is the pipe in front of it)."""
++    path = stdin.value or ""
++    if path in ("/dev/null", "/dev/tty"):
++        return True
++    return path not in STDIN_PATHS and not path.startswith(("/dev/", "/proc/"))
++
++
++def _stdin_for(effect: Effect, stdin: Stdin) -> Stdin:
++    return {
++        "inherit": stdin,
++        "pipe": _PIPE,
++        "null": _NULL,
++        "terminal": _TERMINAL,
++    }[effect.inner_stdin]
++
++
++def _inner(
++    table: Table,
++    effect: Effect,
++    parsed: _Parsed,
++    words: list[Word],
++    stdin: Stdin,
++    out: _Outcome,
++    depth: int,
++) -> bool:
++    words = list(words)
++    replace = [v.text for s, v in parsed.options if s in effect.placeholder and v is not None]
++    if any(s in effect.placeholder for s, v in parsed.options if v is None):
++        replace.append("{}")  # `xargs -i` with no string replaces `{}`
++    if replace:
++        words = [
++            Word(w.text, False, w.source) if any(r and r in w.text for r in replace) else w
++            for w in words
++        ]
++    elif effect.appends:
++        words.append(_ARGUMENTS_FROM_INPUT)
++    if effect.joined is not None and any(
++        not w.literal or not w.text or _SHELL_SPECIAL.search(w.text) for w in words
++    ):
++        _decision_b(out)
++        return False
++    head = words[0]
++    if head.literal and head.text.startswith("-"):
++        out.raise_to("destructive", f"{UNKNOWN_OPTION}: {head.text}")
++        _decision_a(table, words[1:], out)
++        return False
++    return _command(table, words, _stdin_for(effect, stdin), out, depth + 1)
+diff --git a/targets/gate.toml b/targets/gate.toml
+new file mode 100644
+index 0000000..f5930ab
+--- /dev/null
++++ b/targets/gate.toml
+@@ -0,0 +1,6 @@
++# The one target whose command table (targets/<id>/commands.toml) the policy gate reads
++# (#197, spec policy-gate/v1 §4.1). v1 ships one target and nl_shell.gate.classify has no
++# target argument, so the gate's table is fixed here, in reviewed data, and not chosen from
++# /etc/os-release or the environment. It lives in data because code names no OS
++# (ADR-0023). Changing it changes every command's class: review it like the table itself.
++target = "ubuntu-26.04"
+diff --git a/targets/ubuntu-26.04/commands.toml b/targets/ubuntu-26.04/commands.toml
+new file mode 100644
+index 0000000..a439516
+--- /dev/null
++++ b/targets/ubuntu-26.04/commands.toml
+@@ -0,0 +1,1612 @@
++# The gate's command table for the ubuntu-26.04 target (spec policy-gate/v1 §4.1, #197).
++# Loaded by nl_shell.gate.commands; read by the one engine in nl_shell.gate.rules.
++#
++# Reviewed like an allowlist change. A row is what gives a command a meaning in the gate:
++# removing a row or an effect can lower a class, so that is a v2 change (spec
++# Versioning). Every name in inventory.toml MUST have a row (class 1).
++#
++# Row keys (the loader refuses any other key, including `raw`):
++#   names           command words this row is for (a path is looked up by its last part)
++#   example         a minimal invocation (class 2's test adds an undeclared option to it)
++#   prefix          rows with runs-command-at: the words before the inner command
++#   class, reason   the row's floor (at least mutating; default mutating, "not allowlisted")
++#   argv            "parsed" (default) or "fixed" (effects do not depend on argv; the
++#                   undeclared-option rule is off, decision A still reads the words)
++#   flags / values / optional
++#                   options without a value / with a value (`-u x`, `-ux`, `--user=x`,
++#                   `--user x`) / long options with an optional `=value` (short: attached)
++#   class_7_gap     code-running options of the class-7 floor rows (spec §4.1); they give
++#                   the row's default, not "option the gate does not know"
++#   number_option, signal_option   `-N` / `-N` and `-SIGNAME` are options
++#   plus            `+x` options (bash, declare)
++#   permute         options may follow operands (GNU); false: options end at the first
++#                   operand (required for an inner command at an operand)
++#   end_of_options  `--` ends options (default true)
++#   max_options     options end after this many (kill: `kill -9 -1`)
++#   bundle_first    the first word may be option letters with no dash (`tar xf a.tar`)
++#   modes           words like `-w`, `u+x`, `644` are chmod modes, not options
++#   final           options after which every word is an operand (`python3 -c`)
++#   no_command      what the row does with no inner command: "nothing" | "opens-shell"
++#   terminal_stdin  what it does when stdin is the terminal: "passes-to-inner" |
++#                   "opens-shell"
++#   subcommands     described subcommands (others get the row's default); `inherit`
++#                   lets a subcommand take the row's options too
++#
++# Effect keys ([[command.effect]]): kind, when (all must hold), at, grammar, reason;
++# runs-command-at also: inner_stdin, appends, placeholder, skip, joined, terminators.
++#   when: flag:A|B, no-flag:A|B, operands, no-operands, inner, no-inner,
++#         operand-nonliteral, operand:V, operand-prefix:P, operand-contains:S,
++#         operands>=N, stdin-terminal, stdin-fed
++#   at:   operand:N, operands:N, value:A|B, until:A|B (with terminators), rest:A|B
++#
++# In this version every text effect (runs-text, runs-stdin-as-code, runs-file-as-code,
++# stores-code) is decision B: at least destructive, "runs code the gate cannot read".
++
++# --- elevation (spec §4 privileged, §5) ------------------------------------------------
++
++[[command]]
++names = ["sudo", "sudo.ws", "sudo-rs"]
++example = "sudo true"
++prefix = "sudo"
++class = "privileged"
++reason = "sudo runs commands as root"
++permute = false
++no_command = "nothing"
++terminal_stdin = "passes-to-inner"
++flags = [
++  "-A", "--askpass", "-b", "--background", "-B", "--bell", "-E", "-e", "--edit",
++  "-H", "--set-home", "-h", "--help", "-i", "--login", "-K", "--remove-timestamp",
++  "-k", "--reset-timestamp", "-l", "--list", "-N", "--no-update", "-n",
++  "--non-interactive", "-P", "--preserve-groups", "-S", "--stdin", "-s", "--shell",
++  "-V", "--version", "-v", "--validate",
++]
++values = [
++  "-C", "--close-from", "-D", "--chdir", "-g", "--group", "-p", "--prompt", "-R",
++  "--chroot", "-r", "--role", "-T", "--command-timeout", "-t", "--type", "-U",
++  "--other-user", "-u", "--user", "--host",
++]
++optional = ["--preserve-env"]
++[[command.effect]]
++kind = "elevates"
++[[command.effect]]
++kind = "reads-terminal"
++[[command.effect]]
++kind = "rejected"
++when = "flag:-S|--stdin"
++reason = "sudo -S reads the password from stdin (§5)"
++[[command.effect]]
++kind = "rejected"
++when = "flag:-A|--askpass"
++reason = "sudo -A runs an askpass program (§5)"
++[[command.effect]]
++kind = "rejected"
++when = "flag:-p|--prompt"
++reason = "sudo -p sets the password prompt (§5)"
++[[command.effect]]
++kind = "opens-shell"
++when = ["flag:-i|--login|-s|--shell", "no-inner"]
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:0"
++skip = "assignments"
++when = "no-flag:-e|--edit|-l|--list"
++
++[[command]]
++names = ["sudoedit", "sudoedit-rs"]
++example = "sudoedit /etc/hosts"
++class = "privileged"
++reason = "sudoedit writes files as root"
++flags = ["-A", "--askpass", "-B", "--bell", "-h", "--help", "-k", "-n",
++  "--non-interactive", "-S", "--stdin", "-V", "--version"]
++values = ["-C", "--close-from", "-D", "--chdir", "-g", "--group", "-p", "--prompt",
++  "-r", "--role", "-t", "--type", "-T", "--command-timeout", "-u", "--user", "--host"]
++[[command.effect]]
++kind = "elevates"
++[[command.effect]]
++kind = "reads-terminal"
++[[command.effect]]
++kind = "rejected"
++when = "flag:-S|--stdin"
++reason = "sudoedit -S reads the password from stdin (§5)"
++[[command.effect]]
++kind = "rejected"
++when = "flag:-A|--askpass"
++reason = "sudoedit -A runs an askpass program (§5)"
++[[command.effect]]
++kind = "rejected"
++when = "flag:-p|--prompt"
++reason = "sudoedit -p sets the password prompt (§5)"
++
++[[command]]
++names = ["su", "su-rs"]
++example = "su"
++class = "privileged"
++reason = "su runs a shell as another user"
++no_command = "opens-shell"
++terminal_stdin = "passes-to-inner"
++flags = ["-f", "--fast", "-l", "--login", "-", "-m", "-p", "--preserve-environment",
++  "-P", "--pty", "-h", "--help", "-V", "--version"]
++values = ["-c", "--command", "--session-command", "-g", "--group", "-G",
++  "--supp-group", "-s", "--shell", "-w", "--whitelist-environment"]
++[[command.effect]]
++kind = "elevates"
++[[command.effect]]
++kind = "reads-terminal"
++[[command.effect]]
++kind = "runs-text"
++at = "value:-c|--command|--session-command"
++grammar = "sh"
++[[command.effect]]
++# Words after the user name are arguments to the user's shell (`su root -c x`).
++kind = "runs-text"
++at = "operands:1"
++grammar = "shell-arguments"
++
++[[command]]
++names = ["pkexec"]
++example = "pkexec true"
++prefix = "pkexec"
++class = "privileged"
++reason = "pkexec runs commands as root"
++permute = false
++no_command = "opens-shell"
++terminal_stdin = "passes-to-inner"
++flags = ["--keep-cwd", "--disable-internal-agent", "--version", "--help"]
++values = ["--user"]
++[[command.effect]]
++kind = "elevates"
++[[command.effect]]
++kind = "reads-terminal"
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:0"
++
++[[command]]
++names = ["doas"]
++example = "doas true"
++prefix = "doas"
++class = "privileged"
++reason = "doas runs commands as root"
++permute = false
++no_command = "nothing"
++terminal_stdin = "passes-to-inner"
++flags = ["-L", "-n", "-s"]
++values = ["-C", "-u"]
++[[command.effect]]
++kind = "elevates"
++[[command.effect]]
++kind = "reads-terminal"
++[[command.effect]]
++kind = "opens-shell"
++when = ["flag:-s", "no-inner"]
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:0"
++
++[[command]]
++names = ["run0"]
++example = "run0 true"
++prefix = "run0"
++class = "privileged"
++reason = "run0 runs commands as root"
++permute = false
++no_command = "opens-shell"
++terminal_stdin = "passes-to-inner"
++flags = ["--no-ask-password", "-h", "--help", "--version", "--pty", "--pipe",
++  "--slice-inherit", "--empower"]
++values = ["--unit", "--property", "--description", "--slice", "-u", "--user", "-g",
++  "--group", "--nice", "-D", "--chdir", "--setenv", "--background", "--machine",
++  "--shell-prompt-prefix", "--area", "--lightweight"]
++[[command.effect]]
++kind = "elevates"
++[[command.effect]]
++kind = "reads-terminal"
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:0"
++inner_stdin = "terminal"
++
++[[command]]
++names = ["machinectl"]
++example = "machinectl shell"
++inherit = true
++flags = ["-a", "--all", "--value", "-l", "--full", "--read-only", "--mkdir", "-q",
++  "--quiet", "--force", "--no-pager", "--no-legend", "--no-ask-password", "-h",
++  "--help", "--version"]
++values = ["-p", "--property", "-s", "--signal", "--kill-whom", "--uid", "-E",
++  "--setenv", "--verify", "--format", "--max-addresses", "-n", "--lines", "-o",
++  "--output", "-H", "--host", "-M", "--machine", "--runner"]
++[command.subcommands.shell]
++class = "privileged"
++reason = "machinectl shell opens a shell as root on the host by default"
++prefix = "machinectl shell root@.host"
++permute = false
++no_command = "opens-shell"
++terminal_stdin = "passes-to-inner"
++[[command.subcommands.shell.effect]]
++kind = "elevates"
++[[command.subcommands.shell.effect]]
++kind = "reads-terminal"
++[[command.subcommands.shell.effect]]
++kind = "runs-command-at"
++at = "operand:1"
++inner_stdin = "terminal"
++[command.subcommands.login]
++class = "privileged"
++reason = "machinectl login opens a login prompt on the host"
++no_command = "opens-shell"
++[[command.subcommands.login.effect]]
++kind = "elevates"
++[[command.subcommands.login.effect]]
++kind = "reads-terminal"
++
++[[command]]
++names = ["systemd-run"]
++example = "systemd-run true"
++prefix = "systemd-run"
++permute = false
++no_command = "nothing"
++terminal_stdin = "passes-to-inner"
++flags = ["--no-ask-password", "--scope", "--user", "--system", "-r",
++  "--remain-after-exit", "--send-sighup", "-G", "--collect", "-d", "--same-dir", "-t",
++  "--pty", "-T", "--pty-late", "-P", "--pipe", "-q", "--quiet", "-v", "--verbose",
++  "--no-block", "--wait", "-S", "--shell", "--on-clock-change",
++  "--on-timezone-change", "--slice-inherit", "--ignore-failure", "-h", "--help",
++  "--version"]
++values = ["-u", "--unit", "-p", "--property", "--description", "--slice",
++  "--service-type", "--uid", "--gid", "--nice", "--working-directory", "-E",
++  "--setenv", "-H", "--host", "-M", "--machine", "--path-property",
++  "--socket-property", "--timer-property", "--on-active", "--on-boot", "--on-startup",
++  "--on-unit-active", "--on-unit-inactive", "--on-calendar", "--background", "--json",
++  "--expand-environment", "--capsule"]
++[[command.effect]]
++kind = "elevates"
++when = "no-flag:--user"
++reason = "systemd-run runs commands as a system service (root by default)"
++[[command.effect]]
++kind = "reads-terminal"
++[[command.effect]]
++kind = "opens-shell"
++when = ["flag:-S|--shell", "no-inner"]
++[[command.effect]]
++# The command's stdin is /dev/null, a pty with -t/-T, or systemd-run's own with -P.
++kind = "runs-command-at"
++at = "operand:0"
++inner_stdin = "null"
++when = "no-flag:-t|--pty|-T|--pty-late|-P|--pipe"
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:0"
++inner_stdin = "terminal"
++when = "flag:-t|--pty|-T|--pty-late"
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:0"
++when = "flag:-P|--pipe"
++
++# --- wrappers: the inner command is argv, classed by this engine (spec §4) ------------
++
++[[command]]
++names = ["env"]
++example = "env"
++prefix = "env"
++permute = false
++no_command = "nothing"
++terminal_stdin = "passes-to-inner"
++flags = ["-i", "--ignore-environment", "-", "-0", "--null", "-v", "--debug",
++  "--list-signal-handling", "-h", "--help", "-V", "--version"]
++values = ["-C", "--chdir", "-f", "--file", "-u", "--unset", "-S", "--split-string",
++  "-a", "--argv0"]
++optional = ["--ignore-signal", "--default-signal", "--block-signal"]
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:0"
++skip = "assignments"
++[[command.effect]]
++kind = "runs-text"
++at = "value:-S|--split-string"
++grammar = "env-split"
++[[command.effect]]
++kind = "sets-variable"
++at = "value:-u|--unset"
++
++[[command]]
++names = ["nice"]
++example = "nice true"
++prefix = "nice"
++permute = false
++number_option = true
++no_command = "nothing"
++terminal_stdin = "passes-to-inner"
++flags = ["-h", "--help", "-V", "--version"]
++values = ["-n", "--adjustment"]
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:0"
++
++[[command]]
++names = ["ionice"]
++example = "ionice -c3 true"
++prefix = "ionice -c3"
++permute = false
++no_command = "nothing"
++terminal_stdin = "passes-to-inner"
++flags = ["-t", "--ignore", "-h", "--help", "-V", "--version"]
++values = ["-c", "--class", "-n", "--classdata", "-p", "--pid", "-P", "--pgid", "-u",
++  "--uid"]
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:0"
++when = "no-flag:-p|--pid|-P|--pgid|-u|--uid"
++
++[[command]]
++names = ["nohup"]
++example = "nohup true"
++prefix = "nohup"
++permute = false
++no_command = "nothing"
++terminal_stdin = "passes-to-inner"
++flags = ["--help", "--version"]
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:0"
++
++[[command]]
++names = ["timeout"]
++example = "timeout 5 true"
++prefix = "timeout 5"
++permute = false
++no_command = "nothing"
++terminal_stdin = "passes-to-inner"
++flags = ["-f", "--foreground", "-p", "--preserve-status", "-v", "--verbose", "-h",
++  "--help", "-V", "--version"]
++values = ["-k", "--kill-after", "-s", "--signal"]
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:1"
++
++[[command]]
++names = ["time"]
++example = "time true"
++prefix = "time"
++permute = false
++no_command = "nothing"
++terminal_stdin = "passes-to-inner"
++flags = ["-p"]
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:0"
++
++[[command]]
++names = ["stdbuf"]
++example = "stdbuf -o0 true"
++prefix = "stdbuf -o0"
++permute = false
++no_command = "nothing"
++terminal_stdin = "passes-to-inner"
++flags = ["-h", "--help", "-V", "--version"]
++values = ["-i", "--input", "-o", "--output", "-e", "--error"]
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:0"
++
++[[command]]
++names = ["setsid"]
++example = "setsid true"
++prefix = "setsid"
++permute = false
++no_command = "nothing"
++terminal_stdin = "passes-to-inner"
++flags = ["-c", "--ctty", "-f", "--fork", "-w", "--wait", "-h", "--help", "-V",
++  "--version"]
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:0"
++
++[[command]]
++names = ["flock"]
++example = "flock /tmp/l true"
++prefix = "flock /tmp/l"
++permute = false
++no_command = "nothing"
++terminal_stdin = "passes-to-inner"
++flags = ["-s", "--shared", "-x", "-e", "--exclusive", "-n", "--nb", "--nonblock",
++  "-u", "--unlock", "-o", "--close", "--verbose", "-F", "--no-fork", "-h", "--help",
++  "-V", "--version"]
++values = ["-w", "--wait", "--timeout", "-E", "--conflict-exit-code", "-c",
++  "--command"]
++[[command.effect]]
++kind = "runs-text"
++at = "value:-c|--command"
++grammar = "sh"
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:1"
++
++[[command]]
++names = ["xargs"]
++example = "xargs"
++prefix = "xargs"
++permute = false
++no_command = "nothing"
++terminal_stdin = "passes-to-inner"
++flags = ["-0", "--null", "-o", "--open-tty", "-p", "--interactive", "-r",
++  "--no-run-if-empty", "--show-limits", "-t", "--verbose", "-x", "--exit", "--help",
++  "--version"]
++values = ["-a", "--arg-file", "-d", "--delimiter", "-E", "-I", "-L", "-n",
++  "--max-args", "-P", "--max-procs", "-s", "--max-chars", "--process-slot-var"]
++optional = ["-e", "--eof", "-i", "--replace", "-l", "--max-lines"]
++[[command.effect]]
++# The command's arguments come from the input: unknown words appended, or put where
++# the replace string is. Its stdin is /dev/null unless -a or -o.
++kind = "runs-command-at"
++at = "operand:0"
++appends = true
++placeholder = ["-I", "-i", "--replace"]
++inner_stdin = "null"
++when = "no-flag:-a|--arg-file|-o|--open-tty"
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:0"
++appends = true
++placeholder = ["-I", "-i", "--replace"]
++when = "flag:-a|--arg-file"
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:0"
++appends = true
++placeholder = ["-I", "-i", "--replace"]
++inner_stdin = "terminal"
++when = "flag:-o|--open-tty"
++
++[[command]]
++names = ["find"]
++example = "find ."
++prefix = "find . -exec"
++no_command = "nothing"
++terminal_stdin = "passes-to-inner"
++flags = [
++  "-H", "-L", "-P", "-depth", "-d", "-follow", "-ignore_readdir_race",
++  "-noignore_readdir_race", "-mount", "-noleaf", "-xdev", "-daystart", "-warn",
++  "-nowarn", "-empty", "-executable", "-false", "-true", "-nogroup", "-nouser",
++  "-readable", "-writable", "-delete", "-ls", "-print", "-print0", "-prune", "-quit",
++  "-not", "-and", "-or", "-a", "-o", "-help", "--help", "-version", "--version",
++  "-exec", "-execdir", "-ok", "-okdir",
++]
++values = [
++  "-D", "-amin", "-anewer", "-atime", "-cmin", "-cnewer", "-context", "-ctime",
++  "-fstype", "-gid", "-group", "-ilname", "-iname", "-inum", "-ipath", "-iregex",
++  "-iwholename", "-links", "-lname", "-mmin", "-mtime", "-name", "-newer", "-path",
++  "-perm", "-regex", "-samefile", "-size", "-type", "-uid", "-used", "-user",
++  "-wholename", "-xtype", "-maxdepth", "-mindepth", "-regextype", "-files0-from",
++  "-fprint", "-fprint0", "-fls", "-fprintf", "-printf",
++  "-neweraa", "-neweraB", "-newerac", "-neweram", "-newerat",
++  "-newerBa", "-newerBB", "-newerBc", "-newerBm", "-newerBt",
++  "-newerca", "-newercB", "-newercc", "-newercm", "-newerct",
++  "-newerma", "-newermB", "-newermc", "-newermm", "-newermt",
++]
++optional = ["-O"]
++[[command.effect]]
++kind = "destroys"
++when = "flag:-delete"
++reason = "find -delete removes files"
++[[command.effect]]
++# `{}` is a path unknown at classification time: a non-literal operand of the inner
++# command (spec §4, row 9).
++kind = "runs-command-at"
++at = "until:-exec|-execdir|-ok|-okdir"
++terminators = [";", "+"]
++
++[[command]]
++names = ["watch"]
++example = "watch true"
++prefix = "watch"
++permute = false
++no_command = "nothing"
++terminal_stdin = "passes-to-inner"
++flags = ["-b", "--beep", "-c", "--color", "-C", "--no-color", "-e", "--errexit", "-g",
++  "--chgexit", "-t", "--no-title", "-w", "--no-wrap", "-x", "--exec", "-p",
++  "--precise", "-r", "--no-rerun", "-f", "--follow", "-h", "--help", "-v",
++  "--version"]
++values = ["-n", "--interval", "-q", "--equexit", "-s", "--shotsdir"]
++optional = ["-d", "--differences"]
++[[command.effect]]
++# Without -x, watch joins its words and runs them with `sh -c`.
++kind = "runs-command-at"
++at = "operand:0"
++joined = "sh"
++when = "no-flag:-x|--exec"
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:0"
++when = "flag:-x|--exec"
++
++[[command]]
++names = ["exec"]
++example = "exec true"
++prefix = "exec"
++permute = false
++no_command = "nothing"
++terminal_stdin = "passes-to-inner"
++flags = ["-c", "-l"]
++values = ["-a"]
++[[command.effect]]
++kind = "alters-session"
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:0"
++
++[[command]]
++names = ["command"]
++example = "command true"
++prefix = "command"
++permute = false
++no_command = "nothing"
++terminal_stdin = "passes-to-inner"
++flags = ["-p", "-v", "-V"]
++[[command.effect]]
++kind = "alters-session"
++when = "no-flag:-v|-V"
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:0"
++when = "no-flag:-v|-V"
++
++[[command]]
++names = ["builtin"]
++example = "builtin true"
++prefix = "builtin"
++permute = false
++no_command = "nothing"
++terminal_stdin = "passes-to-inner"
++[[command.effect]]
++kind = "alters-session"
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:0"
++
++[[command]]
++names = ["coproc"]
++example = "coproc true"
++prefix = "coproc"
++permute = false
++no_command = "nothing"
++terminal_stdin = "passes-to-inner"
++[[command.effect]]
++# A coprocess reads from a pipe the shell writes to.
++kind = "runs-command-at"
++at = "operand:0"
++inner_stdin = "pipe"
++
++[[command]]
++names = ["chroot"]
++example = "chroot /"
++prefix = "chroot /"
++permute = false
++no_command = "opens-shell"
++terminal_stdin = "passes-to-inner"
++flags = ["--skip-chdir", "-h", "--help", "-V", "--version"]
++values = ["--userspec", "--groups"]
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:1"
++
++[[command]]
++names = ["unshare"]
++example = "unshare"
++prefix = "unshare"
++permute = false
++no_command = "opens-shell"
++terminal_stdin = "passes-to-inner"
++flags = ["-m", "-u", "-i", "-n", "-p", "-U", "-C", "-T", "-f", "--fork", "-r",
++  "--map-root-user", "-c", "--map-current-user", "--map-auto", "--keep-caps", "-h",
++  "--help", "-V", "--version"]
++values = ["-R", "--root", "-w", "--wd", "-S", "--setuid", "-G", "--setgid",
++  "--propagation", "--setgroups", "--monotonic", "--boottime", "--map-user",
++  "--map-group", "--map-users", "--map-groups", "-l", "--load-interp"]
++optional = ["--mount", "--uts", "--ipc", "--net", "--pid", "--user", "--cgroup",
++  "--time", "--mount-proc", "--kill-child", "--mount-binfmt"]
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:0"
++
++[[command]]
++names = ["nsenter"]
++example = "nsenter -t 1"
++prefix = "nsenter -t 1"
++permute = false
++no_command = "opens-shell"
++terminal_stdin = "passes-to-inner"
++flags = ["-a", "--all", "-F", "--no-fork", "--preserve-credentials", "-e", "--env",
++  "-c", "--join-cgroup", "-h", "--help", "-V", "--version"]
++values = ["-t", "--target", "-S", "--setuid", "-G", "--setgid", "-N", "--net-socket"]
++optional = ["-m", "--mount", "-u", "--uts", "-i", "--ipc", "-n", "--net", "-p",
++  "--pid", "-U", "--user", "-C", "--cgroup", "-T", "--time", "-r", "--root", "-w",
++  "--wd"]
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:0"
++
++[[command]]
++names = ["busybox"]
++example = "busybox"
++prefix = "busybox"
++permute = false
++no_command = "nothing"
++terminal_stdin = "passes-to-inner"
++flags = ["--list", "--list-full", "--help", "--install"]
++[[command.effect]]
++# The first operand is the applet: the inner command.
++kind = "runs-command-at"
++at = "operand:0"
++
++[[command]]
++names = ["ssh-agent"]
++example = "ssh-agent"
++prefix = "ssh-agent"
++permute = false
++no_command = "nothing"
++terminal_stdin = "passes-to-inner"
++flags = ["-c", "-s", "-d", "-D", "-k"]
++values = ["-a", "-E", "-P", "-t", "-O"]
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:0"
++
++# --- shells and text-runners (class 7) ------------------------------------------------
++
++[[command]]
++names = ["bash", "rbash", "sh", "dash", "static-sh", "ash", "hush"]
++example = "bash"
++plus = true
++permute = false
++no_command = "opens-shell"
++terminal_stdin = "opens-shell"
++flags = [
++  "-", "-a", "-b", "-C", "-e", "-E", "-f", "-h", "-H", "-i", "-k", "-l", "-m", "-n",
++  "-p", "-P", "-r", "-s", "-t", "-T", "-u", "-v", "-x", "-B", "-D", "-c",
++  "+a", "+b", "+C", "+e", "+E", "+f", "+h", "+H", "+k", "+m", "+n", "+p", "+P",
++  "+t", "+T", "+u", "+v", "+x", "+B",
++  "--debugger", "--dump-po-strings", "--dump-strings", "--help", "--login",
++  "--noediting", "--noprofile", "--norc", "--posix", "--pretty-print", "--restricted",
++  "--verbose", "--version",
++]
++values = ["-o", "-O", "+o", "+O", "--init-file", "--rcfile"]
++[[command.effect]]
++kind = "runs-text"
++at = "operand:0"
++grammar = "bash"
++when = "flag:-c"
++[[command.effect]]
++kind = "runs-file-as-code"
++at = "operand:0"
++when = ["no-flag:-c|-s", "operands"]
++[[command.effect]]
++kind = "runs-stdin-as-code"
++grammar = "bash"
++when = ["no-flag:-c", "flag:-s"]
++[[command.effect]]
++kind = "runs-stdin-as-code"
++grammar = "bash"
++when = ["no-flag:-c", "no-operands"]
++[[command.effect]]
++kind = "runs-file-as-code"
++at = "value:--init-file|--rcfile"
++
++[[command]]
++names = ["zsh"]
++example = "zsh"
++plus = true
++permute = false
++no_command = "opens-shell"
++terminal_stdin = "opens-shell"
++flags = [
++  "-a", "-b", "-c", "-d", "-e", "-f", "-g", "-h", "-i", "-j", "-k", "-l", "-m", "-n",
++  "-p", "-q", "-r", "-s", "-t", "-u", "-v", "-w", "-x", "-y", "-z",
++  "-A", "-B", "-C", "-D", "-E", "-F", "-G", "-H", "-I", "-J", "-K", "-L", "-M", "-N",
++  "-P", "-Q", "-R", "-S", "-T", "-U", "-V", "-W", "-X", "-Y", "-Z",
++  "-0", "-1", "-2", "-3", "-4", "-5", "-6", "-7", "-8", "-9",
++  "+a", "+b", "+d", "+e", "+f", "+g", "+h", "+i", "+j", "+k", "+l", "+m", "+n", "+p",
++  "+q", "+r", "+t", "+u", "+v", "+w", "+x", "+y", "+z",
++  "+A", "+B", "+C", "+D", "+E", "+F", "+G", "+H", "+I", "+J", "+K", "+L", "+M", "+N",
++  "+P", "+Q", "+R", "+S", "+T", "+U", "+V", "+W", "+X", "+Y", "+Z",
++  "--help", "--version",
++]
++values = ["-o", "+o", "--emulate"]
++[[command.effect]]
++kind = "runs-text"
++at = "operand:0"
++grammar = "zsh"
++when = "flag:-c"
++[[command.effect]]
++kind = "runs-file-as-code"
++at = "operand:0"
++when = ["no-flag:-c|-s", "operands"]
++[[command.effect]]
++kind = "runs-stdin-as-code"
++grammar = "zsh"
++when = ["no-flag:-c", "flag:-s"]
++[[command.effect]]
++kind = "runs-stdin-as-code"
++grammar = "zsh"
++when = ["no-flag:-c", "no-operands"]
++
++[[command]]
++# Shells the target does not ship, by name: their text is in no grammar the gate parses.
++names = ["ksh", "ksh93", "mksh", "lksh", "pdksh", "yash", "posh", "csh", "tcsh", "fish"]
++example = "ksh"
++plus = true
++permute = false
++no_command = "opens-shell"
++terminal_stdin = "opens-shell"
++flags = [
++  "-a", "-b", "-c", "-d", "-e", "-f", "-g", "-h", "-i", "-k", "-l", "-m", "-n", "-p",
++  "-q", "-r", "-s", "-t", "-u", "-v", "-x", "-B", "-C", "-D", "-E", "-H", "-L", "-N",
++  "-P", "-T", "-V", "-X", "+a", "+b", "+e", "+f", "+h", "+k", "+m", "+n", "+p", "+u",
++  "+v", "+x", "+B", "+C", "+E", "+H", "+P", "--help", "--version", "--login",
++  "--interactive", "--no-config", "--private", "--norc", "--noprofile",
++]
++values = ["-o", "+o", "-O", "+O", "--command", "--init-command", "--rcfile"]
++[[command.effect]]
++kind = "runs-text"
++at = "operand:0"
++grammar = "shell-arguments"
++when = "flag:-c"
++[[command.effect]]
++kind = "runs-text"
++at = "value:--command|--init-command"
++grammar = "shell-arguments"
++[[command.effect]]
++kind = "runs-file-as-code"
++at = "value:--rcfile"
++[[command.effect]]
++kind = "runs-file-as-code"
++at = "operand:0"
++when = ["no-flag:-c|-s", "operands"]
++[[command.effect]]
++kind = "runs-stdin-as-code"
++grammar = "shell-arguments"
++when = ["no-flag:-c", "flag:-s"]
++[[command.effect]]
++kind = "runs-stdin-as-code"
++grammar = "shell-arguments"
++when = ["no-flag:-c|--command", "no-operands"]
++
++[[command]]
++# login starts a login shell; `login -f root` as root skips the password.
++names = ["login", "sulogin"]
++example = "login"
++permute = false
++no_command = "opens-shell"
++terminal_stdin = "opens-shell"
++flags = ["-p", "-f", "-H", "-e", "--force", "-h", "--help", "-V", "--version"]
++values = ["-t", "--timeout"]
++
++[[command]]
++names = ["python3", "python3.14"]
++example = "python3"
++permute = false
++no_command = "opens-shell"
++terminal_stdin = "opens-shell"
++flags = ["-b", "-B", "-d", "-E", "-h", "-i", "-I", "-O", "-P", "-q", "-R", "-s", "-S",
++  "-u", "-v", "-V", "-x", "-?", "--help", "--help-env", "--help-xoptions",
++  "--help-all", "--version"]
++values = ["-c", "-m", "-W", "-X", "--check-hash-based-pycs"]
++final = ["-c", "-m"]
++[[command.effect]]
++kind = "runs-text"
++at = "value:-c"
++grammar = "python"
++[[command.effect]]
++kind = "runs-file-as-code"
++at = "value:-m"
++[[command.effect]]
++kind = "runs-file-as-code"
++at = "operand:0"
++when = ["no-flag:-c|-m", "operands"]
++[[command.effect]]
++kind = "runs-stdin-as-code"
++grammar = "python"
++when = ["no-flag:-c|-m", "no-operands"]
++[[command.effect]]
++kind = "opens-shell"
++when = "flag:-i"
++
++[[command]]
++names = ["perl", "perl5.40.1", "perl5.40-x86_64-linux-gnu"]
++example = "perl"
++permute = false
++no_command = "opens-shell"
++terminal_stdin = "opens-shell"
++flags = ["-a", "-c", "-n", "-p", "-s", "-S", "-t", "-T", "-u", "-U", "-v", "-w", "-W",
++  "-X", "-h", "-f", "-g"]
++values = ["-e", "-E", "-I", "-m", "-M"]
++optional = ["-0", "-C", "-d", "-D", "-F", "-i", "-l", "-x", "-V"]
++[[command.effect]]
++kind = "runs-text"
++at = "value:-e|-E"
++grammar = "perl"
++[[command.effect]]
++kind = "runs-file-as-code"
++at = "value:-m|-M|-d"
++[[command.effect]]
++kind = "runs-file-as-code"
++at = "operand:0"
++when = ["no-flag:-e|-E", "operands"]
++[[command.effect]]
++kind = "runs-stdin-as-code"
++grammar = "perl"
++when = ["no-flag:-e|-E", "no-operands"]
++[[command.effect]]
++# The debugger is an interactive prompt that runs perl.
++kind = "opens-shell"
++when = "flag:-d"
++
++[[command]]
++names = ["perldoc"]
++example = "perldoc perl"
++flags = ["-h", "-D", "-t", "-u", "-m", "-l", "-F", "-i", "-V", "-T", "-r", "-U", "-X"]
++values = ["-f", "-q", "-v", "-a", "-L", "-d", "-o", "-M", "-w", "-n"]
++[[command.effect]]
++# -M loads a formatter module and -n names the nroff program to run.
++kind = "runs-file-as-code"
++at = "value:-M|-n"
++
++[[command]]
++names = ["perltex"]
++example = "perltex x.tex"
++argv = "fixed"
++[[command.effect]]
++# perltex runs the Perl code in the document it typesets.
++kind = "runs-file-as-code"
++
++[[command]]
++names = ["tclsh", "tclsh8.6", "wish", "wish8.6"]
++example = "tclsh"
++permute = false
++no_command = "opens-shell"
++terminal_stdin = "opens-shell"
++flags = ["-sync", "-help"]
++values = ["-encoding", "-display", "-geometry", "-name", "-use", "-visual",
++  "-colormap"]
++[[command.effect]]
++kind = "runs-file-as-code"
++at = "operand:0"
++[[command.effect]]
++kind = "runs-stdin-as-code"
++grammar = "tcl"
++when = "no-operands"
++
++[[command]]
++names = ["gjs", "gjs-console"]
++example = "gjs"
++permute = false
++no_command = "opens-shell"
++terminal_stdin = "opens-shell"
++flags = ["-m", "--module", "--debugger", "-h", "--help", "--version"]
++values = ["-c", "--command", "-I", "--include-path", "--coverage-prefix",
++  "--coverage-output", "--log-file"]
++optional = ["--profile"]
++final = ["-c", "--command"]
++[[command.effect]]
++kind = "runs-text"
++at = "value:-c|--command"
++grammar = "js"
++[[command.effect]]
++kind = "runs-file-as-code"
++at = "operand:0"
++when = ["no-flag:-c|--command", "operands"]
++[[command.effect]]
++kind = "runs-stdin-as-code"
++grammar = "js"
++when = ["no-flag:-c|--command", "no-operands"]
++
++[[command]]
++names = ["gdb"]
++example = "gdb -batch"
++prefix = "gdb -batch --args"
++no_command = "nothing"
++terminal_stdin = "opens-shell"
++flags = [
++  "-batch", "--batch", "-batch-silent", "--batch-silent", "-q", "-quiet", "--quiet",
++  "-silent", "--silent", "-n", "-nx", "--nx", "-nh", "--nh", "-readnow", "--readnow",
++  "-readnever", "--readnever", "-write", "--write", "-w", "-statistics",
++  "--statistics", "-version", "--version", "-help", "--help", "-h", "-tui", "--tui",
++  "-return-child-result", "--return-child-result", "-dbx", "--dbx", "-args", "--args",
++]
++values = [
++  "-ex", "--ex", "-eval-command", "--eval-command", "-iex", "--iex",
++  "-init-eval-command", "--init-eval-command", "-x", "--x", "-command", "--command",
++  "-ix", "--ix", "-init-command", "--init-command", "-p", "-pid", "--pid", "-cd",
++  "--cd", "-d", "-directory", "--directory", "-s", "-symbols", "--symbols", "-e",
++  "-exec", "--exec", "-se", "--se", "-c", "-core", "--core", "-tty", "--tty",
++  "-data-directory", "--data-directory", "-D", "-l", "-b", "-i", "-interpreter",
++  "--interpreter",
++]
++[[command.effect]]
++kind = "runs-text"
++at = "value:-ex|--ex|-eval-command|--eval-command|-iex|--iex|-init-eval-command|--init-eval-command"
++grammar = "gdb"
++[[command.effect]]
++kind = "runs-file-as-code"
++at = "value:-x|--x|-command|--command|-ix|--ix|-init-command|--init-command"
++[[command.effect]]
++# Without -batch, gdb reads its commands (which include `shell`) from stdin.
++kind = "runs-stdin-as-code"
++grammar = "gdb"
++when = "no-flag:-batch|--batch|-batch-silent|--batch-silent"
++[[command.effect]]
++kind = "runs-command-at"
++at = "rest:-args|--args"
++
++[[command]]
++names = ["screen"]
++example = "screen"
++prefix = "screen"
++permute = false
++no_command = "opens-shell"
++terminal_stdin = "passes-to-inner"
++flags = ["-a", "-A", "-d", "-D", "-r", "-R", "-m", "-f", "-fn", "-fa", "-i", "-l",
++  "-ln", "-L", "-ls", "-list", "-O", "-q", "-Q", "-U", "-wipe", "-x", "-v"]
++values = ["-c", "-e", "-h", "-p", "-s", "-S", "-t", "-T", "-X", "-Logfile"]
++[[command.effect]]
++kind = "runs-file-as-code"
++at = "value:-c"
++[[command.effect]]
++kind = "runs-text"
++at = "value:-X"
++grammar = "screen"
++[[command.effect]]
++# -s names the shell screen runs in each new window.
++kind = "runs-command-at"
++at = "value:-s"
++inner_stdin = "terminal"
++[[command.effect]]
++kind = "runs-command-at"
++at = "operand:0"
++inner_stdin = "terminal"
++
++[[command]]
++names = ["tmux"]
++example = "tmux"
++permute = false
++no_command = "opens-shell"
++terminal_stdin = "passes-to-inner"
++flags = ["-2", "-C", "-D", "-l", "-N", "-u", "-v", "-V", "-h"]
++values = ["-c", "-f", "-L", "-S", "-T"]
++[[command.effect]]
++kind = "runs-text"
++at = "value:-c"
++grammar = "sh"
++[[command.effect]]
++kind = "runs-file-as-code"
++at = "value:-f"
++[[command.effect]]
++# tmux commands (`new-session 'cmd'`, `send-keys`, `run-shell`) run text.
++kind = "runs-text"
++at = "operands:0"
++grammar = "tmux"
++
++[[command]]
++names = ["x-terminal-emulator", "ptyxis"]
++example = "x-terminal-emulator"
++prefix = "x-terminal-emulator -e"
++no_command = "opens-shell"
++terminal_stdin = "passes-to-inner"
++flags = ["-e", "-x", "--help", "--version"]
++values = ["-T", "--title", "--working-directory", "-geometry"]
++[[command.effect]]
++# Some terminals run the words after -e directly, others as one shell string.
++kind = "runs-command-at"
++at = "rest:-e|-x"
++joined = "sh"
++inner_stdin = "terminal"
++
++[[command]]
++names = ["sg"]
++example = "sg adm"
++permute = false
++no_command = "opens-shell"
++terminal_stdin = "opens-shell"
++flags = ["-"]
++[[command.effect]]
++# sg runs its command with /bin/sh -c.
++kind = "runs-text"
++at = "operands:1"
++grammar = "sh"
++
++[[command]]
++names = ["newgrp"]
++example = "newgrp adm"
++permute = false
++no_command = "opens-shell"
++terminal_stdin = "opens-shell"
++flags = ["-", "-l"]
++
++[[command]]
++names = ["at", "batch"]
++example = "at now"
++no_command = "nothing"
++terminal_stdin = "opens-shell"
++flags = ["-V", "-m", "-M", "-l", "-r", "-d", "-b", "-c", "-v"]
++values = ["-q", "-f", "-t"]
++[[command.effect]]
++kind = "runs-stdin-as-code"
++grammar = "sh"
++when = "no-flag:-f|-l|-r|-d|-c"
++[[command.effect]]
++kind = "runs-file-as-code"
++at = "value:-f"
++
++[[command]]
++names = ["crontab"]
++example = "crontab -l"
++flags = ["-l", "-r", "-e", "-i", "-n"]
++values = ["-u", "-T"]
++[[command.effect]]
++kind = "destroys"
++when = "flag:-r"
++reason = "crontab -r removes every job"
++[[command.effect]]
++# A crontab file is commands run later.
++kind = "stores-code"
++at = "operand:0"
++grammar = "crontab"
++when = "no-flag:-l|-r|-e"
++
++[[command]]
++names = ["pppd"]
++example = "pppd call x"
++argv = "fixed"
++[[command.effect]]
++# connect, disconnect, pty, init, welcome and plugin options run programs.
++kind = "runs-file-as-code"
++
++# --- setuid, setgid and capability binaries that do not elevate (class 1) -------------
++# Reviewed: none of these runs a command chosen by the caller as another user.
++
++[[command]]
++names = [
++  "passwd", "chsh", "chfn", "gpasswd", "chage", "expiry", "mount", "umount",
++  "mount.ntfs", "mount.ntfs-3g", "ntfs-3g", "fusermount", "fusermount3",
++  "unix_chkpwd", "pam_extrausers_chkpwd", "ping", "ping4", "ping6", "mtr-packet",
++  "nvtop",
++]
++example = "passwd"
++argv = "fixed"
++
++# --- other binaries the inventory lists (class 1) -------------------------------------
++
++[[command]]
++names = [
++  "python3-config", "python3.14-config", "x86_64-linux-gnu-python3-config",
++  "x86_64-linux-gnu-python3.14-config", "cpp", "cpp-15", "x86_64-linux-gnu-cpp",
++  "x86_64-linux-gnu-cpp-15", "bashbug", "clear_console", "dh_bash-completion",
++  "perlbug", "perlthanks", "perli11ndoc", "perlivp", "perlcalls-bpfcc",
++  "perlflow-bpfcc", "perlstat-bpfcc",
++]
++example = "cpp x.c"
++argv = "fixed"
++
++# --- destructive commands (spec §4) ---------------------------------------------------
++
++[[command]]
++names = ["rm", "gnurm"]
++example = "rm x"
++flags = ["-f", "--force", "-i", "-I", "-r", "-R", "--recursive", "-d", "--dir", "-v",
++  "--verbose", "--one-file-system", "--no-preserve-root", "--help", "--version"]
++optional = ["--interactive", "--preserve-root"]
++[[command.effect]]
++kind = "destroys"
++when = "flag:-r|-R|--recursive"
++reason = "rm -r removes a whole tree"
++[[command.effect]]
++# A glob, an expansion or find's `{}` may name anything (spec §4, row 9).
++kind = "destroys"
++when = "operand-nonliteral"
++reason = "rm with an operand the gate cannot read"
++[[command.effect]]
++kind = "destroys"
++when = "flag:--no-preserve-root"
++reason = "rm --no-preserve-root"
++
++[[command]]
++names = ["dd", "shred", "truncate", "wipefs"]
++example = "dd if=/dev/zero of=x"
++argv = "fixed"
++[[command.effect]]
++kind = "destroys"
++
++[[command]]
++names = [
++  "mkfs", "mkfs.ext2", "mkfs.ext3", "mkfs.ext4", "mkfs.vfat", "mkfs.fat",
++  "mkfs.msdos", "mkfs.xfs", "mkfs.btrfs", "mkfs.ntfs", "mkfs.exfat", "mkfs.f2fs",
++  "mkfs.minix", "mkfs.cramfs", "mkfs.bfs", "mke2fs", "mkdosfs", "mkntfs", "mkswap",
++  "fdisk", "sfdisk", "cfdisk", "parted", "gdisk", "sgdisk", "cgdisk", "blkdiscard",
++]
++example = "mkfs.ext4 /dev/sdb1"
++argv = "fixed"
++[[command.effect]]
++kind = "destroys"
++reason = "writes a file system or a partition table"
++
++[[command]]
++names = ["chmod"]
++example = "chmod 644 x"
++modes = true
++flags = ["-c", "--changes", "-f", "--silent", "--quiet", "-v", "--verbose", "-R",
++  "--recursive", "--no-preserve-root", "--preserve-root", "-H", "-L", "-P",
++  "--dereference", "--no-dereference", "--help", "--version"]
++values = ["--reference"]
++[[command.effect]]
++kind = "destroys"
++when = "flag:-R|--recursive"
++reason = "recursive chmod"
++
++[[command]]
++names = ["chown", "chgrp"]
++example = "chown u x"
++flags = ["-c", "--changes", "-f", "--silent", "--quiet", "-v", "--verbose", "-h",
++  "--no-dereference", "--dereference", "-H", "-L", "-P", "-R", "--recursive",
++  "--no-preserve-root", "--preserve-root", "--help", "--version"]
++values = ["--from", "--reference"]
++[[command.effect]]
++kind = "destroys"
++when = "flag:-R|--recursive"
++reason = "recursive chown"
++
++[[command]]
++names = ["kill"]
++example = "kill 1"
++signal_option = true
++max_options = 1
++flags = ["-l", "-L"]
++values = ["-s", "-n"]
++[[command.effect]]
++kind = "destroys"
++when = "operand:-1"
++reason = "kill -1 signals every process"
++
++[[command]]
++names = ["systemctl"]
++example = "systemctl status ssh"
++inherit = true
++flags = [
++  "-a", "--all", "-r", "--recursive", "--reverse", "--after", "--before",
++  "--with-dependencies", "-l", "--full", "--value", "--show-types", "-T",
++  "--show-transaction", "-i", "--ignore-inhibitors", "-q", "--quiet", "--no-warn",
++  "--no-block", "--wait", "--no-wall", "--no-reload", "--no-ask-password", "-f",
++  "--force", "--now", "--runtime", "--firmware-setup", "--plain", "--mkdir",
++  "--marked", "--read-only", "--no-legend", "--no-pager", "--user", "--system",
++  "--global", "-h", "--help", "--version", "-C",
++]
++values = [
++  "-t", "--type", "--state", "-p", "--property", "--job-mode", "--kill-whom",
++  "--kill-value", "-s", "--signal", "--what", "--message", "--root", "--image",
++  "--image-policy", "--preset-mode", "-n", "--lines", "-o", "--output",
++  "--boot-loader-menu", "--boot-loader-entry", "--reboot-argument", "--timestamp",
++  "--drop-in", "--when", "--legend", "-H", "--host", "-M", "--machine",
++  "--check-inhibitors", "--capsule",
++]
++[command.subcommands.stop]
++[[command.subcommands.stop.effect]]
++kind = "destroys"
++[command.subcommands.disable]
++[[command.subcommands.disable.effect]]
++kind = "destroys"
++[command.subcommands.mask]
++[[command.subcommands.mask.effect]]
++kind = "destroys"
++[command.subcommands.kill]
++[[command.subcommands.kill.effect]]
++kind = "destroys"
++[command.subcommands.isolate]
++[[command.subcommands.isolate.effect]]
++kind = "destroys"
++[command.subcommands.poweroff]
++[[command.subcommands.poweroff.effect]]
++kind = "destroys"
++[command.subcommands.reboot]
++[[command.subcommands.reboot.effect]]
++kind = "destroys"
++[command.subcommands.halt]
++[[command.subcommands.halt.effect]]
++kind = "destroys"
++[command.subcommands.soft-reboot]
++[[command.subcommands.soft-reboot.effect]]
++kind = "destroys"
++[command.subcommands.kexec]
++[[command.subcommands.kexec.effect]]
++kind = "destroys"
++[command.subcommands.emergency]
++[[command.subcommands.emergency.effect]]
++kind = "destroys"
++[command.subcommands.rescue]
++[[command.subcommands.rescue.effect]]
++kind = "destroys"
++[command.subcommands.switch-root]
++[[command.subcommands.switch-root.effect]]
++kind = "destroys"
++
++[[command]]
++# The same file as systemctl: each one stops the system.
++names = ["halt", "poweroff", "reboot", "shutdown"]
++example = "reboot"
++argv = "fixed"
++[[command.effect]]
++kind = "destroys"
++reason = "stops or restarts the system"
++
++# --- class-7 floor rows: git, tar, ssh (spec rows 8, 10, 11, 27) ----------------------
++
++[[command]]
++names = ["git"]
++example = "git status"
++permute = false
++flags = ["-p", "--paginate", "-P", "--no-pager", "--bare", "--no-replace-objects",
++  "--no-lazy-fetch", "--no-optional-locks", "--no-advice", "--literal-pathspecs",
++  "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs", "-v", "--version",
++  "-h", "--help", "--html-path", "--man-path", "--info-path"]
++values = ["-C", "-c", "--config-env", "--git-dir", "--work-tree", "--namespace",
++  "--super-prefix", "--list-cmds", "--attr-source"]
++optional = ["--exec-path"]
++class_7_gap = ["-c", "--config-env", "--exec-path"]
++[command.subcommands.clean]
++flags = ["-d", "-f", "--force", "-i", "--interactive", "-n", "--dry-run", "-q",
++  "--quiet", "-x", "-X"]
++values = ["-e", "--exclude"]
++[[command.subcommands.clean.effect]]
++kind = "destroys"
++reason = "git clean removes untracked files"
++[command.subcommands.reset]
++flags = ["--soft", "--mixed", "--hard", "--merge", "--keep", "-q", "--quiet", "-N",
++  "--intent-to-add", "--no-recurse-submodules", "-p", "--patch",
++  "--pathspec-file-nul", "--no-refresh", "--refresh"]
++values = ["--pathspec-from-file"]
++optional = ["--recurse-submodules"]
++[[command.subcommands.reset.effect]]
++kind = "destroys"
++when = "flag:--hard"
++reason = "git reset --hard discards changes"
++[command.subcommands.push]
++flags = ["--all", "--branches", "--prune", "--mirror", "-n", "--dry-run",
++  "--porcelain", "-d", "--delete", "--tags", "--follow-tags", "--no-follow-tags",
++  "--atomic", "--no-atomic", "-f", "--force", "--force-if-includes",
++  "--no-force-if-includes", "-u", "--set-upstream", "--thin", "--no-thin", "-q",
++  "--quiet", "-v", "--verbose", "--progress", "--no-recurse-submodules", "--verify",
++  "--no-verify", "-4", "--ipv4", "-6", "--ipv6", "--no-signed"]
++values = ["-o", "--push-option", "--receive-pack", "--exec", "--repo"]
++optional = ["--force-with-lease", "--recurse-submodules", "--signed"]
++[[command.subcommands.push.effect]]
++kind = "destroys"
++when = "flag:-f|--force|--force-with-lease|--force-if-includes|--mirror|-d|--delete|--prune"
++reason = "git push that rewrites or deletes remote refs"
++[[command.subcommands.push.effect]]
++kind = "destroys"
++when = "operand-prefix:+"
++reason = "git push with a forced refspec"
++[[command.subcommands.push.effect]]
++kind = "destroys"
++when = "operand-prefix::"
++reason = "git push that deletes a remote ref"
++
++[[command]]
++# The same file as git; run by name, they serve a repository to a client.
++names = ["git-receive-pack", "git-upload-archive", "git-upload-pack"]
++example = "git-upload-pack ."
++argv = "fixed"
++
++[[command]]
++names = ["tar"]
++example = "tar -tf a.tar"
++bundle_first = true
++flags = [
++  "-A", "--catenate", "--concatenate", "-c", "--create", "-d", "--diff", "--compare",
++  "--delete", "-r", "--append", "-t", "--list", "--test-label", "-u", "--update",
++  "-x", "--extract", "--get", "-a", "--auto-compress", "-j", "--bzip2", "-J", "--xz",
++  "-z", "--gzip", "--gunzip", "--ungzip", "-Z", "--compress", "--uncompress",
++  "--lzip", "--lzma", "--lzop", "--zstd", "--no-auto-compress", "-k",
++  "--keep-old-files", "--keep-newer-files", "--keep-directory-symlink",
++  "--skip-old-files", "--overwrite", "--overwrite-dir", "--no-overwrite-dir",
++  "--recursive-unlink", "--remove-files", "-U", "--unlink-first", "-W", "--verify",
++  "--ignore-zeros", "-i", "--ignore-failed-read", "--no-recursion", "--recursion",
++  "--one-file-system", "-l", "--check-links", "-h", "--dereference",
++  "--hard-dereference", "-O", "--to-stdout", "-m", "--touch", "-o", "--no-same-owner",
++  "--same-owner", "-p", "--preserve-permissions", "--same-permissions",
++  "--no-same-permissions", "-s", "--preserve-order", "--same-order",
++  "--numeric-owner", "-P", "--absolute-names", "-S", "--sparse", "-v", "--verbose",
++  "-w", "--interactive", "--confirmation", "-R", "--block-number",
++  "--show-transformed-names", "--show-stored-names", "-M", "--multi-volume", "-G",
++  "--incremental", "--null", "--no-null", "--unquote", "--no-unquote", "--anchored",
++  "--no-anchored", "--ignore-case", "--no-ignore-case", "--wildcards",
++  "--no-wildcards", "--wildcards-match-slash", "--no-wildcards-match-slash",
++  "--exclude-vcs", "--exclude-vcs-ignores", "--exclude-backups", "--exclude-caches",
++  "--exclude-caches-all", "--exclude-caches-under", "--full-time", "--utc",
++  "--delay-directory-restore", "--no-delay-directory-restore", "--no-xattrs",
++  "--xattrs", "--acls", "--no-acls", "--selinux", "--no-selinux", "-B",
++  "--read-full-records", "--help", "--usage", "--version", "--restrict",
++  "--force-local", "--seek", "--no-seek", "--check-device", "--no-check-device",
++  "--ignore-command-error", "--no-ignore-command-error", "-n",
++]
++values = [
++  "-f", "--file", "-C", "--directory", "-T", "--files-from", "-X", "--exclude-from",
++  "-b", "--blocking-factor", "-H", "--format", "-K", "--starting-file", "-N",
++  "--newer", "--after-date", "-V", "--label", "--exclude", "--strip-components",
++  "--owner", "--group", "--mode", "--mtime", "--transform", "--xform", "--suffix",
++  "-L", "--tape-length", "--record-size", "--volno-file", "--index-file",
++  "--newer-mtime", "--quoting-style", "--sort", "-g", "--listed-incremental",
++  "--to-command", "-I", "--use-compress-program", "-F", "--info-script",
++  "--new-volume-script", "--rsh-command", "--rmt-command", "--checkpoint-action",
++  "--exclude-ignore", "--exclude-ignore-recursive", "--exclude-tag",
++  "--exclude-tag-all", "--exclude-tag-under", "--hole-detection", "--pax-option",
++  "--xattrs-include", "--xattrs-exclude", "--warning", "--level", "--clamp-mtime",
++]
++optional = ["--totals", "--backup", "--occurrence", "--checkpoint"]
++class_7_gap = ["--to-command"]
++[[command.effect]]
++# Not in the spec's class-7 list, so read as code: decision B.
++kind = "runs-text"
++at = "value:-I|--use-compress-program|--rsh-command|--rmt-command|--checkpoint-action"
++grammar = "sh"
++[[command.effect]]
++kind = "runs-file-as-code"
++at = "value:-F|--info-script|--new-volume-script"
++[[command.effect]]
++kind = "destroys"
++when = "flag:--remove-files|--recursive-unlink|-U|--unlink-first"
++reason = "tar that removes files"
++
++[[command]]
++names = ["ssh"]
++example = "ssh h"
++permute = false
++flags = ["-4", "-6", "-A", "-a", "-C", "-f", "-G", "-g", "-K", "-k", "-M", "-N", "-n",
++  "-q", "-s", "-T", "-t", "-V", "-v", "-X", "-x", "-Y", "-y"]
++values = ["-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m",
++  "-O", "-o", "-P", "-p", "-Q", "-R", "-S", "-W", "-w"]
++class_7_gap = ["-o"]
++[[command.effect]]
++# A config file other than the user's own can hold ProxyCommand or LocalCommand.
++kind = "runs-file-as-code"
++at = "value:-F"
++
++# --- builtins (spec §3) ---------------------------------------------------------------
++
++[[command]]
++names = ["alias"]
++example = "alias"
++permute = false
++flags = ["-p"]
++[[command.effect]]
++kind = "alters-session"
++[[command.effect]]
++kind = "stores-code"
++at = "operands:0"
++grammar = "bash"
++when = "operand-contains:="
++
++[[command]]
++names = ["unalias", "set", "shopt", "hash"]
++example = "set -e"
++argv = "fixed"
++[[command.effect]]
++kind = "alters-session"
++
++[[command]]
++names = ["source", "."]
++example = "source f"
++permute = false
++values = ["-p"]
++[[command.effect]]
++kind = "alters-session"
++[[command.effect]]
++kind = "runs-file-as-code"
++at = "operand:0"
++
++[[command]]
++names = ["eval"]
++example = "eval true"
++permute = false
++[[command.effect]]
++kind = "alters-session"
++[[command.effect]]
++kind = "runs-text"
++at = "operands:0"
++grammar = "bash"
++
++[[command]]
++names = ["trap"]
++example = "trap"
++permute = false
++flags = ["-l", "-p", "-P"]
++[[command.effect]]
++kind = "alters-session"
++[[command.effect]]
++kind = "stores-code"
++at = "operand:0"
++grammar = "bash"
++when = "operands>=2"
++
++[[command]]
++names = ["enable"]
++example = "enable -n test"
++permute = false
++flags = ["-a", "-d", "-n", "-p", "-s"]
++values = ["-f"]
++[[command.effect]]
++kind = "alters-session"
++[[command.effect]]
++kind = "runs-file-as-code"
++at = "value:-f"
++
++[[command]]
++names = ["bind"]
++example = "bind -l"
++permute = false
++flags = ["-l", "-p", "-P", "-s", "-S", "-v", "-V", "-X"]
++values = ["-m", "-q", "-u", "-r", "-f", "-x"]
++[[command.effect]]
++kind = "alters-session"
++[[command.effect]]
++kind = "stores-code"
++at = "value:-x"
++grammar = "bash"
++[[command.effect]]
++# A key binding can type a command line.
++kind = "stores-code"
++at = "operands:0"
++grammar = "readline"
++[[command.effect]]
++kind = "runs-file-as-code"
++at = "value:-f"
++
++[[command]]
++names = ["complete"]
++example = "complete -F f x"
++permute = false
++flags = ["-a", "-b", "-c", "-d", "-e", "-f", "-g", "-j", "-k", "-s", "-u", "-v", "-D",
++  "-E", "-I", "-p", "-r"]
++values = ["-o", "-A", "-G", "-W", "-F", "-C", "-X", "-P", "-S"]
++[[command.effect]]
++kind = "alters-session"
++[[command.effect]]
++kind = "stores-code"
++at = "value:-C|-W"
++grammar = "bash"
++
++[[command]]
++names = ["compgen"]
++example = "compgen -c"
++permute = false
++flags = ["-a", "-b", "-c", "-d", "-e", "-f", "-g", "-j", "-k", "-s", "-u", "-v", "-D",
++  "-E", "-I", "-p", "-r"]
++values = ["-o", "-A", "-G", "-W", "-F", "-C", "-X", "-P", "-S", "-V"]
++[[command.effect]]
++kind = "runs-text"
++at = "value:-C|-W"
++grammar = "bash"
++
++[[command]]
++names = ["export"]
++example = "export A=1"
++permute = false
++flags = ["-f", "-n", "-p"]
++[[command.effect]]
++kind = "alters-session"
++[[command.effect]]
++kind = "sets-variable"
++at = "operands:0"
++
++[[command]]
++names = ["declare", "typeset", "local"]
++example = "declare A=1"
++plus = true
++permute = false
++flags = ["-a", "-A", "-f", "-F", "-g", "-i", "-I", "-l", "-n", "-p", "-r", "-t", "-u",
++  "-x", "+a", "+A", "+f", "+F", "+g", "+i", "+I", "+l", "+n", "+r", "+t", "+u", "+x"]
++[[command.effect]]
++kind = "alters-session"
++when = ["operands", "no-flag:-p|-f|-F"]
++[[command.effect]]
++kind = "sets-variable"
++at = "operands:0"
++
++[[command]]
++names = ["readonly"]
++example = "readonly A=1"
++permute = false
++flags = ["-a", "-A", "-f", "-p"]
++[[command.effect]]
++kind = "alters-session"
++when = "operands"
++[[command.effect]]
++kind = "sets-variable"
++at = "operands:0"
++
++[[command]]
++names = ["unset"]
++example = "unset A"
++permute = false
++flags = ["-f", "-v", "-n"]
++[[command.effect]]
++kind = "alters-session"
++[[command.effect]]
++kind = "sets-variable"
++at = "operands:0"
++
++[[command]]
++names = ["printf"]
++example = "printf x"
++permute = false
++values = ["-v"]
++[[command.effect]]
++kind = "sets-variable"
++at = "value:-v"
++
++[[command]]
++names = ["read"]
++example = "read x"
++permute = false
++flags = ["-e", "-r", "-s", "-E"]
++values = ["-a", "-d", "-i", "-n", "-N", "-p", "-t", "-u"]
++[[command.effect]]
++kind = "sets-variable"
++at = "operands:0"
++[[command.effect]]
++kind = "sets-variable"
++at = "value:-a"
++
++[[command]]
++names = ["mapfile", "readarray"]
++example = "mapfile a"
++permute = false
++flags = ["-t"]
++values = ["-d", "-n", "-O", "-s", "-u", "-C", "-c"]
++[[command.effect]]
++kind = "runs-text"
++at = "value:-C"
++grammar = "bash"
++[[command.effect]]
++kind = "sets-variable"
++at = "operands:0"
++
++[[command]]
++names = ["getopts"]
++example = "getopts x opt"
++permute = false
++[[command.effect]]
++kind = "sets-variable"
++at = "operand:1"
++
++[[command]]
++names = ["wait"]
++example = "wait"
++permute = false
++flags = ["-f", "-n"]
++values = ["-p"]
++[[command.effect]]
++kind = "sets-variable"
++at = "value:-p"
++
++[[command]]
++names = ["let"]
++example = "let x=1"
++permute = false
++[[command.effect]]
++kind = "sets-variable"
++at = "operands:0"
++
++[[command]]
++names = ["fc"]
++example = "fc -l"
++permute = false
++flags = ["-l", "-n", "-r", "-s"]
++values = ["-e"]
++[[command.effect]]
++kind = "runs-text"
++at = "value:-e"
++grammar = "bash"
++[[command.effect]]
++# Without -l, fc runs commands from the history, which the gate cannot see.
++kind = "runs-file-as-code"
++when = "no-flag:-l"
+diff --git a/targets/ubuntu-26.04/gate-vectors.toml b/targets/ubuntu-26.04/gate-vectors.toml
+index 722ae35..4724d27 100644
+--- a/targets/ubuntu-26.04/gate-vectors.toml
++++ b/targets/ubuntu-26.04/gate-vectors.toml
+@@ -1,9 +1,10 @@
+ # Policy-gate conformance vectors for the ubuntu-26.04 target
+ # (docs/design/specs/policy-gate/v1.md, Conformance). Loaded by nl_shell.gate.vectors.
+ #
+-# This file holds the rows landed so far: the shell-layer rows of #196. It is not the
+-# complete set the spec's Conformance section asks for; it becomes complete only when
+-# #192 (live-session resolution) lands. #197 and #198 add their rows here.
++# This file holds the rows landed so far: the shell-layer rows of #196 and the command
++# layer rows of #197 (after the `#197` comment below). It is not the complete set the
++# spec's Conformance section asks for; it becomes complete only when #192 (live-session
++# resolution) lands. #198 adds its rows here.
+ #
+ # Keys: command, origin ("proposal" | "typed"), rejected; class (required unless
+ # rejected, absent when rejected); optional reason (a substring some reason must
+@@ -46,8 +47,8 @@ row = 16
+ command = "$'\\x72m' -rf ~"
+ origin = "typed"
+ rejected = false
+-class = "mutating"
+-reason = "command word is not a literal"
++class = "destructive"
++reason = "rm -r"
+ 
+ [[vector]]
+ row = 23
+@@ -77,3 +78,105 @@ origin = "typed"
+ rejected = false
+ class = "mutating"
+ reason = "unparseable"
++
++# #197: the command layer (commands.toml and the engine in nl_shell.gate.rules).
++
++[[vector]]
++row = 8
++command = 'git -c core.pager=sh log'
++origin = "typed"
++rejected = false
++class = "mutating"
++reason = "not allowlisted"
++
++[[vector]]
++row = 9
++command = 'find . -exec rm {} \;'
++origin = "typed"
++rejected = false
++class = "destructive"
++reason = "rm with an operand the gate cannot read"
++
++[[vector]]
++row = 17
++command = '"r"m -rf ~'
++origin = "typed"
++rejected = false
++class = "destructive"
++reason = "rm -r"
++
++[[vector]]
++row = 18
++command = 'ls; rm -rf ~'
++origin = "typed"
++rejected = false
++class = "destructive"
++reason = "rm -r"
++
++[[vector]]
++row = 21
++command = 'sudo -S true'
++origin = "typed"
++rejected = true
++reason = "(§5)"
++
++[[vector]]
++row = 21
++command = 'sudo -p x true'
++origin = "typed"
++rejected = true
++reason = "(§5)"
++
++[[vector]]
++row = 21
++command = 'sudo -A true'
++origin = "typed"
++rejected = true
++reason = "(§5)"
++
++[[vector]]
++row = 22
++command = 'echo pw | sudo -S true'
++origin = "typed"
++rejected = true
++reason = "(§5)"
++
++[[vector]]
++row = 24
++command = 'sudo apt update'
++origin = "typed"
++rejected = false
++class = "privileged"
++reason = "sudo runs commands as root"
++
++[[vector]]
++row = 26
++command = 'rm -rf build'
++origin = "typed"
++rejected = false
++class = "destructive"
++reason = "rm -r"
++
++[[vector]]
++row = 27
++command = 'git status'
++origin = "typed"
++rejected = false
++class = "mutating"
++reason = "not allowlisted"
++
++[[vector]]
++row = 29
++command = 'systemctl stop ssh'
++origin = "typed"
++rejected = false
++class = "destructive"
++reason = "systemctl stop"
++
++[[vector]]
++row = 32
++command = 'env rm -rf x'
++origin = "typed"
++rejected = false
++class = "destructive"
++reason = "rm -r"
+diff --git a/targets/ubuntu-26.04/inventory.toml b/targets/ubuntu-26.04/inventory.toml
+new file mode 100644
+index 0000000..3467a4a
+--- /dev/null
++++ b/targets/ubuntu-26.04/inventory.toml
+@@ -0,0 +1,386 @@
++# The binaries on the ubuntu-26.04 reference host that the gate's command table MUST
++# cover (spec policy-gate/v1 §4.1, class 1). GENERATED by scripts/harvest_inventory.py;
++# do not edit by hand. Reviewed like an allowlist change: a name added here needs a row
++# in commands.toml, and removing a name needs a reason in the review.
++
++host = "VERSION=\"26.04.1 LTS (Resolute Raccoon)\""
++
++[[binary]]
++name = "bash"
++why = ["/etc/shells /usr/bin/bash", "dpkg bash (shells)", "same file as rbash (/usr/bin/bash)"]
++
++[[binary]]
++name = "bashbug"
++why = ["dpkg bash (shells)"]
++
++[[binary]]
++name = "busybox"
++why = ["dpkg busybox-static (shells)", "name matches busybox", "same file as static-sh (/usr/bin/busybox)"]
++
++[[binary]]
++name = "chage"
++why = ["setgid /usr/bin/chage"]
++
++[[binary]]
++name = "chfn"
++why = ["setuid /usr/bin/chfn"]
++
++[[binary]]
++name = "chsh"
++why = ["setuid /usr/bin/chsh"]
++
++[[binary]]
++name = "clear_console"
++why = ["dpkg bash (shells)"]
++
++[[binary]]
++name = "cpp"
++why = ["dpkg cpp (interpreters)", "same file as cpp-15 (/usr/bin/x86_64-linux-gnu-cpp-15)", "same file as x86_64-linux-gnu-cpp (/usr/bin/x86_64-linux-gnu-cpp-15)", "same file as x86_64-linux-gnu-cpp-15 (/usr/bin/x86_64-linux-gnu-cpp-15)"]
++
++[[binary]]
++name = "cpp-15"
++why = ["dpkg cpp-15 (interpreters)", "same file as cpp (/usr/bin/x86_64-linux-gnu-cpp-15)", "same file as x86_64-linux-gnu-cpp (/usr/bin/x86_64-linux-gnu-cpp-15)", "same file as x86_64-linux-gnu-cpp-15 (/usr/bin/x86_64-linux-gnu-cpp-15)"]
++
++[[binary]]
++name = "crontab"
++why = ["setgid /usr/bin/crontab"]
++
++[[binary]]
++name = "dash"
++why = ["/etc/shells /usr/bin/dash", "dpkg dash (shells)", "same file as sh (/usr/bin/dash)"]
++
++[[binary]]
++name = "dh_bash-completion"
++why = ["dpkg bash-completion (shells)"]
++
++[[binary]]
++name = "expiry"
++why = ["setgid /usr/bin/expiry"]
++
++[[binary]]
++name = "fusermount"
++why = ["same file as fusermount3 (/usr/bin/fusermount3)"]
++
++[[binary]]
++name = "fusermount3"
++why = ["setuid /usr/bin/fusermount3", "same file as fusermount (/usr/bin/fusermount3)"]
++
++[[binary]]
++name = "gdb"
++why = ["name matches gdb"]
++
++[[binary]]
++name = "git"
++why = ["same file as git-receive-pack (/usr/bin/git)", "same file as git-upload-archive (/usr/bin/git)", "same file as git-upload-pack (/usr/bin/git)"]
++
++[[binary]]
++name = "git-receive-pack"
++why = ["same file as git (/usr/bin/git)", "same file as git-upload-archive (/usr/bin/git)", "same file as git-upload-pack (/usr/bin/git)"]
++
++[[binary]]
++name = "git-upload-archive"
++why = ["same file as git (/usr/bin/git)", "same file as git-receive-pack (/usr/bin/git)", "same file as git-upload-pack (/usr/bin/git)"]
++
++[[binary]]
++name = "git-upload-pack"
++why = ["same file as git (/usr/bin/git)", "same file as git-receive-pack (/usr/bin/git)", "same file as git-upload-archive (/usr/bin/git)"]
++
++[[binary]]
++name = "gjs"
++why = ["dpkg gjs (interpreters)", "same file as gjs-console (/usr/bin/gjs-console)"]
++
++[[binary]]
++name = "gjs-console"
++why = ["dpkg gjs (interpreters)", "same file as gjs (/usr/bin/gjs-console)"]
++
++[[binary]]
++name = "gnurm"
++why = ["same file as rm (/usr/bin/gnurm)"]
++
++[[binary]]
++name = "gpasswd"
++why = ["setuid /usr/bin/gpasswd"]
++
++[[binary]]
++name = "halt"
++why = ["same file as poweroff (/usr/bin/systemctl)", "same file as reboot (/usr/bin/systemctl)", "same file as shutdown (/usr/bin/systemctl)", "same file as systemctl (/usr/bin/systemctl)"]
++
++[[binary]]
++name = "mkdosfs"
++why = ["same file as mkfs.fat (/usr/sbin/mkfs.fat)", "same file as mkfs.msdos (/usr/sbin/mkfs.fat)", "same file as mkfs.vfat (/usr/sbin/mkfs.fat)"]
++
++[[binary]]
++name = "mke2fs"
++why = ["same file as mkfs.ext2 (/usr/sbin/mke2fs)", "same file as mkfs.ext3 (/usr/sbin/mke2fs)", "same file as mkfs.ext4 (/usr/sbin/mke2fs)"]
++
++[[binary]]
++name = "mkfs.ext2"
++why = ["same file as mke2fs (/usr/sbin/mke2fs)", "same file as mkfs.ext3 (/usr/sbin/mke2fs)", "same file as mkfs.ext4 (/usr/sbin/mke2fs)"]
++
++[[binary]]
++name = "mkfs.ext3"
++why = ["same file as mke2fs (/usr/sbin/mke2fs)", "same file as mkfs.ext2 (/usr/sbin/mke2fs)", "same file as mkfs.ext4 (/usr/sbin/mke2fs)"]
++
++[[binary]]
++name = "mkfs.ext4"
++why = ["same file as mke2fs (/usr/sbin/mke2fs)", "same file as mkfs.ext2 (/usr/sbin/mke2fs)", "same file as mkfs.ext3 (/usr/sbin/mke2fs)"]
++
++[[binary]]
++name = "mkfs.fat"
++why = ["same file as mkdosfs (/usr/sbin/mkfs.fat)", "same file as mkfs.msdos (/usr/sbin/mkfs.fat)", "same file as mkfs.vfat (/usr/sbin/mkfs.fat)"]
++
++[[binary]]
++name = "mkfs.msdos"
++why = ["same file as mkdosfs (/usr/sbin/mkfs.fat)", "same file as mkfs.fat (/usr/sbin/mkfs.fat)", "same file as mkfs.vfat (/usr/sbin/mkfs.fat)"]
++
++[[binary]]
++name = "mkfs.ntfs"
++why = ["same file as mkntfs (/usr/sbin/mkntfs)"]
++
++[[binary]]
++name = "mkfs.vfat"
++why = ["same file as mkdosfs (/usr/sbin/mkfs.fat)", "same file as mkfs.fat (/usr/sbin/mkfs.fat)", "same file as mkfs.msdos (/usr/sbin/mkfs.fat)"]
++
++[[binary]]
++name = "mkntfs"
++why = ["same file as mkfs.ntfs (/usr/sbin/mkntfs)"]
++
++[[binary]]
++name = "mount"
++why = ["setuid /usr/bin/mount"]
++
++[[binary]]
++name = "mount.ntfs"
++why = ["same file as mount.ntfs-3g (/usr/bin/ntfs-3g)", "same file as ntfs-3g (/usr/bin/ntfs-3g)"]
++
++[[binary]]
++name = "mount.ntfs-3g"
++why = ["same file as mount.ntfs (/usr/bin/ntfs-3g)", "same file as ntfs-3g (/usr/bin/ntfs-3g)"]
++
++[[binary]]
++name = "mtr-packet"
++why = ["file capability /usr/bin/mtr-packet"]
++
++[[binary]]
++name = "ntfs-3g"
++why = ["setuid /usr/bin/ntfs-3g", "same file as mount.ntfs (/usr/bin/ntfs-3g)", "same file as mount.ntfs-3g (/usr/bin/ntfs-3g)"]
++
++[[binary]]
++name = "nvtop"
++why = ["file capability /usr/bin/nvtop"]
++
++[[binary]]
++name = "pam_extrausers_chkpwd"
++why = ["setgid /usr/sbin/pam_extrausers_chkpwd"]
++
++[[binary]]
++name = "passwd"
++why = ["setuid /usr/bin/passwd"]
++
++[[binary]]
++name = "perl"
++why = ["name matches perl*"]
++
++[[binary]]
++name = "perl5.40-x86_64-linux-gnu"
++why = ["name matches perl*"]
++
++[[binary]]
++name = "perl5.40.1"
++why = ["name matches perl*"]
++
++[[binary]]
++name = "perlbug"
++why = ["name matches perl*"]
++
++[[binary]]
++name = "perlcalls-bpfcc"
++why = ["name matches perl*"]
++
++[[binary]]
++name = "perldoc"
++why = ["name matches perl*"]
++
++[[binary]]
++name = "perlflow-bpfcc"
++why = ["name matches perl*"]
++
++[[binary]]
++name = "perli11ndoc"
++why = ["name matches perl*"]
++
++[[binary]]
++name = "perlivp"
++why = ["name matches perl*"]
++
++[[binary]]
++name = "perlstat-bpfcc"
++why = ["name matches perl*"]
++
++[[binary]]
++name = "perltex"
++why = ["name matches perl*"]
++
++[[binary]]
++name = "perlthanks"
++why = ["name matches perl*"]
++
++[[binary]]
++name = "ping"
++why = ["file capability /usr/bin/ping", "same file as ping4 (/usr/bin/ping)", "same file as ping6 (/usr/bin/ping)"]
++
++[[binary]]
++name = "ping4"
++why = ["same file as ping (/usr/bin/ping)", "same file as ping6 (/usr/bin/ping)"]
++
++[[binary]]
++name = "ping6"
++why = ["same file as ping (/usr/bin/ping)", "same file as ping4 (/usr/bin/ping)"]
++
++[[binary]]
++name = "pkexec"
++why = ["setuid /usr/bin/pkexec"]
++
++[[binary]]
++name = "poweroff"
++why = ["same file as halt (/usr/bin/systemctl)", "same file as reboot (/usr/bin/systemctl)", "same file as shutdown (/usr/bin/systemctl)", "same file as systemctl (/usr/bin/systemctl)"]
++
++[[binary]]
++name = "pppd"
++why = ["setuid /usr/sbin/pppd"]
++
++[[binary]]
++name = "ptyxis"
++why = ["same file as x-terminal-emulator (/usr/bin/ptyxis)"]
++
++[[binary]]
++name = "python3"
++why = ["name matches python3*", "same file as python3.14 (/usr/bin/python3.14)"]
++
++[[binary]]
++name = "python3-config"
++why = ["name matches python3*", "same file as python3.14-config (/usr/bin/x86_64-linux-gnu-python3.14-config)", "same file as x86_64-linux-gnu-python3-config (/usr/bin/x86_64-linux-gnu-python3.14-config)", "same file as x86_64-linux-gnu-python3.14-config (/usr/bin/x86_64-linux-gnu-python3.14-config)"]
++
++[[binary]]
++name = "python3.14"
++why = ["name matches python3*", "same file as python3 (/usr/bin/python3.14)"]
++
++[[binary]]
++name = "python3.14-config"
++why = ["name matches python3*", "same file as python3-config (/usr/bin/x86_64-linux-gnu-python3.14-config)", "same file as x86_64-linux-gnu-python3-config (/usr/bin/x86_64-linux-gnu-python3.14-config)", "same file as x86_64-linux-gnu-python3.14-config (/usr/bin/x86_64-linux-gnu-python3.14-config)"]
++
++[[binary]]
++name = "rbash"
++why = ["/etc/shells /usr/bin/rbash", "dpkg bash (shells)", "same file as bash (/usr/bin/bash)"]
++
++[[binary]]
++name = "reboot"
++why = ["same file as halt (/usr/bin/systemctl)", "same file as poweroff (/usr/bin/systemctl)", "same file as shutdown (/usr/bin/systemctl)", "same file as systemctl (/usr/bin/systemctl)"]
++
++[[binary]]
++name = "rm"
++why = ["same file as gnurm (/usr/bin/gnurm)"]
++
++[[binary]]
++name = "run0"
++why = ["same file as systemd-run (/usr/bin/systemd-run)"]
++
++[[binary]]
++name = "screen"
++why = ["/etc/shells /usr/bin/screen"]
++
++[[binary]]
++name = "sh"
++why = ["/etc/shells /usr/bin/sh", "dpkg dash (shells)", "same file as dash (/usr/bin/dash)"]
++
++[[binary]]
++name = "shutdown"
++why = ["same file as halt (/usr/bin/systemctl)", "same file as poweroff (/usr/bin/systemctl)", "same file as reboot (/usr/bin/systemctl)", "same file as systemctl (/usr/bin/systemctl)"]
++
++[[binary]]
++name = "ssh-agent"
++why = ["setgid /usr/bin/ssh-agent"]
++
++[[binary]]
++name = "static-sh"
++why = ["dpkg busybox-static (shells)", "same file as busybox (/usr/bin/busybox)"]
++
++[[binary]]
++name = "su"
++why = ["setuid /usr/lib/cargo/bin/su", "same file as su-rs (/usr/lib/cargo/bin/su)"]
++
++[[binary]]
++name = "su-rs"
++why = ["same file as su (/usr/lib/cargo/bin/su)"]
++
++[[binary]]
++name = "sudo"
++why = ["setuid /usr/lib/cargo/bin/sudo", "same file as sudo-rs (/usr/lib/cargo/bin/sudo)", "same file as sudoedit (/usr/lib/cargo/bin/sudo)", "same file as sudoedit-rs (/usr/lib/cargo/bin/sudo)"]
++
++[[binary]]
++name = "sudo-rs"
++why = ["same file as sudo (/usr/lib/cargo/bin/sudo)", "same file as sudoedit (/usr/lib/cargo/bin/sudo)", "same file as sudoedit-rs (/usr/lib/cargo/bin/sudo)"]
++
++[[binary]]
++name = "sudo.ws"
++why = ["setuid /usr/bin/sudo.ws"]
++
++[[binary]]
++name = "sudoedit"
++why = ["same file as sudo (/usr/lib/cargo/bin/sudo)", "same file as sudo-rs (/usr/lib/cargo/bin/sudo)", "same file as sudoedit-rs (/usr/lib/cargo/bin/sudo)"]
++
++[[binary]]
++name = "sudoedit-rs"
++why = ["same file as sudo (/usr/lib/cargo/bin/sudo)", "same file as sudo-rs (/usr/lib/cargo/bin/sudo)", "same file as sudoedit (/usr/lib/cargo/bin/sudo)"]
++
++[[binary]]
++name = "systemctl"
++why = ["same file as halt (/usr/bin/systemctl)", "same file as poweroff (/usr/bin/systemctl)", "same file as reboot (/usr/bin/systemctl)", "same file as shutdown (/usr/bin/systemctl)"]
++
++[[binary]]
++name = "systemd-run"
++why = ["same file as run0 (/usr/bin/systemd-run)"]
++
++[[binary]]
++name = "tclsh"
++why = ["dpkg tcl (interpreters)", "same file as tclsh8.6 (/usr/bin/tclsh8.6)"]
++
++[[binary]]
++name = "tclsh8.6"
++why = ["dpkg tcl8.6 (interpreters)", "same file as tclsh (/usr/bin/tclsh8.6)"]
++
++[[binary]]
++name = "umount"
++why = ["setuid /usr/bin/umount"]
++
++[[binary]]
++name = "unix_chkpwd"
++why = ["setgid /usr/sbin/unix_chkpwd"]
++
++[[binary]]
++name = "wish"
++why = ["dpkg tk (interpreters)", "same file as wish8.6 (/usr/bin/wish8.6)"]
++
++[[binary]]
++name = "wish8.6"
++why = ["dpkg tk8.6 (interpreters)", "same file as wish (/usr/bin/wish8.6)"]
++
++[[binary]]
++name = "x-terminal-emulator"
++why = ["same file as ptyxis (/usr/bin/ptyxis)"]
++
++[[binary]]
++name = "x86_64-linux-gnu-cpp"
++why = ["dpkg cpp-x86-64-linux-gnu (interpreters)", "same file as cpp (/usr/bin/x86_64-linux-gnu-cpp-15)", "same file as cpp-15 (/usr/bin/x86_64-linux-gnu-cpp-15)", "same file as x86_64-linux-gnu-cpp-15 (/usr/bin/x86_64-linux-gnu-cpp-15)"]
++
++[[binary]]
++name = "x86_64-linux-gnu-cpp-15"
++why = ["dpkg cpp-15-x86-64-linux-gnu (interpreters)", "same file as cpp (/usr/bin/x86_64-linux-gnu-cpp-15)", "same file as cpp-15 (/usr/bin/x86_64-linux-gnu-cpp-15)", "same file as x86_64-linux-gnu-cpp (/usr/bin/x86_64-linux-gnu-cpp-15)"]
++
++[[binary]]
++name = "x86_64-linux-gnu-python3-config"
++why = ["same file as python3-config (/usr/bin/x86_64-linux-gnu-python3.14-config)", "same file as python3.14-config (/usr/bin/x86_64-linux-gnu-python3.14-config)", "same file as x86_64-linux-gnu-python3.14-config (/usr/bin/x86_64-linux-gnu-python3.14-config)"]
++
++[[binary]]
++name = "x86_64-linux-gnu-python3.14-config"
++why = ["same file as python3-config (/usr/bin/x86_64-linux-gnu-python3.14-config)", "same file as python3.14-config (/usr/bin/x86_64-linux-gnu-python3.14-config)", "same file as x86_64-linux-gnu-python3-config (/usr/bin/x86_64-linux-gnu-python3.14-config)"]
+diff --git a/tests/test_gate_commands.py b/tests/test_gate_commands.py
+new file mode 100644
+index 0000000..2059938
+--- /dev/null
++++ b/tests/test_gate_commands.py
+@@ -0,0 +1,559 @@
++"""The policy gate's command layer (issue #197, spec ``policy-gate/v1`` §3-§5, §4.1).
++
++The command table ``targets/ubuntu-26.04/commands.toml`` and the one engine that reads it
++(``nl_shell.gate.rules``): decisions A and C, classes 1, 2 and 7, the spec §4/§5 rows for
++commands whose inner command is argv, and the §3 builtin floor.
++
++Every case goes through the public ``nl_shell.gate.classify(cmd, origin=...)`` and asserts
++a class (or a floor), a reason substring, and that no reason is "could not class" (the
++decision-C cases assert it instead). ``nl_shell.gate`` and the loader are imported inside
++the test functions, and the inventory and the table are read there too, so a missing
++module or file fails a test instead of the collection.
++"""
++
++from __future__ import annotations
++
++import inspect
++import tomllib
++from pathlib import Path
++
++import pytest
++
++REPO_ROOT = Path(__file__).resolve().parents[1]
++INVENTORY = REPO_ROOT / "targets" / "ubuntu-26.04" / "inventory.toml"
++RANK = {
++    "read-only": 0,
++    "mutating": 1,
++    "session-altering": 1,
++    "destructive": 2,
++    "privileged": 3,
++}
++COULD_NOT = "could not class"
++NA = "not allowlisted"
++UNREADABLE = "runs code the gate cannot read"
++UNKNOWN = "option the gate does not know"
++ROOT_SHELL = "opens an interactive root shell"
++SECTION_5 = "(§5)"
++PIPE = "pipe, here-doc or here-string into"
++SESSION = "changes the shell session"
++UNDECLARED = "--pdca-undeclared"
++
++REQUIRED_INVENTORY = (
++    "sudo",
++    "sudo.ws",
++    "sudo-rs",
++    "sudoedit-rs",
++    "su",
++    "su-rs",
++    "pkexec",
++    "passwd",
++    "chsh",
++    "crontab",
++    "mount",
++    "sh",
++    "bash",
++    "rbash",
++    "dash",
++    "screen",
++    "python3",
++    "perl",
++    "busybox",
++    "gdb",
++)
++
++
++def classify(command: str, origin: str = "typed"):
++    import nl_shell.gate
++
++    return nl_shell.gate.classify(command, origin=origin)
++
++
++def commands_module():
++    from nl_shell.gate import commands
++
++    return commands
++
++
++def has_reason(result, needle: str) -> bool:
++    return any(needle in reason for reason in result.reasons)
++
++
++def at_least(cls: str, floor: str) -> bool:
++    if floor == "session-altering":
++        # `session-altering` ranks with `mutating`; "at least" it means not `mutating`.
++        return cls == "session-altering" or RANK[cls] > RANK[floor]
++    return RANK[cls] >= RANK[floor]
++
++
++def expect(
++    command: str,
++    *,
++    origin: str = "typed",
++    cls: str | None = None,
++    floor: str | None = None,
++    rejected: bool | None = None,
++    reason: str,
++    decision_c: bool = False,
++):
++    result = classify(command, origin)
++    where = (command, origin, result)
++    if cls is not None:
++        assert result.cls == cls, where
++    if floor is not None:
++        assert at_least(result.cls, floor), where
++    if rejected is not None:
++        assert result.rejected is rejected, where
++    assert has_reason(result, reason), where
++    if decision_c:
++        assert has_reason(result, COULD_NOT), where
++    else:
++        assert not has_reason(result, COULD_NOT), where
++    return result
++
++
++def root_shell(command: str) -> None:
++    """A proposal that opens a root shell is rejected; typed, it is privileged."""
++    expect(command, origin="proposal", cls="privileged", rejected=True, reason=ROOT_SHELL)
++    expect(command, cls="privileged", rejected=False, reason=ROOT_SHELL)
++
++
++def load_table():
++    return commands_module().load()
++
++
++def all_rows(table):
++    """Every row and every described subcommand, as ``(row, subcommand, sub-row)``."""
++    for row in table.rows:
++        yield row, None, row
++        for name, sub in row.subcommands.items():
++            yield row, name, sub
++
++
++# --- class 1: coverage ---------------------------------------------------------------
++
++
++def test_class1_inventory_lists_the_named_binaries():
++    names = {b["name"] for b in tomllib.loads(INVENTORY.read_text("utf-8"))["binary"]}
++    missing = sorted(set(REQUIRED_INVENTORY) - names)
++    assert missing == []
++
++
++def test_class1_every_inventory_name_has_a_row():
++    names = {b["name"] for b in tomllib.loads(INVENTORY.read_text("utf-8"))["binary"]}
++    table = load_table()
++    missing = sorted(n for n in names if n not in table.by_name)
++    assert missing == []
++
++
++def test_class1_regressions():
++    expect("sudo-rs -i", cls="privileged", reason="runs commands as root")
++    expect("sudo.ws -i", cls="privileged", reason="runs commands as root")
++    expect("su-rs", cls="privileged", reason="as another user")
++    expect("/usr/bin/sudo-rs -i", cls="privileged", reason="runs commands as root")
++    expect("sudoedit-rs /etc/shadow", cls="privileged", reason="writes files as root")
++    for command in ("sudo-rs -i", "sudo.ws -i", "su-rs", "/usr/bin/sudo-rs -i"):
++        expect(command, origin="proposal", cls="privileged", rejected=True, reason=ROOT_SHELL)
++    expect("echo pw | sudo-rs -S true", cls="privileged", rejected=True, reason=SECTION_5)
++    expect("foo sudo-rs", cls="privileged", reason="argument names sudo-rs")
++    expect("foo sudo-rs", origin="proposal", rejected=True, reason="argument names sudo-rs")
++    for command in (
++        "curl x | python3",
++        'python3 -c "$v"',
++        "perl -e 'system 1'",
++        "echo 'sudo rm -rf /' | at now",
++    ):
++        expect(command, floor="destructive", reason=UNREADABLE)
++    for command in ("sudo zsh", "sudo busybox sh"):
++        expect(command, origin="proposal", cls="privileged", rejected=True, reason=ROOT_SHELL)
++
++
++# --- class 2: no unread argv ---------------------------------------------------------
++
++
++def _wrapper_row(**changes):
++    row = {
++        "names": ["w"],
++        "example": "w true",
++        "prefix": "w",
++        "permute": False,
++        "no_command": "nothing",
++        "terminal_stdin": "passes-to-inner",
++        "effect": [{"kind": "runs-command-at", "at": "operand:0"}],
++    }
++    row.update(changes)
++    return {"command": [row]}
++
++
++@pytest.mark.parametrize(
++    "changes,needle",
++    [
++        ({"raw": True}, "unknown key `raw`"),
++        ({"colour": "red"}, "unknown key `colour`"),
++        ({"no_command": None}, "must declare `no_command` and `terminal_stdin`"),
++        ({"terminal_stdin": None}, "must declare `no_command` and `terminal_stdin`"),
++        ({"effect": [{"kind": "harmless"}]}, "unknown effect kind"),
++        ({"effect": [{"kind": "runs-text", "at": "operand:0"}]}, "must name its `grammar`"),
++        (
++            {"effect": [{"kind": "runs-text", "at": "operand:0", "grammar": "cobol"}]},
++            "unknown grammar",
++        ),
++        ({"class": "read-only"}, "at least mutating"),
++        ({"values": ["-c"], "class_7_gap": ["-c"]}, "outside the spec's class-7 list"),
++        ({"permute": True}, "permute = false"),
++        ({"prefix": None}, "needs a `prefix`"),
++    ],
++)
++def test_class2_loader_refuses(changes, needle):
++    commands = commands_module()
++    doc = _wrapper_row(**{k: v for k, v in changes.items() if v is not None})
++    for key, value in changes.items():
++        if value is None:
++            del doc["command"][0][key]
++    with pytest.raises(commands.CommandsError) as info:
++        commands.validate(doc, "test")
++    assert needle in str(info.value)
++
++
++def test_class2_loader_accepts_the_class7_gap_only_where_the_spec_names_it():
++    commands = commands_module()
++    commands.validate(_wrapper_row(), "test")
++    ssh = {"names": ["ssh"], "example": "ssh h", "values": ["-o"], "class_7_gap": ["-o"]}
++    commands.validate({"command": [ssh]}, "test")
++    ssh["values"] = ["-o", "-F"]
++    ssh["class_7_gap"] = ["-F"]
++    with pytest.raises(commands.CommandsError, match="class-7 list"):
++        commands.validate({"command": [ssh]}, "test")
++
++
++def test_class2_every_row_has_an_example():
++    for row in load_table().rows:
++        assert row.example.split()[0] in row.names, row.names
++
++
++def test_class2_undeclared_option_property():
++    """Every row that reads argv: its example with an undeclared option right after the
++    command word (and right after each described subcommand) is at least destructive;
++    on an elevating row it is also rejected as a proposal."""
++    checked = 0
++    for row in load_table().rows:
++        if row.fixed:
++            continue
++        words = row.example.split()
++        command = " ".join([words[0], UNDECLARED, *words[1:]])
++        expect(command, floor="destructive", reason=UNKNOWN)
++        if any(e.kind == "elevates" for e in row.all_effects()):
++            expect(command, origin="proposal", rejected=True, reason=UNKNOWN)
++        checked += 1
++        for name, sub in row.subcommands.items():
++            command = f"{row.names[0]} {name} {UNDECLARED}"
++            expect(command, floor="destructive", reason=UNKNOWN)
++            if any(e.kind == "elevates" for e in sub.effects):
++                expect(command, origin="proposal", rejected=True, reason=UNKNOWN)
++    assert checked > 40
++
++
++def test_class2_no_command_opens_a_shell_property():
++    """Every row declaring that it opens a shell with no command: under sudo, with no
++    command, it is a root shell."""
++    checked = 0
++    for _, _, row in all_rows(load_table()):
++        if row.no_command != "opens-shell":
++            continue
++        base = row.prefix or row.example
++        expect(f"sudo {base}", origin="proposal", rejected=True, reason=ROOT_SHELL)
++        checked += 1
++    assert checked >= 10
++
++
++def test_class2_regressions():
++    for command in (
++        "sudo bash -s x",
++        "sudo bash -is x",
++        "sudo dash -s x",
++        "sudo env bash -s x",
++        "pkexec bash -s x",
++        "sudo bash /dev/stdin",
++        "sudo chroot /",
++        "sudo unshare",
++        # The inner command's stdin follows the wrapper's options (a pty with -t).
++        "systemd-run -t bash",
++        "sudo login -f root",
++    ):
++        expect(command, origin="proposal", cls="privileged", rejected=True, reason=ROOT_SHELL)
++    expect("enable -f /tmp/x.so foo", floor="destructive", reason=UNREADABLE)
++
++
++# --- class 7: the floor rows and the accepted gap (not part of the red-leg claim) -----
++
++
++def test_floor_class7_accepted_gap():
++    for command in (
++        "foo 'sudo -i'",
++        "git -c core.pager=sh log",
++        "git status",
++        "tar --to-command=sh -xf a.tar",
++        "ssh -o ProxyCommand=sh h",
++    ):
++        expect(command, cls="mutating", rejected=False, reason=NA)
++
++
++# --- spec §4 -------------------------------------------------------------------------
++
++
++def test_spec4_privileged():
++    for command, reason in (
++        ("sudo apt update", "sudo runs commands as root"),
++        ("su", "su runs a shell as another user"),
++        ("pkexec", "pkexec runs commands as root"),
++        ("doas", "doas runs commands as root"),
++        ("run0", "run0 runs commands as root"),
++        ("machinectl shell", "as root on the host"),
++        ("machinectl shell root@", "as root on the host"),
++        ("//usr/bin/sudo true", "sudo runs commands as root"),
++    ):
++        expect(command, cls="privileged", reason=reason)
++
++
++def test_spec4_destructive():
++    for command, reason in (
++        ("rm -rf build", "rm -r"),
++        ('"r"m -rf ~', "rm -r"),
++        ("ls; rm -rf ~", "rm -r"),
++        ("systemctl stop ssh", "systemctl stop"),
++        ("find . -exec rm {} \\;", "rm with an operand the gate cannot read"),
++        ("dd if=/dev/zero of=x", "destructive command: dd"),
++        ("mkfs.ext4 /dev/sdb1", "file system"),
++        ("wipefs -a /dev/sdb", "destructive command: wipefs"),
++        ("shred x", "destructive command: shred"),
++        ("truncate -s 0 x", "destructive command: truncate"),
++        ("chmod -R 777 x", "recursive chmod"),
++        ("find . -delete", "find -delete"),
++        ("git clean -fd", "git clean"),
++        ("git reset --hard", "git reset --hard"),
++        ("git push --force", "git push"),
++        ("kill -9 -1", "kill -1"),
++    ):
++        expect(command, floor="destructive", reason=reason)
++
++
++def test_spec4_wrappers_property():
++    """Every row with runs-command-at carries a prefix; the prefix with `rm -rf x` is at
++    least destructive, and with `sudo -i` as a proposal it is privileged and rejected."""
++    checked = 0
++    for _, _, row in all_rows(load_table()):
++        if not any(e.kind == "runs-command-at" for e in row.effects):
++            continue
++        assert row.prefix, row.where
++        expect(f"{row.prefix} rm -rf x", floor="destructive", reason="rm -r")
++        expect(
++            f"{row.prefix} sudo -i",
++            origin="proposal",
++            cls="privileged",
++            rejected=True,
++            reason="sudo",
++        )
++        checked += 1
++    assert checked >= 20
++
++
++def test_spec4_wrapper_regressions():
++    expect("env rm -rf x", cls="destructive", reason="rm -r")
++    for prefix in ("nice", "nohup", "timeout 5", "time", "xargs", "watch"):
++        expect(f"{prefix} true", cls="mutating", reason=NA)
++        expect(f"{prefix} rm -rf x", cls="destructive", reason="rm -r")
++    expect('xargs "$c"', floor="destructive", reason="inner command word the gate cannot read")
++    expect(
++        'find . -exec "$c" {} \\;',
++        floor="destructive",
++        reason="inner command word the gate cannot read",
++    )
++    for command in (
++        "env - sudo -i",
++        "env 'A=1' sudo -i",
++        "env -a x sudo -i",
++        "exec -a x sudo -i",
++        "nice -n5 sudo -i",
++        "timeout -s9 5 sudo -i",
++        "stdbuf -o0 sudo -i",
++        "setsid sudo -i",
++        "flock /tmp/l sudo -i",
++    ):
++        root_shell(command)
++    expect("env - rm -rf ~", cls="destructive", reason="rm -r")
++    nested = "env " * 10 + "sudo -i"
++    result = classify(nested, "proposal")
++    assert (result.cls, result.rejected) == ("privileged", True), result
++    assert has_reason(result, ROOT_SHELL) or has_reason(result, COULD_NOT), result
++
++
++# --- spec §5 -------------------------------------------------------------------------
++
++
++def test_spec5_sudo_rules():
++    for command in (
++        "sudo -S true",
++        "sudo -p x true",
++        "sudo -A true",
++        "echo pw | sudo -S true",
++        'sudo "-S" true',
++        "sudo $'-S' true",
++        "sudo --std true",
++    ):
++        expect(command, cls="privileged", rejected=True, reason=SECTION_5)
++    expect('sudo "$P" true', cls="privileged", rejected=True, reason="rejected option")
++    expect("sudo --stdin=x true", cls="privileged", rejected=True, reason="rejected option")
++    # `</dev/stdin` is the pipe in front of it.
++    expect("echo pw | sudo true </dev/stdin", cls="privileged", rejected=True, reason=PIPE)
++    for command in ("sudo -s <<<x", "printf x | sudo -i"):
++        expect(command, cls="privileged", rejected=True, reason=PIPE)
++    for consumer in ("sudo true", "su", "pkexec true", "doas true"):
++        for command in (
++            f"echo x | {consumer}",
++            f"{consumer} <<<x",
++            f"{consumer} <<E\nx\nE",
++        ):
++            expect(command, cls="privileged", rejected=True, reason=PIPE)
++    expect("cat <<E | sudo tee /x\nx\nE", rejected=True, reason=PIPE)
++    expect("cat <<E | doas id\nx\nE", rejected=True, reason=PIPE)
++    for command in ("sudo -i", "sudo -s", "sudo su", "sudo bash", "su", "pkexec bash"):
++        root_shell(command)
++
++
++# --- decisions A, B (text effects) and C ---------------------------------------------
++
++
++def test_decision_a():
++    expect("foo sudo x", cls="privileged", reason="argument names sudo")
++    expect("foo sudo x", origin="proposal", rejected=True, reason="argument names sudo")
++    expect("foo rm -rf x", floor="destructive", reason="argument names rm")
++    # ANSI-C quoting decodes like any other quoting.
++    expect("$'\\x73udo' -i", origin="proposal", rejected=True, reason=ROOT_SHELL)
++    expect("echo pw | $'\\x73udo' -S true", rejected=True, reason=SECTION_5)
++    expect("foo $'\\x73udo'", cls="privileged", reason="argument names sudo")
++    expect("foo --exec=/usr/bin/sudo", cls="privileged", reason="argument names sudo")
++    # A command word with a tilde is a fixed path: looked up by its last part.
++    expect("~/bin/sudo -i", origin="proposal", rejected=True, reason=ROOT_SHELL)
++
++
++def test_text_effects_are_decision_b():
++    for command in ("x | sh", "bash < f", "bash f.sh", 'bash -c "$v"', 'eval "$v"', ". ./f"):
++        expect(command, floor="destructive", reason=UNREADABLE)
++
++
++@pytest.fixture
++def table_root(monkeypatch, tmp_path):
++    commands = commands_module()
++    monkeypatch.setattr(commands, "ROOT", tmp_path)
++    commands.clear_cache()
++    (tmp_path / commands.TARGET_ID).mkdir()
++    yield tmp_path / commands.TARGET_ID / commands.COMMANDS_FILE
++    commands.clear_cache()
++
++
++DECISION_C_COMMANDS = ("sudo -i", "rm -rf x", "ls", "true", "x | sh")
++
++
++def test_decision_c_missing_table(table_root):
++    for command in DECISION_C_COMMANDS:
++        expect(command, cls="privileged", rejected=True, reason=COULD_NOT, decision_c=True)
++
++
++@pytest.mark.parametrize(
++    "body",
++    [
++        "[[command]\nnames = [",
++        '[[command]]\nnames = ["sudo"]\nexample = "sudo"\nraw = true\n',
++        "",
++    ],
++)
++def test_decision_c_invalid_table(table_root, body):
++    table_root.write_text(body, encoding="utf-8")
++    for command in DECISION_C_COMMANDS:
++        expect(command, cls="privileged", rejected=True, reason=COULD_NOT, decision_c=True)
++
++
++def test_decision_c_without_the_fixed_target(monkeypatch, tmp_path):
++    commands = commands_module()
++    monkeypatch.setattr(commands, "TARGET_ID", None)
++    commands.clear_cache()
++    try:
++        for command in DECISION_C_COMMANDS:
++            expect(command, cls="privileged", rejected=True, reason=COULD_NOT, decision_c=True)
++    finally:
++        commands.clear_cache()
++    (tmp_path / "gate.toml").write_text('target = "x"\nextra = 1\n', encoding="utf-8")
++    assert commands._fixed_target_id(tmp_path) is None
++    (tmp_path / "gate.toml").write_text('target = "../x"\n', encoding="utf-8")
++    assert commands._fixed_target_id(tmp_path) is None
++
++
++HARMLESS_SUDO = '[[command]]\nnames = ["sudo"]\nexample = "sudo"\nargv = "fixed"\n'
++
++
++def test_fixed_load_location(monkeypatch, tmp_path):
++    commands = commands_module()
++    assert commands.TARGET_ID == "ubuntu-26.04"
++    assert list(inspect.signature(commands.load).parameters) == []
++    assert commands.path() == commands.ROOT / "ubuntu-26.04" / "commands.toml"
++    for folder in (tmp_path, tmp_path / "ubuntu-26.04", tmp_path / "nl-shell"):
++        folder.mkdir(exist_ok=True)
++        (folder / "commands.toml").write_text(HARMLESS_SUDO, encoding="utf-8")
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setenv("NL_SHELL_COMMANDS", str(tmp_path / "commands.toml"))
++    monkeypatch.setenv("NL_SHELL_TARGETS", str(tmp_path))
++    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
++    monkeypatch.setenv("HOME", str(tmp_path))
++    commands.clear_cache()
++    try:
++        expect("sudo -i", cls="privileged", reason="sudo runs commands as root")
++    finally:
++        commands.clear_cache()
++
++
++def test_fixed_load_location_refuses_a_path_outside_the_root(monkeypatch, tmp_path):
++    commands = commands_module()
++    root = tmp_path / "root"
++    outside = tmp_path / "outside"
++    root.mkdir()
++    outside.mkdir()
++    (outside / "commands.toml").write_text(HARMLESS_SUDO, encoding="utf-8")
++    (root / "ubuntu-26.04").symlink_to(outside)
++    monkeypatch.setattr(commands, "ROOT", root)
++    commands.clear_cache()
++    try:
++        with pytest.raises(commands.CommandsError, match="outside"):
++            commands.load()
++        expect("sudo true", cls="privileged", rejected=True, reason=COULD_NOT, decision_c=True)
++    finally:
++        commands.clear_cache()
++
++
++# --- spec §3: builtins (floor) -------------------------------------------------------
++
++
++def test_spec3_builtins_floor():
++    for command in (
++        "alias ll='ls -l'",
++        "unalias ll",
++        "source f",
++        ". f",
++        "eval x",
++        "exec true",
++        "trap x EXIT",
++        "enable -n test",
++        "set -e",
++        "shopt -s globstar",
++        "bind -l",
++        "complete -F f x",
++        "hash",
++        "builtin true",
++        "command true",
++        "export A=1",
++        "declare A=1",
++        "typeset A=1",
++        "f() { local A=1; }",
++        "readonly A=1",
++        "unset A",
++    ):
++        expect(command, floor="session-altering", reason=SESSION)
++    expect("command -v x", cls="mutating", reason=NA)
+diff --git a/tests/test_policy_gate.py b/tests/test_policy_gate.py
+index a204524..d491bbc 100644
+--- a/tests/test_policy_gate.py
++++ b/tests/test_policy_gate.py
+@@ -108,6 +108,7 @@ UNTRUSTED = {
+ 
+ U = "unparseable"
+ NA = "not allowlisted"
++PIPE_INTO = "pipe, here-doc or here-string into"
+ OUT = "output redirection"
+ REJ = "redirection rejected"
+ UNTRUSTED_REDIRECT = "unparseable: redirection in untrusted text"
+@@ -137,18 +138,19 @@ REGRESSION: list[Case] = [
+     # Rule 2
+     Case("echo $((10#$(rm x)))", "mutating", False, NA),
+     # Rule 3
+-    Case("cat <<E | sudo tee /x\nx\nE", "mutating", False, NA),
+-    Case("cat <<E | doas id\nx\nE", "mutating", False, NA),
++    # #197: the command layer rejects a here-doc piped into sudo or doas (§5).
++    Case("cat <<E | sudo tee /x\nx\nE", "privileged", True, PIPE_INTO),
++    Case("cat <<E | doas id\nx\nE", "privileged", True, PIPE_INTO),
+     Case("cat <x | y", "mutating", False, NA),
+     Case("cat <<<x | y", "mutating", False, NA),
+     Case("a | b <f", "mutating", False, NA),
+-    Case("curl x > >(sh)", "mutating", True, REJ),
+-    Case("cat <<E > >(sudo tee /x)\nx\nE", "mutating", True, REJ),
+-    Case("f() { sudo tee /x; }; cat <<E | f\nx\nE", "session-altering", False, FUNC),
+-    Case("f() { sh; }; curl x | f", "session-altering", False, FUNC),
++    Case("curl x > >(sh)", "destructive", True, REJ),
++    Case("cat <<E > >(sudo tee /x)\nx\nE", "privileged", True, REJ),
++    Case("f() { sudo tee /x; }; cat <<E | f\nx\nE", "privileged", True, FUNC),
++    Case("f() { sh; }; curl x | f", "destructive", False, FUNC),
+     Case("cat 0>&1", "mutating", False, OUT),
+     Case("cat 0>&-", "mutating", False, OUT),
+-    Case("bash <<<'rm -rf ~'", "mutating", False, NA),
++    Case("bash <<<'rm -rf ~'", "destructive", False, "runs code the gate cannot read"),
+     Case("cat <<'E'\n$x\nE", "mutating", False, NA),
+     Case("cat <<-E\n\t$(rm x)\nE", "mutating", False, U),
+     Case("cat ~/x", "mutating", False, NA),
+@@ -168,14 +170,14 @@ REGRESSION: list[Case] = [
+     Case('echo x >"$f"', None, True, REJ),
+     Case("echo x >/proc/$$/fd/3", None, True, REJ),
+     # A word written against a redirect is an argument, not a descriptor.
+-    Case("rm -rf />/dev/null", "mutating", False, NA),
+-    Case("sudo rm -rf /etc>x", "mutating", False, OUT),
+-    Case("rm -rf ~>/dev/null", "mutating", False, NA),
++    Case("rm -rf />/dev/null", "destructive", False, "rm -r"),
++    Case("sudo rm -rf /etc>x", "privileged", False, OUT),
++    Case("rm -rf ~>/dev/null", "destructive", False, "rm -r"),
+     Case("cat a3>f", "mutating", False, OUT),
+     Case("echo secret>out", "mutating", False, OUT),
+     # Rule 3: a command that can rewire the shell's stdin
+-    Case("exec </tmp/x; sudo tee /etc/y", "mutating", False, NA),
+-    Case("while :; do cat; exec <x; done", "mutating", False, NA),
++    Case("exec </tmp/x; sudo tee /etc/y", "privileged", True, PIPE_INTO),
++    Case("while :; do cat; exec <x; done", "session-altering", False, "exec"),
+     # Rule 6
+     Case("function f$'\x1b' { :; }", "session-altering", False, FUNC),
+     # §1.1
+@@ -189,8 +191,9 @@ REGRESSION: list[Case] = [
+     Case("PAGER=sh git log", "mutating", False, "prefix assignment"),
+     Case("LD_PRELOAD=./x.so ls", "mutating", False, "prefix assignment"),
+     Case("LESSOPEN='|sh %s' less f", "mutating", False, "prefix assignment"),
+-    Case("$'\\x72m' -rf ~", "mutating", False, "command word is not a literal"),
+-    Case("$(echo rm) -rf ~", "mutating", False, "command word is not a literal"),
++    # #197: ANSI-C quoting decodes to `rm`; decision A reads `echo rm`.
++    Case("$'\\x72m' -rf ~", "destructive", False, "rm -r"),
++    Case("$(echo rm) -rf ~", "destructive", False, "command word is not a literal"),
+     Case("diff <(ls) <(ls)", "mutating", False, "process substitution"),
+     Case("/tmp/rm x", "mutating", False, "path outside the system directories"),
+     Case("./rm x", "mutating", False, "path outside the system directories"),
+@@ -227,7 +230,7 @@ REGRESSION: list[Case] = [
+     Case("while a; do b; done; for i in 1; do c; done", "mutating", False, NA),
+     Case("case x in a) b;; esac", "mutating", False, NA),
+     Case("echo $(id) `pwd`", "mutating", False, NA),
+-    Case("declare -x A=1; unset A", "mutating", False, NA),
++    Case("declare -x A=1; unset A", "session-altering", False, NA),
+ ]
+ 
+ 
+@@ -514,13 +517,15 @@ def test_rule3_literal_flag():
+         "cat [ab]",
+         "cat {a,b}",
+         'cat "$x"',
+-        "cat $'x'",
++        "cat $'\\x80'",
+         "cat x=~/y",
+         "cat a:~/y",
+     ):
+         assert not second_word(command).literal, command
+-    for command in ("cat plain", "cat 'a b'", 'cat "a b"', "cat a\\*b", "cat a=b"):
++    for command in ("cat plain", "cat 'a b'", 'cat "a b"', "cat a\\*b", "cat a=b", "cat $'x'"):
+         assert second_word(command).literal, command
++    # ANSI-C quoting is a fixed value (#197).
++    assert second_word("cat $'\\x73u\\144o'").text == "sudo"
+     value = parse.shell_layer("A=x:~/b").assignments[0].value
+     assert not value.literal
+ 
+@@ -746,7 +751,7 @@ def test_rule5_work_budget_and_failures(monkeypatch):
+     with monkeypatch.context() as m:
+         from nl_shell.gate import rules
+ 
+-        m.setattr(rules, "classify", lambda inv: (_ for _ in ()).throw(RuntimeError("x")))
++        m.setattr(rules, "classify", lambda *a: (_ for _ in ()).throw(RuntimeError("x")))
+         assert classify("ls").reasons[0] == COULD_NOT
+     for bad in (None, 3, b"ls"):
+         assert gate().classify(bad).reasons[0] == COULD_NOT
+@@ -805,7 +810,7 @@ def read_only_for(word: str):
+     """A command layer that calls ``word`` read-only and everything else mutating."""
+     from nl_shell.gate import rules
+ 
+-    def fake(invocation):
++    def fake(invocation, origin="typed"):
+         if invocation.words[0].text == word:
+             return rules.Verdict("read-only")
+         return rules.Verdict("mutating", (NA,))
+@@ -845,7 +850,7 @@ def test_walk_reaches_every_simple_command(monkeypatch):
+ 
+     seen = []
+ 
+-    def record(invocation):
++    def record(invocation, origin="typed"):
+         seen.append((invocation.kind, invocation.words[0].text))
+         return rules.Verdict("mutating", (NA,))
+ 

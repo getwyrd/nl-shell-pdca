@@ -1,0 +1,2399 @@
+diff --git a/.oss-scanner/threat_model.md b/.oss-scanner/threat_model.md
+index e492456..3a33796 100644
+--- a/.oss-scanner/threat_model.md
++++ b/.oss-scanner/threat_model.md
+@@ -165,6 +165,20 @@ bug only if nl-shell's use of it is what makes it exploitable). The training pip
+ - **Child processes inherit the control channel (fd 3).** Only code running as the user can
+   use it, which is out of scope.
+ - **The PTY session runs with the user's own rights.** There is no sandbox around the shell.
++- **The session core is partial (interim, until #141).** `src/nl_shell/session.py` detects
++  changes to nl-shell's own prompt hooks (`PS0`, `PROMPT_COMMAND`, the hook functions and
++  their state), to `TERM` and to `functrace` at the snapshot of the command that made
++  them; aliases cannot reach inside the hooks. Not yet detected: confirmed code that
++  defines a shell function named `builtin`, `command`, `eval` or `return` (it shadows what
++  the hooks call and can forge every record, exit status and `H` included); that turns
++  on `extdebug` with a DEBUG trap (I2 is not claimed against it); that changes other
++  traps, xtrace or `PS4`, disabled builtins, readline state (`bind`, e.g. turning
++  bracketed paste off, or `set +o emacs` / `set +o vi`, which turn readline off) or
++  `set -H`; or that changes the terminal from outside bash (termios, `TIOCSTI`, a stopped
++  shell). Those checks (the remaining Table A rows and all of Table B of the #101 design)
++  land with #141. A command that reads the terminal (`read x`, `read -t`, `read -n1 -t`,
++  `select`) degrades the session by the prompt rule even when it would finish (#136).
++  Nothing calls the session until the REPL is wired to it (#78).
+ 
+ ## How to exercise it
+ 
+@@ -172,7 +186,9 @@ The test suite: `python3 -m pytest` from the repo root (CONTRIBUTING.md). Tests
+ a temporary HOME and guard scripts ahead of `sudo`; tests marked `sudo` or `vm` need
+ the throwaway reference VM (`NL_SHELL_TEST_VM=1`, never on your own machine). The gate's
+ contract and its test vectors are in `docs/design/specs/policy-gate/v1.md`; the PTY
+-protocol's in `docs/design/specs/pty-protocol/v1.md`. Once #16 lands, a stub model backend
++protocol's in `docs/design/specs/pty-protocol/v1.md`. The session tests
++(`tests/test_session.py`) need only bash (5.1 or later): they start a real bash on a PTY,
++with no VM and no sudo. Once #16 lands, a stub model backend
+ returns fixed proposals, so the gate can be tested without a GPU.
+ 
+ ## How we rate severity
+diff --git a/docs/design/adr/0013-policy-gate-v2.md b/docs/design/adr/0013-policy-gate-v2.md
+index 230a79d..33a453f 100644
+--- a/docs/design/adr/0013-policy-gate-v2.md
++++ b/docs/design/adr/0013-policy-gate-v2.md
+@@ -70,7 +70,7 @@ We will classify every command with the procedure in
+ 
+    Otherwise the command is at least `mutating`, and the confirm says why ("`du` is a
+    function defined in this session"). If the snapshot is missing or nl-shell's hooks were
+-   changed, the session is *degraded*: everything needs a confirm until the session is
++   changed, the session is *degraded*: no command is sent to it until the session is
+    restarted.
+ 6. **Rejected outright** (cannot be confirmed, for proposals and typed input alike):
+    - redirections to or from file descriptor 3 or higher (they would reach nl-shell's
+diff --git a/docs/design/adr/0014-pty-session-protocol.md b/docs/design/adr/0014-pty-session-protocol.md
+index 4890a47..e4d30d6 100644
+--- a/docs/design/adr/0014-pty-session-protocol.md
++++ b/docs/design/adr/0014-pty-session-protocol.md
+@@ -43,15 +43,16 @@ In summary:
+      jobs) before each prompt.
+ 
+    A `PROMPT_COMMAND` the user's `~/.bashrc` set (for example VTE's terminal integration)
+-   is kept and run after nl-shell's hook. Each record carries a sequence number, advanced
++   is kept and run after nl-shell's done record and before its snapshot; nl-shell sets
++   `PS1` and `PS2` after the snapshot. Each record carries a sequence number, advanced
+    in `PROMPT_COMMAND`: `PS0` runs its expansion in a subshell, so it can't advance a
+    counter. Text a command prints goes to the PTY, never to
+    fd 3, so it cannot forge a record. Redirecting to fd 3 is rejected by the gate
+    (ADR-0013). A program that writes to its inherited fd 3 on purpose is code running as
+    the user, outside the threat model.
+ 2. **Exit codes and completion come only from the control channel.** A missing,
+-   out-of-order or malformed record puts the session into *degraded* mode: every command
+-   needs a confirm, and nl-shell offers to restart the session.
++   out-of-order or malformed record puts the session into *degraded* mode: nl-shell sends
++   it no further command, says why, and offers to restart the session.
+ 3. **Byte-identical input.** The rcfile turns history expansion off (`set +H`). nl-shell
+    sends the confirmed command as one bracketed paste followed by Enter, so readline
+    inserts it literally: no completion, no expansion, newlines kept. The gate rejects
+diff --git a/docs/design/specs/policy-gate/v1.md b/docs/design/specs/policy-gate/v1.md
+index 4553516..cc73907 100644
+--- a/docs/design/specs/policy-gate/v1.md
++++ b/docs/design/specs/policy-gate/v1.md
+@@ -190,10 +190,12 @@ snapshot:
+    package-owner query, cached). Otherwise ⇒ `mutating`, reason "not a system command".
+ 5. `T` MUST show no `DEBUG`, `RETURN` or `ERR` trap that the baseline didn't have; `X` MUST
+    show `extdebug` off; `H` MUST equal the baseline; the pager and loader variables
+-   (`V`, a `cksum` of `PAGER`, `MANPAGER`, `SYSTEMD_PAGER`, `GIT_PAGER`, `LESSOPEN`,
+-   `LESSCLOSE`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `BASH_ENV`, `ENV`) MUST equal the
+-   baseline. Any difference ⇒ the whole command is `mutating`, reason "session changed".
+-6. A missing snapshot ⇒ degraded mode (pty-protocol §4): everything `mutating`.
++   (`V`, the encoded `declare -p` text of `PAGER`, `MANPAGER`, `SYSTEMD_PAGER`,
++   `GIT_PAGER`, `LESSOPEN`, `LESSCLOSE`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `BASH_ENV`,
++   `ENV`, pty-protocol §3) MUST equal the baseline exactly. Any difference ⇒ the whole
++   command is `mutating`, reason "session changed".
++6. A missing snapshot ⇒ degraded mode (pty-protocol §4): no command is sent to the
++   session until it is restarted.
+ 7. An active target that does not match `/etc/os-release` (the user named it, ADR-0023)
+    ⇒ degraded mode: everything `mutating`, reason "target does not match this OS".
+ 
+diff --git a/docs/design/specs/pty-protocol/v1.md b/docs/design/specs/pty-protocol/v1.md
+index 2202120..54d1504 100644
+--- a/docs/design/specs/pty-protocol/v1.md
++++ b/docs/design/specs/pty-protocol/v1.md
+@@ -43,69 +43,179 @@ handling (ADR-0015), or what captured output is used for (taint, ADR-0016).
+    of a pipe as fd 3 in the child and the read end kept by nl-shell.
+ 2. The rcfile MUST source the user's `~/.bashrc` (if present) **before** installing
+    nl-shell's hooks, and MUST:
+-   - turn off history expansion (`set +H`);
++   - turn off history expansion and functrace (`set +H +T`);
+    - unset `HISTFILE` (nl-shell writes history itself, ADR-0014 §5);
+-   - save any `PROMPT_COMMAND` set by `~/.bashrc` and run it after nl-shell's hook;
++   - save any `PROMPT_COMMAND` set by `~/.bashrc` and run it at every prompt after the
++     `D` record and **before** the snapshot, so the snapshot sees what it changed;
++   - set `PS1` and `PS2` to fixed values **after** the snapshot, so no prompt string the
++     user or a command set is ever expanded;
+    - set `PS0` and `PROMPT_COMMAND` as in the reference rcfile below.
+-3. Reference rcfile (tested on Ubuntu 26.04, bash 5.3.9):
++3. Reference rcfile (tested on Ubuntu 26.04, bash 5.3.9; `src/nl_shell/session.py`
++   `RCFILE`, and `tests/test_session.py` checks the two are the same):
+ 
+ ```bash
+ [ -f ~/.bashrc ] && . ~/.bashrc
+-set +H
++set +H +T
+ unset HISTFILE
+-__nls_user_pc=$PROMPT_COMMAND
+-__nls_seq=0 __nls_fsum= __nls_started=0
+-# PS0 is expanded in a subshell: it may print, but cannot change variables.
+-PS0='$( printf "S %s\n" "$((__nls_seq + 1))" >&3 )'
++bind 'set enable-bracketed-paste on' 2>/dev/null
++shopt -s promptvars
++__nls_ea=$(shopt -p expand_aliases); shopt -u expand_aliases
++__nls_user_pc=()
++if declare -p PROMPT_COMMAND >/dev/null 2>&1; then __nls_user_pc=("${PROMPT_COMMAND[@]}"); fi
++__nls_seq=-1 __nls_st=0 __nls_ps=() __nls_v= __nls_c= __nls_n=0 __nls_f=
++PS0='$(\\builtin printf "S %s\\n" "$((__nls_seq + 1))" >&3)'
++__nls_ret() { \builtin return "$1"; }
++__nls_enc() {
++  __nls_v=$2
++  __nls_v=${__nls_v//'\'/'\\'}
++  __nls_v=${__nls_v//$'\n'/'\n'}
++  __nls_v=${__nls_v//$'\r'/'\r'}
++  \builtin printf '%s %s\n' "$1" "$__nls_v" >&3
++}
+ __nls_done() {
+-  local st=$? ps=("${PIPESTATUS[@]}") f s
+-  if (( __nls_started )); then ((++__nls_seq)); fi
+-  printf 'D %s %s %s\n' "$__nls_seq" "$st" "${ps[*]}" >&3
+-  f=$(compgen -A function); s=$(cksum <<<"$f")
+-  if [[ $s != "$__nls_fsum" ]]; then __nls_fsum=$s; printf 'F %s\n' "$(tr '\n' ' ' <<<"$f")" >&3; fi
+-  printf 'L %s\n' "$(alias -p | tr '\n' '\036')" >&3
+-  printf 'E\n' >&3
+-  eval "$__nls_user_pc"
+-  return $st
++  \builtin set +T -- "$?" "$-" "${PIPESTATUS[@]}"
++  __nls_st=$1 __nls_f=${2//[!T]/}
++  \builtin shift 2
++  __nls_ps=("$@")
++  \builtin printf '\033]7700;@NLS_END@\007'
++  __nls_seq=$((__nls_seq + 1))
++  \builtin printf -v __nls_v ' %s' "${__nls_ps[@]}"
++  \builtin printf 'D %s %s%s\n' "$__nls_seq" "$__nls_st" "$__nls_v" >&3
++  for __nls_c in "${__nls_user_pc[@]}"; do
++    if __nls_ret "$__nls_st"; then
++      \builtin eval "$__nls_c" || \builtin :
++    else
++      \builtin eval "$__nls_c" || \builtin :
++    fi
++  done
++  __nls_st=0 __nls_ps=() __nls_v= __nls_c= __nls_n=0
++}
++__nls_snap() {
++  \builtin set +T -- "$1" "${BASHOPTS-}"
++  \builtin shopt -u expand_aliases
++  __nls_enc H "$( {
++    \builtin declare -p PS0 PROMPT_COMMAND __nls_user_pc TERM
++    \builtin shopt -p promptvars
++    for __nls_c in __nls_c __nls_done __nls_ea __nls_enc __nls_f __nls_n __nls_ps __nls_ret __nls_seq __nls_snap __nls_st __nls_user_pc __nls_v; do
++      \builtin declare -p "$__nls_c" 2>/dev/null || \builtin printf '%s unset\n' "$__nls_c"
++    done
++    for __nls_c in PS1 PS2; do
++      if __nls_v=$(\builtin declare -p "$__nls_c" 2>/dev/null); then
++        \builtin printf '%s\n' "${__nls_v%%=*}"
++      else
++        \builtin printf '%s unset\n' "$__nls_c"
++      fi
++    done
++    \builtin declare -f __nls_done __nls_snap __nls_enc __nls_ret
++  } 2>&1 )"
++  __nls_enc V "$(
++    for __nls_c in PAGER MANPAGER SYSTEMD_PAGER GIT_PAGER LESSOPEN LESSCLOSE LD_PRELOAD LD_LIBRARY_PATH BASH_ENV ENV; do
++      \builtin declare -p "$__nls_c" 2>/dev/null || \builtin printf '%s unset\n' "$__nls_c"
++    done
++  )"
++  __nls_enc F "$(\builtin compgen -A function)"
++  __nls_enc L "$(\builtin alias -p)"
++  __nls_enc T "$1"
++  __nls_enc B "$(\builtin enable -n)"
++  __nls_enc X "$(\builtin shopt -p extdebug)"
++  __nls_enc P "${PATH-}"
++  __nls_v=$(\builtin jobs -ps) __nls_n=0
++  if [[ -n $__nls_v ]]; then __nls_c=${__nls_v//[!$'\n']/}; __nls_n=$((${#__nls_c} + 1)); fi
++  \builtin printf 'J %s\n' "$__nls_n" >&3
++  \builtin printf 'E\n' >&3
++  PS1='\$ ' PS2='> '
++  if [[ :$2: == *:expand_aliases:* ]]; then \builtin shopt -s expand_aliases; fi
+ }
+-PROMPT_COMMAND='__nls_done; __nls_started=1'
++PROMPT_COMMAND='\__nls_done; \__nls_snap "$(\builtin trap -p)"'
++builtin eval "$__nls_ea"; builtin unset __nls_ea
+ ```
+ 
+-   The v1 snapshot fields not yet in the reference (§3: `T`, `B`, `X`, `P`, `J`, `H`, `V`) MUST
+-   be added the same way before #12 relies on them.
++   The hooks call no external program, only bash builtins and parameter expansion, so a
++   `hash -p`, a `BASH_CMDS` entry or a changed `PATH` cannot replace part of them. The
++   function bodies are parsed with alias expansion off, but each `$( … )` is parsed
++   again when it runs, so `__nls_snap` turns `expand_aliases` off first (back on after
++   `E`) and `PS0`/`PROMPT_COMMAND` quote their command words (`\builtin`). Each hook
++   first turns `functrace` off, so no DEBUG trap runs inside it after `H` is taken;
++   `__nls_f` (in `H`) records that it was on. A shell function named `builtin`,
++   `command`, `eval` or `return` shadows what the hooks call and can forge every record;
++   this is **not yet detected** (#141). With `extdebug` a DEBUG trap runs, and can skip,
++   every hook command; I2 is not claimed against it (#141). The hooks are safe under
++   `set -u` and `set -e`. `PS0` writes `\\n` because bash decodes prompt escapes before
++   expanding `PS0` and would turn `\n` into CR LF. `@NLS_END@` is replaced by a random
++   token at every start: `__nls_done` prints that OSC sequence on the PTY before it writes
++   `D` and before the user's `PROMPT_COMMAND` runs, and a command's output is what
++   follows readline's end of the paste (`ESC [?2004l`) and precedes that marker.
+ 
+ ### 2. Records
+ 
+ | Record | Written by | Fields | Meaning |
+ |---|---|---|---|
+ | `S <n>` | `PS0` | sequence number of the command about to run | a command started |
+-| `D <n> <status> <pipestatus…>` | `PROMPT_COMMAND` | sequence number, `$?`, `PIPESTATUS` | the command finished |
+-| `F <names…>` | `PROMPT_COMMAND` | function names, space-separated | function list; sent only when it changed |
+-| `L <defs>` | `PROMPT_COMMAND` | `alias -p` output, lines joined with `\x1e` | alias definitions |
++| `D <n> <status> <pipestatus…>` | `PROMPT_COMMAND` | sequence number, `$?`, `PIPESTATUS` | the command finished, or nothing ran (§4.1) |
++| `F <names>` | `PROMPT_COMMAND` | `compgen -A function` output, encoded | function names, one per line |
++| `L <defs>` | `PROMPT_COMMAND` | `alias -p` output, encoded | alias definitions |
+ | `E` | `PROMPT_COMMAND` | — | end of this snapshot |
+ 
+ The first snapshot (before any command) has sequence number 0 and no `S` record.
+ 
++Every free-text field (`F`, `L` and the §3 text fields) uses one reversible encoding: `\`
++is written `\\`, LF `\n` and CR `\r`; no other escape exists, so a record never holds a
++raw LF or CR. A record that contains a CR, or a bad escape, is malformed.
++
+ ### 3. Snapshot (v1 fields)
+ 
+ Besides `F` and `L`, a v1 snapshot MUST carry, as separate record types before `E`:
+ `T` (output of `trap -p`), `B` (output of `enable -n`, i.e. disabled builtins), `X`
+-(`shopt -p extdebug`), `P` (`$PATH`), `J` (number of stopped jobs, `jobs -ps | wc -l`),
+-`H` (a `cksum` of `$PROMPT_COMMAND` and `$PS0`) and `V` (a `cksum` of the pager and loader
+-variables listed in spec `policy-gate/v1` §7.5). nl-shell records the first snapshot as the
++(`shopt -p extdebug`), `P` (`$PATH`), `J` (number of stopped jobs, counted from
++`jobs -ps` with builtins only), `H` and `V`. nl-shell records the first snapshot as the
+ session's **baseline**.
+ 
++`H` and `V` carry raw `declare -p` (and builtin) output text, encoded as in §2, and are
++compared exactly; there is no checksum.
++
++- `H` covers nl-shell's prompt hooks and their state: `declare -p` of `PS0`,
++  `PROMPT_COMMAND` (every element), the saved user hook and `TERM` (readline turns
++  bracketed paste off for some terminals); `shopt -p promptvars`;
++  `declare -p` of every hook state variable, value and attributes (`NAME unset` when it
++  is not a variable); the attributes of `PS1` and `PS2`; and `declare -f` of the hook
++  functions. The hooks reset their scratch variables before `H` is taken, so the only
++  value that changes between snapshots is the sequence counter, which MUST equal the `D`
++  record's number. `__nls_f` holds `T` when `functrace` was on as the hooks began.
++  Everything else MUST equal the baseline byte for byte. Traps, `extdebug`, xtrace and
++  `PS4`, disabled hook builtins, readline state (`bind`, or readline turned off with
++  `set +o emacs` / `set +o vi`), `set -H` and functions that shadow `builtin`,
++  `command`, `eval` or `return` are not covered yet (#141).
++- `V` is `declare -p` of the pager and loader variables listed in spec `policy-gate/v1`
++  §7.5 (`NAME unset` when unset).
++
+ ### 4. Sequencing and degraded mode
+ 
+ 1. After sending a command, nl-shell MUST see `S n+1`, then `D n+1 …`, then a snapshot
+    ending in `E`, in that order. Output on the PTY between `S` and `D` belongs to that
+-   command.
++   command; it includes the job notices (`[1]+  Done …`) bash prints before its next
++   prompt, so a background job's notice lands in the output of a later command. `PS0`
++   runs once per line of a multi-line command, so `S n+1` MAY repeat before `D n+1`.
++   `D n+1` without `S n+1` means bash read the input but ran nothing (an empty line, a
++   comment, a syntax error): it is reported as not run with the `D` status, and the
++   session stays healthy.
+ 2. nl-shell MUST enter **degraded mode** when:
+-   - a record is missing, out of order or malformed;
++   - a record is missing, out of order or malformed (except `D n+1` without `S n+1`,
++     §4.1);
+    - the control channel closes;
+-   - no `D` arrives after the shell is back at a prompt;
+-   - the snapshot's `H` differs from the baseline (nl-shell's hooks were replaced).
+-3. In degraded mode every command MUST need a confirm, the user MUST be told why, and
++   - from the paste, no `D` (or no `E`) has arrived and bash has been blocked reading its
++     terminal (fd 0, read from `/proc/<bash pid>/syscall`, while `/proc/<bash pid>/fd/0`
++     is the session's PTY, so a builtin reading a redirected fd 0 does not count) for 1 s
++     continuously: "no done record after the shell returned to a prompt". nl-shell does
++     not parse the PTY stream for prompts. If either file cannot be read, at start or
++     during a command, the session degrades with a reason naming the file. A command
++     that reads the terminal itself also degrades, even when it would finish: `read x`,
++     timed or single-key reads (`read -t`, `read -n1 -t`) and `select` (#136);
++   - the snapshot's `H` differs from the baseline (nl-shell's hooks were changed); this is
++     found at the snapshot of the command that changed them. Shadowing the builtins the
++     hooks call with a function is not yet detected (§1.3, #141).
++3. In degraded mode nl-shell MUST NOT send the session any further command until it is
++   restarted. A restart gives a fresh session and baseline; restoring the cwd (§4.4) and
++   the `session_restart` record (§4.5) land with #121. The user MUST be told why, and
+    nl-shell MUST offer to restart the session.
+ 
+ ### 5. Sending a command
+@@ -142,6 +252,8 @@ write history.
+ 
+ Adding a snapshot record type is compatible within v1 if nl-shell ignores unknown types.
+ Changing a record's fields, the paste framing or the start-up command requires v2.
++While this spec is `status: draft`, v1 changes in place; the v2 rule applies once it is
++`stable`.
+ 
+ ## Conformance
+ 
+@@ -156,14 +268,15 @@ The session tests for #10 MUST cover at least these vectors:
+ | 5 | `printf '\x1b]133;D;0\x07'` | as 4: printed OSC sequences have no effect |
+ | 6 | `echo 'done!!'` | output `done!!` (no history expansion) |
+ | 7 | `alias ll2='ls -la'; g(){ :; }` | next snapshot has a changed `F` list and `ll2` in `L` |
+-| 8 | `PROMPT_COMMAND=:` | degraded mode at the next prompt (missing `D`) |
++| 8 | `PROMPT_COMMAND=:` | degraded: the hook is gone, so no `D` (§4.2 prompt rule). A change that keeps the hook, such as `PROMPT_COMMAND+=(':')` or `PS0='x'`, is degraded at that command's snapshot (`H` changed) |
+ | 9 | `exec 3>&-` | rejected by the gate; if typed raw, degraded mode |
+ | 10 | `sleep 5` then Ctrl-C | SIGINT reaches `sleep`; `D … 130` |
+ | 11 | `less /etc/hostname`, `q` | output mirrored; capture paused on the alternate screen |
+ | 12 | command with `ESC [201~` inside | not sent (gate rejects) |
+ 
+-Vectors 1–7 were checked by hand with a prototype on Ubuntu 26.04 (bash 5.3.9); the
+-others are untested.
++`tests/test_session.py` checks vectors 1–8, 9 typed raw, 10 and 12 against a real bash
++(5.3.9 on Ubuntu 26.04), and that a job notice lands in the next command's output (§4.1);
++the others are untested.
+ 
+ ## Open questions
+ 
+diff --git a/pyproject.toml b/pyproject.toml
+index 48a5e89..7f95606 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -12,6 +12,7 @@ authors = [{ name = "Eduard Ralph", email = "eduard@ralphovi.net" }]
+ requires-python = ">=3.12"
+ dependencies = [
+     "prompt_toolkit>=3.0",
++    "ptyprocess>=0.7",
+ ]
+ 
+ [project.optional-dependencies]
+diff --git a/src/nl_shell/pty_protocol.py b/src/nl_shell/pty_protocol.py
+new file mode 100644
+index 0000000..c301610
+--- /dev/null
++++ b/src/nl_shell/pty_protocol.py
+@@ -0,0 +1,303 @@
++"""pty-protocol v1 (``docs/design/specs/pty-protocol/v1.md``): records (§2), the snapshot
++(§3), sequencing and degraded mode (§4) and which commands may be sent (§5).
++
++Pure logic with no I/O: ``session.py`` feeds it the bytes read from the control channel
++(fd 3 in bash). Exit codes and completion come only from here, never from PTY text.
++"""
++
++from __future__ import annotations
++
++import dataclasses
++import enum
++import re
++from typing import Callable
++
++PASTE_START = b"\x1b[200~"
++PASTE_END = b"\x1b[201~"
++
++# A record longer than this is malformed rather than buffered forever.
++MAX_RECORD = 1 << 20
++
++# Record types every snapshot carries (§3), in no required order.
++SNAPSHOT_TYPES = ("F", "L", "T", "B", "X", "P", "J", "H", "V")
++KNOWN_TYPES = frozenset(("S", "D", "E") + SNAPSHOT_TYPES)
++
++# At most 18 digits: int() raises past 4300, and a malformed record must degrade (§4.2).
++_NUM = r"\d{1,18}"
++_NUMERIC = {
++    "S": re.compile(_NUM),
++    "D": re.compile(rf"{_NUM} {_NUM}(?: {_NUM})*"),
++    "J": re.compile(_NUM),
++}
++# The one reversible free-text encoding (§2).
++_ESCAPES = {"\\": "\\", "n": "\n", "r": "\r"}
++
++
++class ProtocolError(Exception):
++    """A control-channel record that does not follow pty-protocol v1 §2."""
++
++
++class CommandRefused(ValueError):
++    """A command that pty-protocol v1 §5.2 forbids sending; nothing was written to the PTY."""
++
++
++@dataclasses.dataclass(frozen=True)
++class Record:
++    type: str
++    fields: str  # everything after "<type> ", "" when there is nothing
++
++
++@dataclasses.dataclass(frozen=True)
++class Done:
++    """A ``D`` record: the command finished, or nothing ran (§2, §4.1)."""
++
++    seq: int
++    status: int
++    pipestatus: tuple[int, ...]
++
++
++@dataclasses.dataclass(frozen=True)
++class Snapshot:
++    """The session state reported before a prompt (§3). Text fields are decoded."""
++
++    seq: int
++    functions: tuple[str, ...]  # F: `compgen -A function`, one name per line
++    aliases: str  # L: `alias -p`
++    traps: str  # T: `trap -p`
++    disabled_builtins: str  # B: `enable -n`
++    extdebug: str  # X: `shopt -p extdebug`
++    path: str  # P: `$PATH`
++    stopped_jobs: int  # J: number of stopped jobs
++    hooks: str  # H: `declare -p` / `declare -f` text of nl-shell's hooks and their state
++    variables: str  # V: `declare -p` text of the pager and loader variables
++
++
++class Phase(enum.Enum):
++    BASELINE = "waiting for the first snapshot"
++    IDLE = "idle"
++    SENT = "waiting for the start record"
++    RUNNING = "waiting for the done record"
++    SNAPSHOT = "reading the snapshot"
++    DEGRADED = "degraded"
++
++
++def decode_field(text: str) -> str:
++    """Undo the §2 free-text encoding. Raises :class:`ProtocolError` on a bad escape."""
++    if "\\" not in text:
++        return text
++    out: list[str] = []
++    i = 0
++    while i < len(text):
++        ch = text[i]
++        if ch != "\\":
++            out.append(ch)
++            i += 1
++            continue
++        nxt = text[i + 1 : i + 2]
++        if nxt not in _ESCAPES:
++            raise ProtocolError(f"bad escape {text[i:i + 2]!r} in a free-text field")
++        out.append(_ESCAPES[nxt])
++        i += 2
++    return "".join(out)
++
++
++def parse_record(line: bytes) -> Record:
++    """Parse one record, without its trailing ``\\n``. Raises :class:`ProtocolError`."""
++    if b"\r" in line:
++        raise ProtocolError("record contains a carriage return")
++    if len(line) > MAX_RECORD:
++        raise ProtocolError("record is too long")
++    text = line.decode("utf-8", "surrogateescape")
++    if not text or not ("A" <= text[0] <= "Z"):
++        raise ProtocolError(f"record does not start with a one-letter type: {text[:40]!r}")
++    if len(text) > 1 and text[1] != " ":
++        raise ProtocolError(f"record type is longer than one letter: {text[:40]!r}")
++    rtype, fields = text[0], text[2:]
++    if rtype == "E" and len(text) != 1:
++        raise ProtocolError("E record has fields")
++    pattern = _NUMERIC.get(rtype)
++    if pattern is not None and not pattern.fullmatch(fields):
++        raise ProtocolError(f"malformed {rtype} record: {text[:80]!r}")
++    if rtype in SNAPSHOT_TYPES and rtype != "J":
++        decode_field(fields)  # validates the escapes
++    return Record(rtype, fields)
++
++
++def _seq_line(seq: int) -> str:
++    """The end of the ``declare -p __nls_seq`` line in ``H`` when the counter is ``seq``."""
++    return f' __nls_seq="{seq}"\n'
++
++
++def expected_hooks(baseline: Snapshot, seq: int) -> str:
++    """The ``H`` a healthy session reports at ``seq``: the baseline's, byte for byte, with
++    the sequence counter's value set to ``seq`` (§3, §4.2)."""
++    return baseline.hooks.replace(
++        _seq_line(baseline.seq), _seq_line(seq), 1
++    )
++
++
++def check_command(command: str | bytes) -> bytes:
++    """The bytes to paste for ``command``, or :class:`CommandRefused` (§5.2): no paste
++    end, ESC or other C0 control except TAB and LF. An empty command is allowed (§4.1)."""
++    data = command.encode("utf-8") if isinstance(command, str) else bytes(command)
++    if PASTE_END in data:
++        raise CommandRefused("command contains the paste-end sequence ESC [201~")
++    for byte in data:
++        if byte < 0x20 and byte not in (0x09, 0x0A):
++            raise CommandRefused(f"command contains the control character 0x{byte:02x}")
++    return data
++
++
++class ProtocolTracker:
++    """The §4 state machine. ``feed`` takes raw pipe bytes and returns the events they
++    completed: ``("S", n)``, ``("D", Done)``, ``("E", Snapshot)``. Degraded mode is sticky
++    and keeps the first reason. Unknown record types are ignored (§Versioning)."""
++
++    def __init__(self, on_record: Callable[[bytes], None] | None = None):
++        self.phase = Phase.BASELINE
++        self.seq = 0  # sequence number of the last finished command
++        self.baseline: Snapshot | None = None
++        self.snapshot: Snapshot | None = None
++        self.done: Done | None = None
++        self.started = False  # an `S` came for the command in flight
++        self.degraded_reason: str | None = None
++        self._on_record = on_record
++        self._buf = bytearray()
++        self._fields: dict[str, str] = {}
++
++    @property
++    def degraded(self) -> bool:
++        return self.phase is Phase.DEGRADED
++
++    def degrade(self, reason: str) -> None:
++        if self.phase is not Phase.DEGRADED:
++            self.phase = Phase.DEGRADED
++            self.degraded_reason = reason
++
++    def command_sent(self) -> None:
++        if self.phase is not Phase.IDLE:
++            raise RuntimeError(f"cannot send a command while {self.phase.value}")
++        self.done = None
++        self.started = False
++        self.phase = Phase.SENT
++
++    def eof(self) -> None:
++        self.degrade("the control channel closed")
++
++    def feed(self, data: bytes) -> list[tuple[str, object]]:
++        events: list[tuple[str, object]] = []
++        if self.degraded:
++            return events
++        self._buf += data
++        while not self.degraded:
++            end = self._buf.find(b"\n")
++            if end < 0:
++                if len(self._buf) > MAX_RECORD:
++                    self.degrade("malformed control record: record is too long")
++                break
++            line = bytes(self._buf[: end + 1])
++            del self._buf[: end + 1]
++            if self._on_record is not None:
++                self._on_record(line)
++            event = self._handle(line[:-1])
++            if event is not None:
++                events.append(event)
++        return events
++
++    def _handle(self, line: bytes) -> tuple[str, object] | None:
++        try:
++            return self._sequence(parse_record(line))
++        except (ProtocolError, ValueError) as exc:
++            self.degrade(f"malformed control record: {exc}")
++            return None
++
++    def _sequence(self, record: Record) -> tuple[str, object] | None:
++        rtype = record.type
++        if rtype not in KNOWN_TYPES:
++            return None
++        phase = self.phase
++        nxt = self.seq + 1
++        if phase is Phase.BASELINE:
++            if rtype == "D" and self._done(record).seq == 0:
++                self.phase = Phase.SNAPSHOT
++                return None
++            return self._out_of_order(rtype, "before the first snapshot")
++        if phase is Phase.IDLE:
++            return self._out_of_order(rtype, "while no command was running")
++        if phase is Phase.SENT:
++            if rtype == "S" and int(record.fields) == nxt:
++                self.started = True
++                self.phase = Phase.RUNNING
++                return ("S", nxt)
++            if rtype == "D":
++                # §4.1: `D n+1` without `S n+1`: nothing ran.
++                return self._finish(record, nxt)
++            return self._out_of_order(rtype, f"while waiting for 'S {nxt}'")
++        if phase is Phase.RUNNING:
++            if rtype == "D":
++                return self._finish(record, nxt)
++            if rtype == "S" and int(record.fields) == nxt:
++                return None  # the next line of the same multi-line command
++            return self._out_of_order(rtype, f"while waiting for 'D {nxt}'")
++        # Phase.SNAPSHOT
++        if rtype in SNAPSHOT_TYPES:
++            if rtype in self._fields:
++                return self._out_of_order(rtype, "twice in one snapshot")
++            self._fields[rtype] = record.fields
++            return None
++        if rtype == "E":
++            return self._end_snapshot()
++        return self._out_of_order(rtype, "inside a snapshot")
++
++    def _finish(self, record: Record, nxt: int) -> tuple[str, object] | None:
++        done = self._done(record)
++        if done.seq != nxt:
++            return self._out_of_order("D", f"with sequence number {done.seq}, expected {nxt}")
++        self.done = done
++        self.phase = Phase.SNAPSHOT
++        return ("D", done)
++
++    def _out_of_order(self, rtype: str, where: str) -> None:
++        self.degrade(f"control record '{rtype}' arrived out of order ({where})")
++        return None
++
++    @staticmethod
++    def _done(record: Record) -> Done:
++        numbers = [int(n) for n in record.fields.split(" ")]
++        return Done(numbers[0], numbers[1], tuple(numbers[2:]))
++
++    def _end_snapshot(self) -> tuple[str, object] | None:
++        fields, self._fields = self._fields, {}
++        missing = [t for t in SNAPSHOT_TYPES if t not in fields]
++        if missing:
++            self.degrade(f"snapshot is missing record(s) {', '.join(missing)}")
++            return None
++        text = {t: decode_field(v) for t, v in fields.items() if t != "J"}
++        snapshot = Snapshot(
++            seq=self.done.seq if self.done is not None else 0,
++            functions=tuple(name for name in text["F"].split("\n") if name),
++            aliases=text["L"],
++            traps=text["T"],
++            disabled_builtins=text["B"],
++            extdebug=text["X"],
++            path=text["P"],
++            stopped_jobs=int(fields["J"]),
++            hooks=text["H"],
++            variables=text["V"],
++        )
++        self.snapshot = snapshot
++        if self.baseline is None:
++            if snapshot.hooks.count(_seq_line(snapshot.seq)) != 1:
++                self.degrade("the baseline's H does not report the sequence counter")
++                return None
++            self.baseline = snapshot
++        elif snapshot.hooks != expected_hooks(self.baseline, snapshot.seq):
++            self.degrade(
++                "nl-shell's hooks changed (PROMPT_COMMAND, PS0, TERM, promptvars, functrace,"
++                " the attributes of PS1/PS2, the hook functions, their state variables or"
++                " the saved user hook): the snapshot's H differs from the baseline"
++            )
++            return None
++        self.seq = snapshot.seq
++        self.phase = Phase.IDLE
++        return ("E", snapshot)
+diff --git a/src/nl_shell/session.py b/src/nl_shell/session.py
+new file mode 100644
+index 0000000..678abdd
+--- /dev/null
++++ b/src/nl_shell/session.py
+@@ -0,0 +1,749 @@
++"""The persistent bash session: one interactive bash on a PTY, driven by pty-protocol v1.
++
++``Session.start()`` runs ``bash --noprofile --rcfile <rcfile> -i`` on a PTY (ptyprocess,
++ADR-0021 §2) with a pipe as fd 3, the control channel (spec
++``docs/design/specs/pty-protocol/v1.md`` §1, ADR-0014). ``Session.run()`` pastes one
++confirmed command (§5) and returns its status, ``PIPESTATUS``, output and snapshot. Status
++and completion come only from control-channel records, never from text on the PTY.
++
++A protocol violation puts the session in degraded mode (§4.2) until ``restart()``; while
++degraded nothing more is written to the PTY (§4.3). Terminal ownership (§6) and the REPL
++are later work (#102, #78). The prompt rule reads Linux ``/proc``.
++"""
++
++from __future__ import annotations
++
++import dataclasses
++import fcntl
++import os
++import platform
++import secrets
++import select
++import shutil
++import stat
++import struct
++import tempfile
++import time
++from typing import Callable
++
++import ptyprocess
++
++from nl_shell.pty_protocol import (
++    PASTE_END,
++    PASTE_START,
++    CommandRefused,
++    Done,
++    Phase,
++    ProtocolTracker,
++    Snapshot,
++    check_command,
++)
++
++__all__ = [
++    "CommandRefused",
++    "CommandResult",
++    "HOOK_STATE_VARS",
++    "RCFILE",
++    "Session",
++    "SessionDegraded",
++    "SessionError",
++    "SessionTimeout",
++    "Snapshot",
++]
++
++# Every shell name the rcfile's hooks use, variables and functions (no `local`: a readonly
++# global of the same name would make it fail). H carries `declare -p` of each (value and
++# attributes), so a confirmed change to one degrades at that command's own snapshot. The
++# scratch variables are reset before H is taken; the counter `__nls_seq` must equal the D
++# record's number (pty_protocol.expected_hooks).
++HOOK_STATE_VARS = (
++    "__nls_c",
++    "__nls_done",
++    "__nls_ea",
++    "__nls_enc",
++    "__nls_f",
++    "__nls_n",
++    "__nls_ps",
++    "__nls_ret",
++    "__nls_seq",
++    "__nls_snap",
++    "__nls_st",
++    "__nls_user_pc",
++    "__nls_v",
++)
++
++# The pager and loader variables of policy-gate v1 §7.5, reported in V.
++_V_VARS = (
++    "PAGER MANPAGER SYSTEMD_PAGER GIT_PAGER LESSOPEN LESSCLOSE LD_PRELOAD LD_LIBRARY_PATH"
++    " BASH_ENV ENV"
++)
++
++# The rcfile: the spec's reference (§1.3, which explains it; H and V are §3). In short:
++# - PS0 writes S for every line bash reads, with no guard variable (I2). At each prompt
++#   `__nls_done` saves the status, prints the end-of-output marker, writes D and runs the
++#   user's PROMPT_COMMAND; then `__nls_snap` writes the snapshot and E and sets PS1/PS2
++#   (I3). Output is what lies between readline's end of the paste and that marker.
++# - only builtins and parameter expansion (no `PATH` lookup). Each `$( … )` is parsed
++#   again when it runs, so `__nls_snap` turns `expand_aliases` off first (back on after E
++#   if it was on) and PS0/PROMPT_COMMAND quote their command words (`\builtin`).
++# - each hook first turns functrace off, so no DEBUG trap runs inside it after H is
++#   taken; `__nls_f` (in H) records that it was on, so `set -T` degrades.
++# - NOT yet detected (#141): functions named `builtin`, `command`, `eval` or `return`
++#   (they can forge every record); `extdebug` with a DEBUG trap (I2 is not claimed
++#   against it); other traps, xtrace, disabled builtins, readline state (`bind`,
++#   `set +o emacs`/`vi`). See the threat model's Known gaps.
++RCFILE = (
++    r"""# nl-shell session rcfile (pty-protocol v1 §1.3). Written by nl-shell; do not edit.
++[ -f ~/.bashrc ] && . ~/.bashrc
++set +H +T
++unset HISTFILE
++bind 'set enable-bracketed-paste on' 2>/dev/null
++shopt -s promptvars
++__nls_ea=$(shopt -p expand_aliases); shopt -u expand_aliases
++__nls_user_pc=()
++if declare -p PROMPT_COMMAND >/dev/null 2>&1; then __nls_user_pc=("${PROMPT_COMMAND[@]}"); fi
++__nls_seq=-1 __nls_st=0 __nls_ps=() __nls_v= __nls_c= __nls_n=0 __nls_f=
++PS0='$(\\builtin printf "S %s\\n" "$((__nls_seq + 1))" >&3)'
++__nls_ret() { \builtin return "$1"; }
++__nls_enc() {
++  __nls_v=$2
++  __nls_v=${__nls_v//'\'/'\\'}
++  __nls_v=${__nls_v//$'\n'/'\n'}
++  __nls_v=${__nls_v//$'\r'/'\r'}
++  \builtin printf '%s %s\n' "$1" "$__nls_v" >&3
++}
++__nls_done() {
++  \builtin set +T -- "$?" "$-" "${PIPESTATUS[@]}"
++  __nls_st=$1 __nls_f=${2//[!T]/}
++  \builtin shift 2
++  __nls_ps=("$@")
++  \builtin printf '\033]7700;@NLS_END@\007'
++  __nls_seq=$((__nls_seq + 1))
++  \builtin printf -v __nls_v ' %s' "${__nls_ps[@]}"
++  \builtin printf 'D %s %s%s\n' "$__nls_seq" "$__nls_st" "$__nls_v" >&3
++  for __nls_c in "${__nls_user_pc[@]}"; do
++    if __nls_ret "$__nls_st"; then
++      \builtin eval "$__nls_c" || \builtin :
++    else
++      \builtin eval "$__nls_c" || \builtin :
++    fi
++  done
++  __nls_st=0 __nls_ps=() __nls_v= __nls_c= __nls_n=0
++}
++__nls_snap() {
++  \builtin set +T -- "$1" "${BASHOPTS-}"
++  \builtin shopt -u expand_aliases
++  __nls_enc H "$( {
++    \builtin declare -p PS0 PROMPT_COMMAND __nls_user_pc TERM
++    \builtin shopt -p promptvars
++    for __nls_c in """
++    + " ".join(HOOK_STATE_VARS)
++    + r"""; do
++      \builtin declare -p "$__nls_c" 2>/dev/null || \builtin printf '%s unset\n' "$__nls_c"
++    done
++    for __nls_c in PS1 PS2; do
++      if __nls_v=$(\builtin declare -p "$__nls_c" 2>/dev/null); then
++        \builtin printf '%s\n' "${__nls_v%%=*}"
++      else
++        \builtin printf '%s unset\n' "$__nls_c"
++      fi
++    done
++    \builtin declare -f __nls_done __nls_snap __nls_enc __nls_ret
++  } 2>&1 )"
++  __nls_enc V "$(
++    for __nls_c in """
++    + _V_VARS
++    + r"""; do
++      \builtin declare -p "$__nls_c" 2>/dev/null || \builtin printf '%s unset\n' "$__nls_c"
++    done
++  )"
++  __nls_enc F "$(\builtin compgen -A function)"
++  __nls_enc L "$(\builtin alias -p)"
++  __nls_enc T "$1"
++  __nls_enc B "$(\builtin enable -n)"
++  __nls_enc X "$(\builtin shopt -p extdebug)"
++  __nls_enc P "${PATH-}"
++  __nls_v=$(\builtin jobs -ps) __nls_n=0
++  if [[ -n $__nls_v ]]; then __nls_c=${__nls_v//[!$'\n']/}; __nls_n=$((${#__nls_c} + 1)); fi
++  \builtin printf 'J %s\n' "$__nls_n" >&3
++  \builtin printf 'E\n' >&3
++  PS1='\$ ' PS2='> '
++  if [[ :$2: == *:expand_aliases:* ]]; then \builtin shopt -s expand_aliases; fi
++}
++PROMPT_COMMAND='\__nls_done; \__nls_snap "$(\builtin trap -p)"'
++builtin eval "$__nls_ea"; builtin unset __nls_ea
++"""
++)
++
++# Readline writes this when it hands a finished line to bash (bracketed paste mode off),
++# just before PS0 runs. Before it is readline's echo of the paste.
++_LINE_ACCEPTED = b"\x1b[?2004l"
++
++# Where the rcfile prints the end-of-output marker's token; `_spawn` puts a random one in.
++_END_TOKEN = "@NLS_END@"
++
++
++def _end_marker(token: str) -> bytes:
++    """The OSC sequence `__nls_done` prints before `D` and the user's hook; random per start."""
++    return b"\x1b]7700;" + token.encode("ascii") + b"\x07"
++
++
++# Captured output kept per command; past this only the tail is kept and
++# ``output_truncated`` is set.
++MAX_OUTPUT = 1 << 20
++
++# §4.2 third trigger: how long bash must be blocked reading the terminal, with no D (or
++# E), before the session degrades.
++PROMPT_GRACE = 1.0
++
++# Bound on waiting for the prompt before a paste, or for the end marker after E.
++_SETTLE = 3.0
++
++# System call numbers for reading `/proc/<pid>/syscall`. readline waits for a line in
++# `pselect6` with nfds 1 (fd 0 only); the `read` builtin reads fd 0 with `read`.
++_SYSCALLS = {
++    "x86_64": {"read": 0, "select": 23, "pselect6": 270},
++    "aarch64": {"read": 63, "pselect6": 72},
++}
++
++# Linux `TIOCGPTN` (the PTY number of a master), for Pythons without `os.ptsname`.
++_TIOCGPTN = 0x80045430
++
++_POLL = 0.02
++
++_DEV_TTY = os.makedev(5, 0)
++
++
++class SessionError(Exception):
++    """The session cannot do what was asked."""
++
++
++class SessionDegraded(SessionError):
++    """The session is in degraded mode (§4.2); ``reason`` says why. ``result`` is the
++    command's result when its own snapshot degraded the session (``H`` changed)."""
++
++    def __init__(self, reason: str, result: "CommandResult | None" = None):
++        super().__init__(f"session degraded: {reason}")
++        self.reason = reason
++        self.result = result
++
++
++class SessionTimeout(SessionError, TimeoutError):
++    """No done record within the caller's timeout (the session degrades)."""
++
++
++class _ProcUnreadable(Exception):
++    """``/proc/<pid>/syscall`` could not be read: the prompt rule cannot be applied."""
++
++
++@dataclasses.dataclass(frozen=True)
++class CommandResult:
++    """One command, as the control channel reported it."""
++
++    seq: int
++    ran: bool  # False: `D` came without `S`, bash read the input but ran nothing (§4.1)
++    status: int  # `$?` from the D record
++    pipestatus: tuple[int, ...]
++    output: bytes  # PTY output between S and D, the tail when truncated
++    output_truncated: bool
++    snapshot: Snapshot
++    variables_changed: bool  # the snapshot's V differs from the baseline's
++
++    @property
++    def text(self) -> str:
++        """``output`` decoded, with the PTY's CR LF turned back into LF."""
++        return self.output.decode("utf-8", "replace").replace("\r\n", "\n")
++
++
++class _Output:
++    """The command's share of the PTY stream, bounded: after readline's end of the paste,
++    before the end marker. Later bytes are dropped. Markers may be split across reads."""
++
++    def __init__(self, limit: int, end: bytes) -> None:
++        self.limit = limit
++        self.end = end
++        self.data = bytearray()
++        self.truncated = False
++        self._accepted = False
++        self._ended = False
++        self._skip_cr = False
++        self._pending = b""  # bytes that may be the start of a marker split across reads
++
++    @property
++    def ended(self) -> bool:
++        """The end marker was seen: nothing more is the command's."""
++        return self._ended
++
++    @property
++    def delimited(self) -> bool:
++        """Both markers were seen, in order, so ``data`` is exactly the command's output."""
++        return self._accepted and self._ended
++
++    def feed(self, chunk: bytes) -> None:
++        if self._ended:
++            return
++        buf = self._pending + chunk
++        self._pending = b""
++        if not self._accepted:
++            pos = buf.find(_LINE_ACCEPTED)
++            end = buf.find(self.end)
++            if end >= 0 and (pos < 0 or end < pos):
++                self._ended = True  # the command ended before readline ended the paste
++                return
++            if pos < 0:
++                self._pending = buf[-(max(len(_LINE_ACCEPTED), len(self.end)) - 1) :]
++                return
++            self._accepted = True
++            self._skip_cr = True
++            buf = buf[pos + len(_LINE_ACCEPTED) :]
++        if self._skip_cr and buf:
++            # readline moves to column 0 after the accepted line; that CR isn't output.
++            self._skip_cr = False
++            if buf[:1] == b"\r":
++                buf = buf[1:]
++        pos = buf.find(self.end)
++        if pos >= 0:
++            self._ended = True
++            self._append(buf[:pos])
++            return
++        keep = min(len(buf), len(self.end) - 1)
++        self._append(buf[: len(buf) - keep])
++        self._pending = buf[len(buf) - keep :]
++
++    def _append(self, data: bytes) -> None:
++        self.data += data
++        excess = len(self.data) - self.limit
++        if excess > 0:
++            del self.data[:excess]
++            self.truncated = True
++
++
++class Session:
++    """One long-lived interactive bash on a PTY with nl-shell's control channel on fd 3."""
++
++    def __init__(
++        self,
++        *,
++        env: dict[str, str] | None = None,
++        cwd: str | None = None,
++        dimensions: tuple[int, int] = (24, 80),
++        on_record: Callable[[bytes], None] | None = None,
++        max_output: int = MAX_OUTPUT,
++        proc_root: str = "/proc",
++    ):
++        """Prefer :meth:`start`. ``on_record`` sees every control record.
++
++        ``proc_root`` is where bash's ``<pid>/syscall`` is read for the prompt rule (§4.2);
++        if it cannot be read the session degrades with a reason naming the file.
++        """
++        if max_output < 1:
++            raise ValueError("max_output must be at least 1")
++        self.max_output = max_output
++        self.proc_root = proc_root
++        self._env = dict(os.environ if env is None else env)
++        if self._env.get("TERM", "dumb") == "dumb":
++            # Readline turns bracketed paste off on a dumb terminal (§5.1 needs it).
++            self._env["TERM"] = "xterm-256color"
++        self._cwd = cwd
++        self._dimensions = dimensions
++        self._on_record = on_record
++        self._proc: ptyprocess.PtyProcess | None = None
++        self._ctl: int | None = None
++        self._ctl_open = False
++        self._rcdir: str | None = None
++        self._tracker = ProtocolTracker(on_record)
++        self._end = b""  # this start's end-of-output marker (_end_marker)
++        self._tty_rdev: int | None = None  # device number of the PTY slave (bash's fd 0)
++
++    # ----- lifecycle --
++
++    @classmethod
++    def start(cls, *, timeout: float = 10.0, **kwargs) -> "Session":
++        """Start bash and wait for the baseline snapshot (§1, §3). Raises if that fails; a
++        session that cannot apply the prompt rule is returned degraded."""
++        session = cls(**kwargs)
++        try:
++            session._spawn(timeout)
++        except BaseException:
++            session.close()
++            raise
++        return session
++
++    def restart(self, timeout: float = 10.0) -> None:
++        """Fresh bash, fresh baseline, not degraded. Restoring the cwd and logging the
++        restart (spec §4.4-§4.5) land with #121."""
++        self.close()
++        self._tracker = ProtocolTracker(self._on_record)
++        try:
++            self._spawn(timeout)
++        except BaseException:
++            self.close()
++            raise
++
++    def close(self) -> None:
++        """End bash (and its jobs, via SIGHUP) and release every descriptor."""
++        proc, self._proc = self._proc, None
++        if proc is not None:
++            try:
++                proc.close(force=True)
++            except Exception:
++                pass
++        if self._ctl is not None:
++            os.close(self._ctl)
++            self._ctl = None
++        self._ctl_open = False
++        self._remove_rcfile()
++
++    def __enter__(self) -> "Session":
++        return self
++
++    def __exit__(self, *exc) -> None:
++        self.close()
++
++    def _spawn(self, timeout: float) -> None:
++        self._rcdir = tempfile.mkdtemp(prefix="nl-shell-session-")
++        rcfile = os.path.join(self._rcdir, "rc.bash")
++        token = secrets.token_hex(16)
++        self._end = _end_marker(token)
++        with open(rcfile, "w", encoding="utf-8") as fh:
++            fh.write(RCFILE.replace(_END_TOKEN, token))
++        ctl_read, ctl_write = os.pipe()
++
++        def wire_fd3() -> None:  # runs in the child, after fork
++            high = fcntl.fcntl(ctl_write, fcntl.F_DUPFD, 10)
++            os.dup2(high, 3)  # a dup2 copy is inheritable
++            for fd in {high, ctl_write} - {3}:
++                os.close(fd)
++
++        try:
++            self._proc = ptyprocess.PtyProcess.spawn(
++                ["bash", "--noprofile", "--rcfile", rcfile, "-i"],
++                cwd=self._cwd,
++                env=self._env,
++                dimensions=self._dimensions,
++                pass_fds=(ctl_write,),
++                preexec_fn=wire_fd3,
++            )
++        except BaseException:
++            os.close(ctl_read)
++            raise
++        finally:
++            os.close(ctl_write)  # only bash (and what it starts) holds the write end
++        self._ctl, self._ctl_open = ctl_read, True
++        self._tty_rdev = _pty_slave_rdev(self._proc.fd)
++
++        deadline = time.monotonic() + timeout
++        while self._tracker.phase in (Phase.BASELINE, Phase.SNAPSHOT):
++            if time.monotonic() > deadline:
++                raise SessionTimeout("bash did not report its first snapshot in time")
++            ready = _select([self._proc.fd, self._ctl], _POLL)
++            if self._proc.fd in ready:
++                self._read_pty()  # start-up output and the first prompt: not kept
++            if self._ctl in ready:
++                self._read_control()
++            if self._tracker.degraded:
++                raise SessionDegraded(self._tracker.degraded_reason or "unknown")
++        self._remove_rcfile()  # bash has read it
++        # Fail closed at start if the prompt rule cannot be applied (§4.2 third trigger).
++        self._wait_for_prompt()
++
++    def _remove_rcfile(self) -> None:
++        if self._rcdir is not None:
++            shutil.rmtree(self._rcdir, ignore_errors=True)
++            self._rcdir = None
++
++    # ----- state --
++
++    @property
++    def pid(self) -> int | None:
++        return self._proc.pid if self._proc is not None else None
++
++    @property
++    def degraded(self) -> bool:
++        return self._tracker.degraded
++
++    @property
++    def degraded_reason(self) -> str | None:
++        return self._tracker.degraded_reason
++
++    @property
++    def baseline(self) -> Snapshot | None:
++        return self._tracker.baseline
++
++    @property
++    def snapshot(self) -> Snapshot | None:
++        return self._tracker.snapshot
++
++    # ----- running a command --
++
++    def interrupt(self) -> bool:
++        """Write Ctrl-C (``\\x03``) to the PTY, only while a command runs (after its
++        ``S``, before its ``D``); else return ``False``. At a prompt it would make bash
++        send an unrequested ``D``. One that races the command's end degrades the session.
++        """
++        if self._proc is None:
++            raise SessionError("the session is closed")
++        if self._tracker.phase is not Phase.RUNNING:
++            return False
++        _write_all(self._proc.fd, b"\x03")
++        return True
++
++    def run(self, command: str | bytes, *, timeout: float | None = None) -> CommandResult:
++        """Paste one confirmed command (§5) and wait for its done record and snapshot.
++
++        Raises :class:`CommandRefused` or :class:`SessionDegraded` (nothing written unless
++        the command's own run degraded the session), or :class:`SessionTimeout`.
++        """
++        data = check_command(command)
++        if self._proc is None:
++            raise SessionError("the session is closed")
++        self._raise_if_degraded()
++
++        self._drain_pty()  # the last prompt and any job notices: not this command's
++        # A record that arrived after the last E is out of order; the session must
++        # degrade before bash gets the next command (§4.2).
++        self._drain_control()
++        self._raise_if_degraded()
++        # Paste only into readline: bash must be waiting for a line.
++        self._wait_for_prompt()
++        self._raise_if_degraded()
++        self._tracker.command_sent()
++        _write_all(self._proc.fd, PASTE_START + data + PASTE_END + b"\r")
++        return self._wait_for_result(timeout)
++
++    def _raise_if_degraded(self) -> None:
++        if self._tracker.degraded:
++            raise SessionDegraded(self._tracker.degraded_reason or "unknown")
++
++    def _wait_for_result(self, timeout: float | None) -> CommandResult:
++        assert self._proc is not None and self._ctl is not None
++        fd = self._proc.fd
++        deadline = None if timeout is None else time.monotonic() + timeout
++        output = _Output(self.max_output, self._end)
++        done: Done | None = None
++        finished: Snapshot | None = None
++        waiting_since: float | None = None  # bash has been reading the terminal since
++
++        while True:
++            watch = [fd, self._ctl] if self._ctl_open else [fd]
++            ready = _select(watch, _POLL)
++            if fd in ready:
++                output.feed(self._read_pty())
++            if self._ctl_open and self._ctl in ready:
++                for kind, value in self._read_control():
++                    if kind == "D" and done is None:
++                        done = value  # type: ignore[assignment]
++                    elif kind == "E":
++                        finished = value  # type: ignore[assignment]
++                        if self._tracker.started and not self._tracker.degraded:
++                            self._await_output_end(output)
++                if finished is not None:
++                    self._drain_control()  # a record after E degrades, checked below
++
++            if self._tracker.degraded:
++                result = None
++                snapshot = self._tracker.snapshot
++                if done is not None and snapshot is not None and snapshot.seq == done.seq:
++                    result = self._result(done, snapshot, output)
++                raise SessionDegraded(self._tracker.degraded_reason or "unknown", result)
++            if finished is not None:
++                assert done is not None
++                return self._result(done, finished, output)
++
++            now = time.monotonic()
++            # §4.2 third trigger; until E, as a snapshot cut short also ends at a prompt.
++            try:
++                reading = self._reading_terminal()
++            except _ProcUnreadable as exc:
++                self._tracker.degrade(str(exc))
++                continue
++            if reading:
++                if waiting_since is None:
++                    waiting_since = now
++                elif now - waiting_since >= PROMPT_GRACE:
++                    self._tracker.degrade(
++                        "no done record after the shell returned to a prompt"
++                        if done is None
++                        else "the snapshot did not finish after the shell returned to a prompt"
++                    )
++                    continue
++            else:
++                waiting_since = None
++            if deadline is not None and now > deadline:
++                self._tracker.degrade("no done record within the caller's timeout")
++                raise SessionTimeout(f"command did not finish within {timeout} s")
++
++    def _await_output_end(self, output: _Output) -> None:
++        """After ``E``: read the PTY up to the end marker; degrade if the output can't be
++        delimited (reporting partial output for a command that ran would lie)."""
++        assert self._proc is not None
++        deadline = time.monotonic() + _SETTLE
++        while not output.ended and not self._tracker.degraded:
++            if time.monotonic() > deadline:
++                break
++            if _select([self._proc.fd], _POLL):
++                output.feed(self._read_pty())
++        if self._tracker.degraded:
++            return
++        if not output.delimited:
++            self._tracker.degrade(
++                "the command's output could not be delimited (readline did not end a"
++                " bracketed paste, or the end marker before D never reached the terminal)"
++            )
++
++    def _result(self, done: Done, snapshot: Snapshot, output: _Output) -> CommandResult:
++        baseline = self._tracker.baseline
++        assert baseline is not None
++        return CommandResult(
++            seq=done.seq,
++            ran=self._tracker.started,
++            status=done.status,
++            pipestatus=done.pipestatus,
++            output=bytes(output.data) if self._tracker.started else b"",
++            output_truncated=output.truncated and self._tracker.started,
++            snapshot=snapshot,
++            variables_changed=snapshot.variables != baseline.variables,
++        )
++
++    # ----- the prompt rule (§4.2, brief decision 7) --
++
++    def _wait_for_prompt(self) -> bool:
++        """Wait until readline waits for a line; degrade (and return False) if it doesn't."""
++        deadline = time.monotonic() + _SETTLE
++        while True:
++            try:
++                if self._reading_terminal():
++                    return True
++            except _ProcUnreadable as exc:
++                self._tracker.degrade(str(exc))
++                return False
++            if time.monotonic() > deadline:
++                self._tracker.degrade("the shell did not return to its prompt")
++                return False
++            self._drain_control()
++            if self._tracker.degraded:
++                return False
++            time.sleep(0.002)
++
++    def _syscall_path(self) -> str:
++        assert self._proc is not None
++        return os.path.join(self.proc_root, str(self._proc.pid), "syscall")
++
++    def _syscall(self) -> tuple[int, int] | None:
++        """bash's blocking system call and first argument, None while it runs; raises
++        :class:`_ProcUnreadable`."""
++        path = self._syscall_path()
++        try:
++            with open(path, encoding="ascii") as fh:
++                fields = fh.read().split()
++        except (OSError, UnicodeDecodeError) as exc:
++            raise _ProcUnreadable(
++                f"cannot read {path} ({exc.__class__.__name__}), so the prompt rule"
++                " (no done record after the shell returned to a prompt) cannot be applied"
++            ) from exc
++        if fields[:1] == ["running"]:
++            return None
++        try:
++            return int(fields[0]), int(fields[1], 16)
++        except (ValueError, IndexError) as exc:
++            raise _ProcUnreadable(f"cannot parse {path}: {' '.join(fields[:2])!r}") from exc
++
++    @staticmethod
++    def _nr(name: str) -> int:
++        table = _SYSCALLS.get(platform.machine(), {})
++        return table.get(name, -2)
++
++    def _reading_terminal(self) -> bool:
++        """bash is blocked in ``read(0, …)`` or ``pselect6``/``select`` with nfds 1 (as
++        readline waits), and fd 0 is this PTY, not a redirect (``read x < <(…)``)."""
++        call = self._syscall()
++        if call is None:
++            return False
++        nr, arg0 = call
++        if nr == self._nr("read"):
++            blocked = arg0 == 0
++        else:
++            blocked = nr in (self._nr("pselect6"), self._nr("select")) and arg0 == 1
++        return blocked and self._stdin_is_terminal()
++
++    def _stdin_is_terminal(self) -> bool:
++        """bash's fd 0 is this PTY (its slave or /dev/tty); raises
++        :class:`_ProcUnreadable` if unknown."""
++        assert self._proc is not None
++        path = os.path.join(self.proc_root, str(self._proc.pid), "fd", "0")
++        if self._tty_rdev is None:
++            raise _ProcUnreadable(
++                "cannot identify the session's terminal, so the prompt rule"
++                " (no done record after the shell returned to a prompt) cannot be applied"
++            )
++        try:
++            info = os.stat(path)
++        except OSError as exc:
++            raise _ProcUnreadable(
++                f"cannot read {path} ({exc.__class__.__name__}), so the prompt rule"
++                " (no done record after the shell returned to a prompt) cannot be applied"
++            ) from exc
++        # `/dev/tty` (5, 0) is bash's controlling terminal, which is this PTY too.
++        return stat.S_ISCHR(info.st_mode) and info.st_rdev in (self._tty_rdev, _DEV_TTY)
++
++    # ----- helpers --
++
++    def _read_pty(self) -> bytes:
++        assert self._proc is not None
++        try:
++            chunk = os.read(self._proc.fd, 65536)
++        except OSError:
++            chunk = b""  # EIO: bash has exited and the slave side is gone
++        if not chunk:
++            self._tracker.degrade("the shell exited")
++        return chunk
++
++    def _drain_pty(self) -> None:
++        """Read (and drop) what the PTY holds right now, without waiting for more."""
++        assert self._proc is not None
++        while not self._tracker.degraded and _select([self._proc.fd], 0):
++            if not self._read_pty():
++                break
++
++    def _drain_control(self) -> None:
++        """Feed the tracker whatever the control channel holds right now."""
++        while self._ctl_open and not self._tracker.degraded and _select([self._ctl], 0):
++            self._read_control()
++
++    def _read_control(self) -> list[tuple[str, object]]:
++        assert self._ctl is not None
++        data = os.read(self._ctl, 65536)
++        if not data:
++            self._ctl_open = False
++            self._tracker.eof()
++            return []
++        return self._tracker.feed(data)
++
++
++def _pty_slave_rdev(master_fd: int) -> int | None:
++    """The device number of the PTY slave paired with ``master_fd``, or None if unknown."""
++    try:
++        if hasattr(os, "ptsname"):  # Python 3.13+
++            name = os.ptsname(master_fd)
++        else:
++            raw = fcntl.ioctl(master_fd, _TIOCGPTN, b"\0\0\0\0")
++            name = f"/dev/pts/{struct.unpack('I', raw)[0]}"
++        return os.stat(name).st_rdev
++    except OSError:
++        return None
++
++
++def _select(fds: list[int], timeout: float) -> list[int]:
++    ready, _, _ = select.select(fds, [], [], timeout)
++    return ready
++
++
++def _write_all(fd: int, data: bytes) -> None:
++    view = memoryview(data)
++    while view:
++        try:
++            written = os.write(fd, view)
++        except BlockingIOError:
++            select.select([], [fd], [], _POLL)
++            continue
++        view = view[written:]
+diff --git a/tests/test_session.py b/tests/test_session.py
+new file mode 100644
+index 0000000..895e82b
+--- /dev/null
++++ b/tests/test_session.py
+@@ -0,0 +1,980 @@
++"""The persistent bash session (#140) against pty-protocol v1 (docs/design/specs/pty-protocol).
++
++The tests start a real bash (>= 5.1) on a PTY and need Linux /proc; no VM, no sudo. The
++session modules are imported inside each test, so with them missing each test fails on
++its own. Every wait on bash has a timeout of a few seconds; every session is closed.
++Section letters are the items of #140's success criterion.
++"""
++
++from __future__ import annotations
++
++import importlib
++import os
++import re
++import stat
++import threading
++import time
++
++import pytest
++
++START_TIMEOUT = 5.0  # starting bash and reading its baseline snapshot
++RUN_TIMEOUT = 5.0  # one command
++
++SNAPSHOT_TYPES = (b"F", b"L", b"T", b"B", b"X", b"P", b"J", b"H", b"V")
++
++
++def _session_module():
++    return importlib.import_module("nl_shell.session")
++
++
++def _protocol_module():
++    return importlib.import_module("nl_shell.pty_protocol")
++
++
++class _Records:
++    """Every control record a session reported, with the time it was read."""
++
++    def __init__(self) -> None:
++        self.items: list[tuple[float, bytes]] = []
++
++    def __call__(self, line: bytes) -> None:
++        self.items.append((time.monotonic(), line))
++
++    @property
++    def lines(self) -> list[bytes]:
++        return [line for _, line in self.items]
++
++    def for_command(self, seq: int) -> list[bytes]:
++        """The records from the first `S seq` (or the `D`, if no `S` came) to the next `E`."""
++        lines = self.lines
++        start = next(
++            i for i, line in enumerate(lines)
++            if line == b"S %d\n" % seq or line.startswith(b"D %d " % seq)
++        )
++        end = next(i for i in range(start, len(lines)) if lines[i] == b"E\n")
++        return lines[start : end + 1]
++
++
++@pytest.fixture
++def start_session(monkeypatch, tmp_path):
++    """Start sessions in tmp_path; close them all and check every record's framing (n).
++    ``VTE_VERSION`` is dropped so a VTE system bashrc adds no prompt hook."""
++    monkeypatch.delenv("VTE_VERSION", raising=False)
++    started = []
++
++    def start(**kwargs):
++        session_mod = _session_module()
++        records = _Records()
++        kwargs.setdefault("cwd", str(tmp_path))
++        session = session_mod.Session.start(timeout=START_TIMEOUT, on_record=records, **kwargs)
++        started.append((session, records))
++        return session, records
++
++    yield start
++    for session, records in started:
++        session.close()
++    for _, records in started:
++        for line in records.lines:
++            assert line.endswith(b"\n") and b"\r" not in line, line
++
++
++def _spy_on_pty_writes(monkeypatch) -> list[bytes]:
++    """Every write the session module makes to the PTY, from now on."""
++    session_mod = _session_module()
++    writes: list[bytes] = []
++    real_write_all = session_mod._write_all
++
++    def spy(fd, data):
++        writes.append(bytes(data))
++        real_write_all(fd, data)
++
++    monkeypatch.setattr(session_mod, "_write_all", spy)
++    return writes
++
++
++def _run(session, command, timeout=RUN_TIMEOUT):
++    return session.run(command, timeout=timeout)
++
++
++def _try_run(session, command, timeout=RUN_TIMEOUT):
++    """The result, or the SessionDegraded the command raised."""
++    session_mod = _session_module()
++    try:
++        return session.run(command, timeout=timeout)
++    except session_mod.SessionDegraded as exc:
++        return exc
++
++
++def _run_default_timeout(session, command, limit=RUN_TIMEOUT):
++    """``session.run(command)`` with no timeout, in a thread the test bounds by ``limit``.
++    Returns the result or the exception ``run`` raised."""
++    outcome: list[object] = []
++
++    def call() -> None:
++        try:
++            outcome.append(session.run(command))
++        except Exception as exc:  # handed back to the test
++            outcome.append(exc)
++
++    worker = threading.Thread(target=call, daemon=True)
++    worker.start()
++    worker.join(limit)
++    assert not worker.is_alive(), f"run({command!r}) with no timeout still blocked after {limit} s"
++    return outcome[0]
++
++
++def _pairs(records: list[bytes]) -> tuple[int, int]:
++    """Distinct start records (PS0 repeats `S n` per line, §4.1) and done records."""
++    starts = {line for line in records if line.startswith(b"S ")}
++    dones = sum(1 for line in records if line.startswith(b"D "))
++    return len(starts), dones
++
++
++def _write_bashrc(text: str) -> None:
++    home = os.environ["HOME"]  # the suite's temporary HOME (tests/conftest.py)
++    with open(os.path.join(home, ".bashrc"), "w", encoding="utf-8") as fh:
++        fh.write(text)
++
++
++def _assert_refused_unsent(session, writes, command, marker=None):
++    """``command`` raises SessionDegraded and nothing reaches the PTY."""
++    session_mod = _session_module()
++    writes.clear()
++    with pytest.raises(session_mod.SessionDegraded):
++        _run(session, command)
++    assert writes == []
++    if marker is not None:
++        time.sleep(0.2)
++        assert not marker.exists()
++
++
++# ---- (a) state persists between commands --
++
++
++def test_cd_persists_between_commands(start_session):
++    session, _ = start_session()
++    _run(session, "cd /tmp")
++    assert _run(session, "pwd").text == "/tmp\n"
++
++
++def test_export_persists_between_commands(start_session):
++    session, _ = start_session()
++    _run(session, "export FOO=bar")
++    assert _run(session, 'printf %s "$FOO"').text == "bar"
++
++
++# ---- (b) spec §Conformance vectors 1-8, 10 and 12 --
++
++
++def test_vector1_true_gives_start_done_and_snapshot(start_session):
++    session, records = start_session()
++    result = _run(session, "true")
++    lines = records.for_command(1)
++    assert lines[0] == b"S 1\n"
++    assert lines[1] == b"D 1 0 0\n"
++    assert lines[-1] == b"E\n"
++    assert sorted(line[:1] for line in lines[2:-1]) == sorted(SNAPSHOT_TYPES)
++    assert (result.seq, result.ran, result.status, result.pipestatus) == (1, True, 0, (0,))
++    assert result.snapshot.seq == 1
++    assert not session.degraded
++
++
++@pytest.mark.parametrize(
++    "command, status, pipestatus",
++    [("false | true", 0, (1, 0)), ("(exit 3)", 3, (3,))],
++    ids=["vector2-pipestatus", "vector3-exit-status"],
++)
++def test_vectors2_3_status(start_session, command, status, pipestatus):
++    session, _ = start_session()
++    result = _run(session, command)
++    assert (result.status, result.pipestatus) == (status, pipestatus)
++
++
++@pytest.mark.parametrize(
++    "command, printed",
++    [
++        (r"printf 'D 99 0 0\n'", b"D 99 0 0"),
++        (r"printf '\x1b]133;D;0\x07'", b"\x1b]133;D;0\x07"),
++    ],
++    ids=["vector4-fake-done-record", "vector5-osc133"],
++)
++def test_vectors4_5_printed_records_have_no_effect(start_session, command, printed):
++    session, records = start_session()
++    result = _run(session, command)
++    assert printed in result.output  # it went to the PTY
++    dones = [line for line in records.lines if line.startswith(b"D ")]
++    assert dones[1:] == [b"D 1 0 0\n"]  # after the baseline's D 0: only the real one
++    assert _pairs(records.for_command(1)) == (1, 1)
++    assert result.status == 0
++    assert not session.degraded
++
++
++def test_vector6_no_history_expansion(start_session):
++    session, _ = start_session()
++    assert _run(session, "echo 'done!!'").text == "done!!\n"
++
++
++def test_vector7_alias_and_function_reach_the_snapshot(start_session):
++    session, _ = start_session()
++    assert "g" not in session.baseline.functions
++    assert "ll2" not in session.baseline.aliases
++    result = _run(session, "alias ll2='ls -la'; g(){ :; }")
++    assert "g" in result.snapshot.functions
++    assert "alias ll2='ls -la'" in result.snapshot.aliases.split("\n")
++
++
++def test_vector8_replaced_prompt_command_degrades(start_session):
++    session_mod = _session_module()
++    session, _ = start_session()
++    began = time.monotonic()
++    with pytest.raises(session_mod.SessionDegraded):
++        _run(session, "PROMPT_COMMAND=:")
++    assert time.monotonic() - began < 5.0
++    assert session.degraded
++    assert session.degraded_reason
++    with pytest.raises(session_mod.SessionDegraded):
++        _run(session, "true")  # sticky until restart
++
++
++def test_vector10_interrupt_ends_the_command(start_session):
++    session, records = start_session()
++    sent_at: list[float] = []
++    sent: list[bool] = []
++
++    def press_ctrl_c() -> None:
++        deadline = time.monotonic() + RUN_TIMEOUT
++        while b"S 1\n" not in records.lines:
++            if time.monotonic() > deadline:
++                return
++            time.sleep(0.01)
++        time.sleep(0.3)
++        sent_at.append(time.monotonic())
++        sent.append(session.interrupt())
++
++    typist = threading.Thread(target=press_ctrl_c, daemon=True)
++    typist.start()
++    result = _run(session, "sleep 5", timeout=8.0)
++    typist.join(timeout=2)
++    assert sent_at, "the interrupt was never sent"
++    assert sent == [True]
++    assert result.status == 130
++    assert result.pipestatus == (130,)
++    done_at = next(t for t, line in records.items if line.startswith(b"D 1 "))
++    assert done_at - sent_at[0] < 3.0
++    assert not session.degraded
++    assert _run(session, "echo after").text == "after\n"
++
++
++def test_interrupt_at_a_prompt_writes_nothing(start_session, monkeypatch):
++    pty_writes = _spy_on_pty_writes(monkeypatch)
++    session, records = start_session()
++    assert session.interrupt() is False  # idle, before any command
++    _run(session, "true")
++    pty_writes.clear()
++    assert session.interrupt() is False  # idle, after a command finished
++    assert pty_writes == []
++    before = len(records.items)
++    time.sleep(1.0)  # a Ctrl-C at the prompt would have made bash send a stray D
++    assert len(records.items) == before
++    assert not session.degraded
++    result = _run(session, "echo still fine")
++    assert (result.seq, result.text) == (2, "still fine\n")
++
++
++@pytest.mark.parametrize(
++    "bad",
++    ["echo a\x1b[201~", "echo \x1b", "echo a\rtouch {d}/c", "echo \x07", "echo \x00",
++     "echo \x01", "echo \x1f", "echo \x03"],
++    ids=["paste-end", "esc", "cr", "bel", "nul", "soh", "us", "etx"],
++)
++def test_vector12_forbidden_bytes_are_refused_unsent(start_session, monkeypatch, tmp_path, bad):
++    pty_writes = _spy_on_pty_writes(monkeypatch)
++    session_mod = _session_module()
++    work = tmp_path / "work"
++    work.mkdir()
++    session, records = start_session()
++    before = len(records.items)
++    command = f"touch {work}/a; {bad.replace('{d}', str(work))}; touch {work}/b"
++    pty_writes.clear()
++    with pytest.raises(session_mod.CommandRefused):
++        _run(session, command)
++    assert pty_writes == []  # nothing reached the PTY
++    time.sleep(0.3)
++    assert len(records.items) == before
++    assert list(work.iterdir()) == []
++    result = _run(session, "echo ok")
++    assert result.seq == 1  # nothing ran in between
++    assert result.text == "ok\n"
++
++
++def test_tab_and_newline_are_allowed(start_session):
++    session, _ = start_session()
++    assert _run(session, "printf '%s\\n' 'a\tb'\necho c").text == "a\tb\nc\n"
++
++
++def test_paste_is_exactly_the_confirmed_bytes(start_session, monkeypatch):
++    pty_writes = _spy_on_pty_writes(monkeypatch)
++    session, _ = start_session()
++    pty_writes.clear()
++    _run(session, "echo 'x  y'")
++    assert pty_writes == [b"\x1b[200~echo 'x  y'\x1b[201~\r"]
++
++
++# ---- (c) vector 9 typed raw: the control channel closed --
++
++
++def test_vector9_closing_fd3_degrades(start_session):
++    session_mod = _session_module()
++    session, _ = start_session()
++    with pytest.raises(session_mod.SessionDegraded):
++        _run(session, "exec 3>&-")
++    assert session.degraded
++    assert session.degraded_reason == "the control channel closed"
++
++
++# ---- the hooks survive set -u / set -e; a snapshot that never finishes --
++
++
++def test_nounset_without_path_keeps_the_snapshot_whole(start_session):
++    session_mod = _session_module()
++    session, _ = start_session()
++    result = _run_default_timeout(session, "set -u; unset PATH")
++    assert isinstance(result, session_mod.CommandResult), result
++    assert result.snapshot.path == ""
++    assert not session.degraded
++    after = _run_default_timeout(session, "echo still here")
++    assert isinstance(after, session_mod.CommandResult), after
++    assert after.text == "still here\n"
++
++
++def test_errexit_does_not_break_the_hooks(start_session):
++    session, _ = start_session()
++    _run(session, "set -e")
++    for command in ("true", "", "echo ok"):
++        _run(session, command)
++    assert _run(session, "echo still ok").text == "still ok\n"
++    assert not session.degraded
++
++
++def test_snapshot_cut_short_after_done_degrades(start_session):
++    # With extdebug a DEBUG trap skips the snapshot hook: D arrives, E never does.
++    session_mod = _session_module()
++    session, records = start_session()
++    cut = "shopt -s extdebug; trap '[[ $BASH_COMMAND != *__nls_snap* ]]' DEBUG"
++    began = time.monotonic()
++    outcome = _run_default_timeout(session, cut)
++    assert time.monotonic() - began < 5.0
++    assert isinstance(outcome, session_mod.SessionDegraded), outcome
++    assert b"D 1 0 0\n" in records.lines
++    assert records.lines[-1] != b"E\n"
++    assert session.degraded_reason == (
++        "the snapshot did not finish after the shell returned to a prompt"
++    )
++
++
++# ---- (d) one start/done pair per command; stopped jobs --
++
++
++@pytest.mark.parametrize(
++    "command, output",
++    [
++        ("true", ""),
++        ("echo one\necho two", "one\ntwo\n"),
++        ("cat <<'EOF'\nhere doc\nEOF", "here doc\n"),
++        ("f() {\n  echo in f\n}\nf", "in f\n"),
++    ],
++    ids=["no-output", "multi-line", "here-doc", "multi-line-function"],
++)
++def test_one_start_done_pair_per_command(start_session, command, output):
++    session, records = start_session()
++    result = _run(session, command)
++    lines = records.for_command(1)
++    assert _pairs(lines) == (1, 1)
++    assert all(line == b"S 1\n" for line in lines if line.startswith(b"S "))
++    assert result.ran
++    assert result.text == output
++    assert _run(session, "true").seq == 2
++
++
++def test_background_job_gives_one_pair_and_is_not_a_stopped_job(start_session):
++    session, records = start_session()
++    result = _run(session, "sleep 1 &")
++    assert _pairs(records.for_command(1)) == (1, 1)
++    assert result.status == 0
++    assert not session.degraded
++    result = _run(session, "sleep 3 &")
++    assert result.snapshot.stopped_jobs == 0  # running, not stopped
++    assert _run(session, "echo still here").text.endswith("still here\n")
++    assert not session.degraded
++
++
++def test_stopped_job_is_counted(start_session):
++    session, _ = start_session()
++    _run(session, "sleep 30 & kill -STOP $!")
++    assert _run(session, "true").snapshot.stopped_jobs == 1
++    assert _run(session, "kill -KILL %1; wait %1 2>/dev/null; true").status == 0
++    assert _run(session, "true").snapshot.stopped_jobs == 0
++
++
++# ---- (e) decision 5: nothing ran; the prompt rule fails closed --
++
++
++@pytest.mark.parametrize(
++    "command, status",
++    [("", 3), ("# x", 3), ("fi", 2)],
++    ids=["empty-line", "comment-only", "syntax-error"],
++)
++def test_input_that_runs_nothing_is_reported_not_run(start_session, command, status):
++    session, records = start_session()
++    _run(session, "(exit 3)")
++    result = _run(session, command)
++    assert not result.ran
++    assert result.seq == 2
++    assert result.status == status  # the D record's $?
++    assert _pairs(records.for_command(2)) == (0, 1)
++    assert not session.degraded
++    after = _run(session, "true")
++    assert (after.seq, after.ran, after.status) == (3, True, 0)
++
++
++def test_unclosed_quote_degrades(start_session):
++    session_mod = _session_module()
++    session, _ = start_session()
++    began = time.monotonic()
++    with pytest.raises(session_mod.SessionDegraded):
++        _run(session, "echo 'abc")
++    assert time.monotonic() - began < 5.0
++    assert session.degraded_reason == "no done record after the shell returned to a prompt"
++
++
++def test_unreadable_proc_syscall_at_start_degrades(start_session, monkeypatch, tmp_path):
++    pty_writes = _spy_on_pty_writes(monkeypatch)
++    fake_proc = tmp_path / "proc"
++    fake_proc.mkdir()  # no <pid>/syscall in it
++    session, _ = start_session(proc_root=str(fake_proc))
++    path = os.path.join(str(fake_proc), str(session.pid), "syscall")
++    assert session.degraded
++    assert path in session.degraded_reason
++    began = time.monotonic()
++    _assert_refused_unsent(session, pty_writes, "echo 'abc")
++    assert time.monotonic() - began < 5.0
++    assert path in session.degraded_reason
++
++
++def test_unreadable_proc_syscall_during_a_run_degrades(start_session, tmp_path):
++    session_mod = _session_module()
++    session, records = start_session()
++    assert not session.degraded
++    fake_proc = tmp_path / "proc"
++    fake_proc.mkdir()
++
++    def lose_proc() -> None:
++        deadline = time.monotonic() + RUN_TIMEOUT
++        while b"S 1\n" not in records.lines and time.monotonic() < deadline:
++            time.sleep(0.01)
++        session.proc_root = str(fake_proc)
++
++    switcher = threading.Thread(target=lose_proc, daemon=True)
++    switcher.start()
++    began = time.monotonic()
++    # `read x` is the case that needs the prompt rule: with no D, only /proc can tell.
++    outcome = _run_default_timeout(session, "sleep 0.3; read x")
++    switcher.join(timeout=2)
++    assert time.monotonic() - began < 5.0
++    assert isinstance(outcome, session_mod.SessionDegraded), outcome
++    assert outcome.result is None  # never "ran" or "not run" with a healthy session
++    path = os.path.join(str(fake_proc), str(session.pid), "syscall")
++    assert path in session.degraded_reason
++
++
++# ---- (f) snapshot fields, the baseline, H and V --
++
++
++def test_snapshot_carries_v1_fields_and_baseline(start_session):
++    session, records = start_session()
++    baseline = session.baseline
++    types = {line[:1] for line in records.for_command(0)}
++    assert set(SNAPSHOT_TYPES) | {b"D", b"E"} == types
++    assert baseline.seq == 0
++    assert baseline.extdebug == "shopt -u extdebug"
++    assert baseline.path == os.environ["PATH"]
++    assert baseline.stopped_jobs == 0
++    assert baseline.disabled_builtins == ""
++    for name in ("PROMPT_COMMAND", "PS0", "__nls_done", "__nls_user_pc", "promptvars"):
++        assert name in baseline.hooks
++    assert 'declare -- __nls_seq="0"' in baseline.hooks.split("\n")
++    assert "LD_PRELOAD unset" in baseline.variables.split("\n")
++    result = _run(session, "true")
++    assert session.baseline is baseline
++    assert 'declare -- __nls_seq="1"' in result.snapshot.hooks.split("\n")
++    assert not result.variables_changed
++
++
++def test_loader_variable_change_is_reported(start_session):
++    session, _ = start_session()
++    result = _run(session, "export LD_PRELOAD=/x.so")
++    assert result.variables_changed
++    assert result.snapshot.variables != session.baseline.variables
++    assert 'declare -x LD_PRELOAD="/x.so"' in result.snapshot.variables.split("\n")
++    assert not session.degraded
++
++
++def test_blank_ps0_is_not_hidden_as_not_run(start_session, monkeypatch, tmp_path):
++    pty_writes = _spy_on_pty_writes(monkeypatch)
++    session_mod = _session_module()
++    session, _ = start_session()
++    with pytest.raises(session_mod.SessionDegraded) as caught:
++        _run(session, "PS0=")
++    assert caught.value.result is not None and caught.value.result.seq == 1
++    assert "H differs" in session.degraded_reason
++    _assert_refused_unsent(session, pty_writes, "true")  # never "not run" while healthy
++    marker = tmp_path / "ran"
++    _assert_refused_unsent(session, pty_writes, f"touch {marker}; true", marker)
++
++
++_TABLE_A_ROW_1 = {
++    "prompt-command-array": "PROMPT_COMMAND+=(':')",
++    "prompt-command-appended": "PROMPT_COMMAND=\"$PROMPT_COMMAND; :\"",
++    "ps0": "PS0='x'",
++    "promptvars-off": "shopt -u promptvars",
++    "hook-function-redefined": "__nls_ret() { builtin return \"$1\"; }",
++    "main-hook-redefined": "__f=$(declare -f __nls_done); eval \"${__f/\\{/\\{ :;}\"",
++    "saved-user-hook": "__nls_user_pc+=(':')",
++    "state-variable-integer": "declare -i __nls_n",
++    "ps1-readonly": "readonly PS1",
++    "term-dumb": "export TERM=dumb",  # readline would turn bracketed paste off
++    "functrace": "set -T",  # a DEBUG trap would run inside the hooks
++}
++
++
++@pytest.mark.parametrize("change", sorted(_TABLE_A_ROW_1))
++def test_table_a_row_1_changes_degrade_at_their_own_snapshot(start_session, monkeypatch,
++                                                             change):
++    pty_writes = _spy_on_pty_writes(monkeypatch)
++    session_mod = _session_module()
++    session, _ = start_session()
++    with pytest.raises(session_mod.SessionDegraded) as caught:
++        _run(session, _TABLE_A_ROW_1[change])
++    # Found in the snapshot that followed this command's D, not by a later rule.
++    assert caught.value.result is not None, session.degraded_reason
++    assert caught.value.result.seq == 1
++    assert "H differs" in session.degraded_reason
++    _assert_refused_unsent(session, pty_writes, "echo hello")
++
++
++@pytest.mark.parametrize(
++    "change",
++    ["readonly FOO=1", "trap 'echo hi' EXIT", "PS1='x$ '", "PS2='more> '"],
++    ids=["readonly-other", "exit-trap", "ps1", "ps2"],
++)
++def test_ordinary_changes_stay_healthy(start_session, change):
++    session, _ = start_session()
++    result = _run(session, change)
++    assert result.ran and result.status == 0
++    assert not session.degraded
++    after = _run(session, "echo ok")
++    assert after.text == "ok\n"
++    assert not session.degraded
++    if "trap" in change:
++        assert "trap -- 'echo hi' EXIT" in after.snapshot.traps
++
++
++# ---- (g) I2: a command that ran is never reported as "nothing ran" --
++
++
++def _rcfile_variables(rcfile: str) -> set[str]:
++    """Every shell variable the rcfile reads or assigns, by bash syntax."""
++    patterns = (
++        r"\$\{[#!]?([A-Za-z_]\w*)",  # ${name...}, ${#name}, ${!name}
++        r"\$([A-Za-z_]\w*)",  # $name
++        r"\$\(\(\s*([A-Za-z_]\w*)",  # $((name ...
++        r"\(\(\s*\+\+([A-Za-z_]\w*)",  # (( ++name
++        r"(?:^|[\s;(])([A-Za-z_]\w*)(?:\[[^\]]*\])?\+?=",  # name=, name[i]=, name+=
++        r"\bfor\s+([A-Za-z_]\w*)\s+in\b",
++        r"\bprintf\s+-v\s+([A-Za-z_]\w*)",
++        r"\bread\s+(?:-\w+\s+(?:\d+\s+)?)*([A-Za-z_]\w*)",
++        r"\[\[\s+-v\s+\$?([A-Za-z_]\w*)",
++    )
++    names: set[str] = set()
++    for pattern in patterns:
++        names.update(re.findall(pattern, rcfile, flags=re.MULTILINE))
++    return names
++
++
++def test_hook_state_vars_cover_the_rcfile():
++    session_mod = _session_module()
++    rcfile = session_mod.RCFILE
++    listed = set(session_mod.HOOK_STATE_VARS)
++    assert all(name.startswith("__nls_") for name in listed)
++    found = set(re.findall(r"__nls_\w+", rcfile))
++    assert found <= listed, found - listed
++    assert listed <= found, listed - found
++    # Every other variable is bash's own; no `local` (a readonly global would break it).
++    bash_owned = {"BASHOPTS", "PIPESTATUS", "PATH", "PROMPT_COMMAND", "PS0", "PS1", "PS2",
++                  "HISTFILE"}
++    variables = _rcfile_variables(rcfile)
++    assert {"__nls_seq", "__nls_st", "__nls_v", "__nls_c"} <= variables  # the parser works
++    stray = {name for name in variables if not name.startswith("__nls_")} - bash_owned
++    assert stray == set(), stray
++    assert not re.search(r"\blocal\b", rcfile)
++
++
++def _ends_degraded_or_ran(session, marker):
++    """The command after ``true`` is degraded or reported as ran, never "ran False"."""
++    session_mod = _session_module()
++    _try_run(session, "true")
++    third = _try_run(session, f"touch {marker}; echo printed; (exit 7)")
++    if session.degraded:
++        if not isinstance(third, session_mod.SessionDegraded) or third.result is None:
++            assert not marker.exists(), marker.name
++        return
++    assert (third.ran, third.status, third.text) == (True, 7, "printed\n"), marker.name
++    assert marker.exists()
++
++
++# Each sets the variable to what a start guard would need to suppress a later S.
++_I2_ATTACKS = {
++    "ps1-subscript": "PS1='${{__pwn[{name}=__nls_seq]-}}\\$ '",
++    "readonly": "readonly {name}=$((__nls_seq + 2))",
++    "debug-trap": "trap '{name}=$__nls_seq' DEBUG",
++    "debug-trap-functrace": "trap '{name}=$__nls_seq' DEBUG; set -T",
++}
++
++
++@pytest.mark.parametrize("attack", sorted(_I2_ATTACKS))
++def test_hook_state_attacks_never_hide_a_command(start_session, tmp_path, attack):
++    for name in _session_module().HOOK_STATE_VARS:
++        session, _ = start_session()
++        _try_run(session, _I2_ATTACKS[attack].format(name=name))
++        _ends_degraded_or_ran(session, tmp_path / f"{attack}-{name}")
++        session.close()
++
++
++_FUNCTRACE_ATTACKS = {
++    # the DEBUG trap runs inside __nls_snap after H and breaks the counter for PS0
++    "corrupt-after-h": "__k=0; trap 'if [[ $BASH_COMMAND == \"PS1=\"* ]]; then __k=$__nls_seq;"
++    " __nls_seq=\"x[\"; elif [[ $BASH_COMMAND == *__nls_done* && $__nls_seq == \"x[\" ]];"
++    " then __nls_seq=$__k; fi' DEBUG; set -T",
++    # as above, turning functrace on only around the hooks and hiding it before the snapshot
++    "hidden": "trap 'case $BASH_COMMAND in *__nls_done*) set -T;; *__nls_snap*) __nls_f=;"
++    " set +T;; \"PS1=\"*) __nls_seq=\"x[\";; esac' DEBUG",
++}
++
++
++@pytest.mark.parametrize("attack", sorted(_FUNCTRACE_ATTACKS))
++def test_functrace_debug_trap_never_hides_a_command(start_session, tmp_path, attack):
++    session, _ = start_session()
++    _try_run(session, _FUNCTRACE_ATTACKS[attack])
++    _ends_degraded_or_ran(session, tmp_path / "mark")
++
++
++@pytest.mark.parametrize(
++    "aliases",
++    # `builtin` ending in a space lets `printf` expand too: an alias could drop S.
++    ['__p(){ [[ $1 == S* ]] || builtin printf "$@"; }; alias builtin=" " printf=__p',
++     "alias for=': ' if=': ' '{'=': '"],
++    ids=["builtin-printf", "reserved-words"],
++)
++def test_aliases_cannot_reach_inside_the_hooks(start_session, tmp_path, aliases):
++    session, _ = start_session()
++    _try_run(session, aliases)
++    _ends_degraded_or_ran(session, tmp_path / "mark")
++    session, _ = start_session()
++    _run(session, "alias ls='touch PWNED' builtin=' ' alias=':'")
++    _try_run(session, "ls")
++    assert "alias ls='touch PWNED'" in session.snapshot.aliases
++    session, _ = start_session()  # the user's aliases still work after a snapshot
++    assert _run(session, "alias zz='echo zz'; shopt -u expand_aliases").ran
++    assert _run(session, "shopt -s expand_aliases").ran and _run(session, "zz").text == "zz\n"
++
++
++# ---- (k) the prompt rule (decision 7) --
++
++
++@pytest.mark.parametrize(
++    "command, output",
++    [
++        ("x=$(sleep 2); echo hi", "hi\n"),
++        ('cd "$(sleep 1.5; echo /tmp)"; pwd', "/tmp\n"),
++        ("y=`sleep 1.5`; echo \"[$y]\"", "[]\n"),
++    ],
++    ids=["dollar-paren", "cd-substitution", "backticks"],
++)
++def test_slow_command_substitution_stays_healthy(start_session, command, output):
++    session, _ = start_session()
++    result = _run(session, command)
++    assert result.text == output
++    assert not session.degraded
++
++
++@pytest.mark.parametrize(
++    "command, output",
++    [
++        ('read x < <(sleep 1.5; echo hi); echo "$x"', "hi\n"),
++        ("while read -r l; do echo got $l; done < <(sleep 2; echo hi)", "got hi\n"),
++        ("mapfile -t a < <(sleep 1.5; printf 'a\\nb\\n'); echo \"${a[*]}\"", "a b\n"),
++    ],
++    ids=["read-process-substitution", "while-read-loop", "mapfile"],
++)
++def test_slow_read_from_redirected_stdin_stays_healthy(start_session, command, output):
++    # bash blocks in read(0) here, but fd 0 is a pipe, not the terminal: not a prompt.
++    session, _ = start_session()
++    result = _run(session, command)
++    assert result.ran and result.status == 0
++    assert result.text == output
++    assert not session.degraded
++
++
++def test_unreadable_proc_stdin_fails_closed(start_session, monkeypatch, tmp_path):
++    session_mod = _session_module()
++    session, _ = start_session()
++    assert not session.degraded
++    pid_dir = tmp_path / "proc" / str(session.pid)
++    pid_dir.mkdir(parents=True)
++    # syscall is readable, but there is no fd/0 to tell the terminal from a pipe.
++    os.symlink(f"/proc/{session.pid}/syscall", pid_dir / "syscall")
++    session.proc_root = str(tmp_path / "proc")
++    pty_writes = _spy_on_pty_writes(monkeypatch)
++    began = time.monotonic()
++    with pytest.raises(session_mod.SessionDegraded):
++        _run(session, "read x")
++    assert time.monotonic() - began < 5.0
++    assert pty_writes == []  # bash at its prompt: the check fails before the paste
++    assert os.path.join(str(pid_dir), "fd", "0") in session.degraded_reason
++
++
++@pytest.mark.parametrize("command", ["read x", "read x </dev/tty"])
++def test_read_with_no_input_degrades(start_session, command):
++    session_mod = _session_module()
++    session, _ = start_session()
++    began = time.monotonic()
++    with pytest.raises(session_mod.SessionDegraded):
++        _run(session, command)
++    assert time.monotonic() - began < 5.0
++    assert session.degraded_reason == "no done record after the shell returned to a prompt"
++
++
++# ---- (l) decision 4: exact, reversible fields; no external programs --
++
++
++@pytest.mark.parametrize(
++    "command, expression, field, needles",
++    [
++        ("PATH=\"$PATH\"$':/a\\x1eb:/c\\nd:/e\\\\nf\\rg'", "$PATH", "path",
++         ("\x1e", "\n", "\\n", "\r")),
++        ("alias odd_nls=$'a\\\\b\\x1e\\nc \\'q\\''", "$(alias -p)", "aliases",
++         ("odd_nls", "\x1e", "\n")),
++        ("trap $'echo \"x\\\\y\"\\x1e\\n: z' USR1", "$(trap -p)", "traps",
++         ("USR1", "\x1e", "\\")),
++    ],
++    ids=["path", "alias", "trap"],
++)
++def test_text_fields_round_trip_exactly(start_session, tmp_path, command, expression, field,
++                                        needles):
++    session, _ = start_session()
++    result = _run(session, command)
++    out = tmp_path / "live"
++    _run(session, f'printf %s "{expression}" > {out}')
++    live = out.read_bytes().decode("utf-8")
++    assert all(needle in live for needle in needles)
++    assert getattr(result.snapshot, field) == live
++    assert not session.degraded
++
++
++@pytest.mark.parametrize(
++    "setup",
++    [
++        "hash -p {fake}/tr tr",
++        "hash -p {fake}/cksum cksum",
++        "hash -p {fake}/wc wc",
++        "BASH_CMDS[tr]={fake}/tr",
++        "PATH={fake}:$PATH",
++    ],
++    ids=["hash-tr", "hash-cksum", "hash-wc", "bash-cmds-tr", "path-first"],
++)
++def test_fake_programs_cannot_change_the_snapshot(start_session, tmp_path, setup):
++    fake = tmp_path / "fake"
++    fake.mkdir()
++    marker = tmp_path / "fake-ran"
++    for name in ("tr", "cksum", "wc"):
++        script = fake / name
++        script.write_text(f"#!/bin/sh\ntouch {marker}\necho 0\n", encoding="utf-8")
++        script.chmod(script.stat().st_mode | stat.S_IXUSR)
++    session, _ = start_session()
++    command = setup.format(fake=fake) + "; alias evil_nls='rm -rf'; evil_fn(){ :; }"
++    result = _run(session, command)
++    snap = _run(session, "true").snapshot
++    protocol = _protocol_module()
++    for s in (result.snapshot, snap):
++        assert "alias evil_nls='rm -rf'" in s.aliases.split("\n")
++        assert "evil_fn" in s.functions
++        assert s.hooks == protocol.expected_hooks(session.baseline, s.seq)
++    assert not marker.exists()
++    assert not session.degraded
++
++
++# ---- (m, first half) the user's ~/.bashrc --
++
++
++def test_bashrc_alias_and_prompt_command_run_before_the_snapshot(start_session):
++    _write_bashrc(
++        "alias hello_nls='echo hi'\n"
++        "PROMPT_COMMAND='s=$?; alias pc_saw_status=\"$s\"; echo \"$__nls_seq $s\" >> ~/pc.log'\n"
++    )
++    session, _ = start_session()
++    baseline_aliases = session.baseline.aliases.split("\n")
++    assert "alias hello_nls='echo hi'" in baseline_aliases
++    # The user's hook ran at the first prompt before the baseline was taken (decision 6).
++    assert "alias pc_saw_status='0'" in baseline_aliases
++    result = _run(session, "(exit 4)")
++    # It ran again before this command's snapshot, and saw the command's real $?.
++    assert "alias pc_saw_status='4'" in result.snapshot.aliases.split("\n")
++    _run(session, "unalias pc_saw_status")
++    after = _run(session, "true")
++    assert "alias pc_saw_status='0'" in after.snapshot.aliases.split("\n")
++    with open(os.path.join(os.environ["HOME"], "pc.log"), encoding="utf-8") as fh:
++        seen = fh.read().split("\n")
++    assert seen[:4] == ["0 0", "1 4", "2 0", "3 0"]
++    assert not session.degraded
++
++
++# ---- (n) no history; control-channel wiring and framing --
++
++
++def test_histfile_is_unset(start_session):
++    session, _ = start_session()
++    assert _run(session, 'printf %s "${HISTFILE-unset}"').text == "unset"
++    session.close()
++    assert not os.path.exists(os.path.join(os.environ["HOME"], ".bash_history"))
++
++
++def test_fd3_is_a_pipe(start_session):
++    session, _ = start_session()
++    result = _run(session, "[ -p /dev/fd/3 ]")
++    assert (result.ran, result.status) == (True, 0)
++
++
++def test_record_with_carriage_return_is_malformed():
++    protocol = _protocol_module()
++    with pytest.raises(protocol.ProtocolError):
++        protocol.parse_record(b"S 1\r")
++    tracker = protocol.ProtocolTracker()
++    tracker.feed(b"D 0 0 0\r\n")
++    assert tracker.degraded
++    assert "carriage return" in tracker.degraded_reason
++
++
++def _baseline_records(hooks: bytes = b'declare -- __nls_seq="0"\\n') -> bytes:
++    return b"D 0 0 0\nF \nL \nT \nB \nX \nP \nJ 0\nH " + hooks + b"\nV \nE\n"
++
++
++def test_unknown_record_types_are_ignored():
++    protocol = _protocol_module()
++    tracker = protocol.ProtocolTracker()
++    tracker.feed(b"D 0 0 0\nQ something new\n")
++    assert not tracker.degraded
++
++
++def test_repeated_start_record_is_one_start_but_another_number_degrades():
++    protocol = _protocol_module()
++    tracker = protocol.ProtocolTracker()
++    tracker.feed(_baseline_records())
++    assert not tracker.degraded
++    tracker.command_sent()
++    tracker.feed(b"S 1\nS 1\nS 1\n")
++    assert not tracker.degraded
++    tracker.feed(b"S 2\n")
++    assert tracker.degraded
++
++
++def test_done_without_start_is_nothing_ran_and_h_tracks_the_counter():
++    protocol = _protocol_module()
++    tracker = protocol.ProtocolTracker()
++    tracker.feed(_baseline_records())
++    tracker.command_sent()
++    second = _baseline_records(b'declare -- __nls_seq="1"\\n').replace(b"D 0", b"D 1")
++    events = tracker.feed(second)
++    assert [kind for kind, _ in events] == ["D", "E"]
++    assert not tracker.started and not tracker.degraded
++    tracker.command_sent()
++    # The counter's line must carry the D record's number; anything else in H is a change.
++    wrong = _baseline_records(b'declare -- __nls_seq="7"\\n').replace(b"D 0", b"D 2")
++    tracker.feed(b"S 2\n" + wrong)
++    assert tracker.degraded
++    assert "H differs" in tracker.degraded_reason
++
++
++def test_spec_reference_rcfile_is_the_one_in_use():
++    session_mod = _session_module()
++    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++    spec = os.path.join(root, "docs", "design", "specs", "pty-protocol", "v1.md")
++    with open(spec, encoding="utf-8") as fh:
++        text = fh.read()
++    section = text[text.index("3. Reference rcfile") :]
++    reference = section[section.index("```bash\n") + 8 : section.index("```\n")]
++    assert session_mod.RCFILE.split("\n", 1)[1] == reference
++
++
++def test_field_encoding_is_reversible():
++    protocol = _protocol_module()
++    assert protocol.decode_field("a\\\\n\\nb\\r") == "a\\n\nb\r"
++    with pytest.raises(protocol.ProtocolError):
++        protocol.decode_field("bad\\x")
++    with pytest.raises(protocol.ProtocolError):
++        protocol.decode_field("trailing\\")
++
++
++# ---- (o) restart --
++
++
++def test_restart_after_degraded_gives_a_fresh_session(start_session):
++    session_mod = _session_module()
++    session, _ = start_session()
++    old_baseline = session.baseline
++    with pytest.raises(session_mod.SessionDegraded):
++        _run(session, "PROMPT_COMMAND=:")
++    session.restart(timeout=START_TIMEOUT)
++    assert not session.degraded
++    assert session.degraded_reason is None
++    assert session.baseline is not old_baseline
++    assert session.baseline.seq == 0
++    result = _run(session, "echo back")
++    assert (result.seq, result.text) == (1, "back\n")
++
++
++# ---- (q) output boundary: what the user's prompt hook prints is not the command's --
++
++
++def test_user_prompt_hook_output_is_not_the_commands(start_session):
++    _write_bashrc("PROMPT_COMMAND=\"printf 'HOOK-OUTPUT\\\\n'; echo x >> ~/hook.log\"\n")
++    session, _ = start_session()
++    assert session.baseline is not None
++    for _ in range(20):
++        assert _run(session, "echo hello").output == b"hello\r\n"
++        assert _run(session, "printf abc").output == b"abc"
++    assert not session.degraded
++    with open(os.path.join(os.environ["HOME"], "hook.log"), encoding="utf-8") as fh:
++        assert len(fh.read().split()) == 41  # the hook ran (and printed) at every prompt
++
++
++def test_job_notice_is_part_of_the_next_commands_output(start_session):
++    # Spec §4.1: bash prints a job's notice before its next prompt, between S and D.
++    session, _ = start_session()
++    _run(session, "sleep 0.2 &")
++    time.sleep(0.6)
++    result = _run(session, "echo x")
++    assert re.search(rb"\[1\]\+ +Done +sleep 0\.2\r\n", result.output), result.output
++    assert b"x\r\n" in result.output
++    assert not session.degraded
++
++
++# ---- captured output is bounded --
++
++
++def test_captured_output_is_bounded_and_keeps_the_tail(start_session):
++    session, _ = start_session(max_output=1000)
++    result = _run(session, "printf 'x%.0s' {1..5000}; echo; echo END_MARK")
++    assert result.output_truncated
++    assert len(result.output) <= 1000
++    assert result.text.endswith("END_MARK\n")
++    assert not _run(session, "echo small").output_truncated

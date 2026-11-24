@@ -1,0 +1,1709 @@
+diff --git a/.oss-scanner/threat_model.md b/.oss-scanner/threat_model.md
+index c7b8b15..e6607cf 100644
+--- a/.oss-scanner/threat_model.md
++++ b/.oss-scanner/threat_model.md
+@@ -89,7 +89,13 @@ Treat all of the following as attacker-controlled:
+     detect.
+ 11. **The dev teacher endpoint** (development only, behind `--dev-teacher`, ADR-0020):
+     plaintext and unauthenticated on the LAN unless tunnelled. Its answers are model
+-    output (item 5), and the state block is sent to it.
++    output (item 5), and the state block is sent to it. The client
++    (`src/nl_shell/teacher_client.py`, #77) uses any URL only with the flag, warns on a
++    non-loopback `http://` URL, sends no credentials, uses no proxy, follows no redirect,
++    checks TLS certificates, caps a response at 64 KiB within one total deadline
++    (`model.timeout_s`, at most 3600 s; it covers the DNS lookup, connect, TLS handshake,
++    send and read, however slowly the server drips bytes), and escapes any server text it
++    reports (status reason, error body, exception text). Its answer goes to the strict proposal parser unchanged.
+ 
+ Trusted:
+ - what the user types and their confirm and edit decisions;
+@@ -200,6 +206,9 @@ with no VM and no sudo. The recording stub backend (`RecordingStub` in
+ `src/nl_shell/backend.py`) returns fixed model responses and records every model input it
+ was sent, so the prompts, the proposal parser and the REPL are tested without a model or a
+ GPU (`tests/test_backend.py`), and the gate can be tested the same way.
++The model client and the `--dev-teacher` rules are tested against an in-process fake
++OpenAI-compatible server on loopback and on a Unix socket (`tests/test_teacher_client.py`),
++including a check that the default configuration opens no TCP connection.
+ 
+ ## How we rate severity
+ 
+diff --git a/src/nl_shell/backend.py b/src/nl_shell/backend.py
+index 9667d0d..56b190c 100644
+--- a/src/nl_shell/backend.py
++++ b/src/nl_shell/backend.py
+@@ -21,6 +21,21 @@ class Backend(Protocol):
+         ...
+ 
+ 
++class BackendError(Exception):
++    """A backend could not produce a response; the REPL shows a fixed reply and goes on.
++
++    ``reason`` is safe to print: any server-supplied text in it is already escaped.
++    ``not_running_at`` is set, to the socket or address that gave no answer, when the
++    model server is simply not there (absent or refused socket); the REPL then says the
++    server isn't running instead of showing ``reason``.
++    """
++
++    def __init__(self, reason: str, *, not_running_at: str | None = None) -> None:
++        super().__init__(reason)
++        self.reason = reason
++        self.not_running_at = not_running_at
++
++
+ class StubExhausted(Exception):
+     """The stub was sent more requests than it was given responses."""
+ 
+diff --git a/src/nl_shell/cli.py b/src/nl_shell/cli.py
+index 238aaa1..168d279 100644
+--- a/src/nl_shell/cli.py
++++ b/src/nl_shell/cli.py
+@@ -3,11 +3,20 @@
+ from __future__ import annotations
+ 
+ import argparse
++import os
+ import sys
+ from collections.abc import Sequence
+ from pathlib import Path
+ 
+-from nl_shell import __version__, config, os_release, prompts, render, targets
++from nl_shell import (
++    __version__,
++    config,
++    os_release,
++    prompts,
++    render,
++    targets,
++    teacher_client,
++)
+ from nl_shell.input_modes import StatusLine
+ from nl_shell.repl import Repl
+ 
+@@ -30,6 +39,19 @@ def main(
+         metavar="ID",
+         help="use this OS target even if it does not match this OS",
+     )
++    parser.add_argument(
++        "--dev-teacher",
++        nargs="?",
++        const=True,
++        default=None,
++        metavar="URL",
++        help=(
++            "development only: send model requests to URL (or to teacher_url from "
++            "config.toml) for this session instead of the local model socket; URL is "
++            "the server's base URL, e.g. http://127.0.0.1:8080 or "
++            "http://127.0.0.1:8080/v1"
++        ),
++    )
+     args = parser.parse_args(argv)
+ 
+     root = targets.TARGETS_ROOT if targets_root is None else targets_root
+@@ -42,6 +64,12 @@ def main(
+         named = args.target if args.target is not None else settings.target
+         selection = targets.select(named, root, paths)
+         loaded = prompts.load(selection.target.folder, prompts.user_path())
++        endpoint, notices = teacher_client.select_endpoint(
++            args.dev_teacher,
++            settings.teacher_url,
++            os.environ.get("XDG_RUNTIME_DIR"),
++            config_file=str(config_file),
++        )
+     except targets.NoMatchingTarget as exc:
+         names = ", ".join(exc.available) or "none"
+         _error(
+@@ -50,7 +78,12 @@ def main(
+             f"Name one with --target <id>, or with target = \"<id>\" in {config_file}."
+         )
+         return 1
+-    except (config.ConfigError, targets.TargetError, prompts.PromptsError) as exc:
++    except (
++        config.ConfigError,
++        targets.TargetError,
++        prompts.PromptsError,
++        teacher_client.EndpointError,
++    ) as exc:
+         _error(f"nl-shell: {exc}")
+         return 1
+ 
+@@ -59,10 +92,21 @@ def main(
+             f"nl-shell: warning: target {selection.target.id} does not match this OS "
+             f"(detected: {selection.detected_id} {selection.detected_version_id})."
+         )
+-    lines = (*selection.status_lines(), *loaded.status_lines())
++    for notice in notices:
++        _error(notice)
++    client = teacher_client.TeacherClient(
++        endpoint, model=settings.teacher_model, timeout_s=settings.model_timeout_s
++    )
++    lines = (
++        *selection.status_lines(),
++        *loaded.status_lines(),
++        f"model endpoint: {endpoint.describe()}",
++        f"model backend: {client.kind}",
++    )
+     status_lines = tuple(_constant(line) for line in lines)
+-    # No backend until #77 adds the model client: the REPL says so for every request.
+-    return Repl.interactive(status_lines=status_lines, prompts=loaded).run()
++    return Repl.interactive(
++        status_lines=status_lines, backend=client, prompts=loaded
++    ).run()
+ 
+ 
+ def _error(text: str) -> None:
+diff --git a/src/nl_shell/config.py b/src/nl_shell/config.py
+index a3a9301..a039dcb 100644
+--- a/src/nl_shell/config.py
++++ b/src/nl_shell/config.py
+@@ -6,12 +6,15 @@ It lives at ``$XDG_CONFIG_HOME/nl-shell/config.toml``. Per the XDG Base Director
+ ignored; a known key with the wrong type, or a file that is not valid TOML, is an error
+ that names the file.
+ 
+-Today the only key is ``target`` (ADR-0023 "Choosing the target"). Later issues (#77)
+-add their keys to ``Config`` and ``load``.
++The keys: ``target`` (ADR-0023 "Choosing the target"); ``teacher_url`` and
++``teacher_model``, the development teacher endpoint (#77; the URL is used only with
++``--dev-teacher``, ADR-0020 §3); and ``[model] timeout_s``, the total deadline of one
++model request in seconds (ADR-0020 §5, default 10, at most 3600).
+ """
+ 
+ from __future__ import annotations
+ 
++import math
+ import os
+ import tomllib
+ from collections.abc import Mapping
+@@ -19,6 +22,10 @@ from dataclasses import dataclass
+ from pathlib import Path
+ 
+ CONFIG_NAME = "config.toml"
++DEFAULT_MODEL_TIMEOUT_S = 10.0
++# The largest `[model] timeout_s` accepted: one hour. Far above any useful wait, and far
++# below the values that overflow a socket or timer timeout (about 9.2e9 s on Linux).
++MAX_MODEL_TIMEOUT_S = 3600.0
+ 
+ 
+ class ConfigError(Exception):
+@@ -28,6 +35,12 @@ class ConfigError(Exception):
+ @dataclass(frozen=True)
+ class Config:
+     target: str | None = None
++    # A non-default model endpoint. Used only with `--dev-teacher` (ADR-0020 §3).
++    teacher_url: str | None = None
++    # The `model` name sent to the endpoint, if set (vLLM needs one).
++    teacher_model: str | None = None
++    # `[model] timeout_s`: the total deadline of one model request (ADR-0020 §5).
++    model_timeout_s: float = DEFAULT_MODEL_TIMEOUT_S
+ 
+ 
+ def config_path(env: Mapping[str, str] | None = None) -> Path:
+@@ -57,7 +70,38 @@ def load(path: Path | None = None) -> Config:
+         raise ConfigError(f"{path}: not valid TOML: not valid UTF-8") from None
+     except tomllib.TOMLDecodeError as exc:
+         raise ConfigError(f"{path}: not valid TOML: {exc}") from None
+-    target = doc.get("target")
+-    if target is not None and not isinstance(target, str):
+-        raise ConfigError(f"{path}: `target` must be a string")
+-    return Config(target=target)
++    target = _string(doc, "target", path)
++    teacher_url = _string(doc, "teacher_url", path)
++    teacher_model = _string(doc, "teacher_model", path)
++    model = doc.get("model", {})
++    if not isinstance(model, dict):
++        raise ConfigError(f"{path}: `model` must be a table")
++    timeout_s = model.get("timeout_s", DEFAULT_MODEL_TIMEOUT_S)
++    if not valid_timeout(timeout_s):
++        raise ConfigError(
++            f"{path}: `model.timeout_s` must be a number of seconds > 0 and "
++            f"<= {MAX_MODEL_TIMEOUT_S:g}"
++        )
++    return Config(
++        target=target,
++        teacher_url=teacher_url,
++        teacher_model=teacher_model,
++        model_timeout_s=float(timeout_s),
++    )
++
++
++def valid_timeout(value: object) -> bool:
++    """A usable request deadline: a number (not a bool) > 0 and <= MAX_MODEL_TIMEOUT_S."""
++    return (
++        not isinstance(value, bool)
++        and isinstance(value, (int, float))
++        and math.isfinite(value)
++        and 0 < value <= MAX_MODEL_TIMEOUT_S
++    )
++
++
++def _string(doc: Mapping[str, object], key: str, path: Path) -> str | None:
++    value = doc.get(key)
++    if value is not None and not isinstance(value, str):
++        raise ConfigError(f"{path}: `{key}` must be a string")
++    return value
+diff --git a/src/nl_shell/repl.py b/src/nl_shell/repl.py
+index 6fbfae4..21b3106 100644
+--- a/src/nl_shell/repl.py
++++ b/src/nl_shell/repl.py
+@@ -36,6 +36,8 @@ NO_BACKEND = (
+     "the model client arrives with #77."
+ )
+ NO_USABLE_PROPOSAL = "No usable proposal came back from the model."
++MODEL_NOT_RUNNING = "The model server isn't running (no answer at {address})."
++MODEL_UNUSABLE = "The model server could not be used: {reason}."
+ NOTHING_RUNS_YET = (
+     "Nothing runs yet: running a proposal arrives with the policy gate (#12, #78)."
+ )
+@@ -85,7 +87,7 @@ class Repl:
+         # This session's own `:status` lines, after the version line
+         # (see the `StatusLine` comment in nl_shell.input_modes).
+         self._status_lines = tuple(status_lines)
+-        # No backend is the interactive default until #77 adds the model client.
++        # No backend: every request gets NO_BACKEND. `cli.main` passes the model client.
+         self._backend = backend
+         self._prompts = prompts
+         # The model input of the last request, for `:context`.
+@@ -145,9 +147,17 @@ class Repl:
+             return NO_BACKEND
+         from nl_shell import prompts, proposal
+ 
++        from nl_shell.backend import BackendError
++
+         messages = prompts.build(self._prompts, request)
+         self._last_input = messages
+-        raw = self._backend.complete(messages)
++        try:
++            raw = self._backend.complete(messages)
++        except BackendError as exc:
++            # A failed request gets a fixed reply; the REPL keeps reading (ADR-0018 §7).
++            if exc.not_running_at is not None:
++                return MODEL_NOT_RUNNING.format(address=exc.not_running_at)
++            return MODEL_UNUSABLE.format(reason=exc.reason)
+         return show_proposal(proposal.parse(raw))
+ 
+     def _model_input_text(self) -> str | None:
+diff --git a/src/nl_shell/teacher_client.py b/src/nl_shell/teacher_client.py
+new file mode 100644
+index 0000000..5680d2c
+--- /dev/null
++++ b/src/nl_shell/teacher_client.py
+@@ -0,0 +1,508 @@
++"""The model client: OpenAI-compatible chat completions over HTTP (ADR-0018 §1, §2, §5).
++
++``TeacherClient`` is a backend (``nl_shell.backend.Backend``): it sends the model input
++to a ``llama-server`` or vLLM endpoint and returns the raw ``message.content`` text. It
++never parses, repairs or retries it; the REPL hands it to the one strict ``proposal/v1``
++parser (ADR-0018 §3). Each request asks for constrained decoding against
++``nl_shell.proposal.SCHEMA``.
++
++Which endpoint (``select_endpoint``, ADR-0020 §3): by default only the local model
++socket ``$XDG_RUNTIME_DIR/nl-shell/model.sock``. Any URL, including a loopback TCP port,
++is used only when the user passes ``--dev-teacher`` for the session; a ``teacher_url``
++in ``config.toml`` alone is refused with a message. So without the flag nl-shell opens
++no TCP connection (ADR-0003).
++
++Transport rules: the stdlib ``http.client`` (it ignores ``HTTP(S)_PROXY`` and never
++follows a redirect); certificate and host-name checks on for ``https``, no plain-HTTP
++fallback; no credentials; any non-2xx status, a body over ``MAX_RESPONSE_BYTES``, a body
++that is not JSON or has no string ``choices[0].message.content`` is an error. One
++timeout, ``timeout_s``: a total deadline for the whole request (DNS lookup, connect,
++TLS handshake, send, read), cut by a timer however the server drips its bytes.
++Errors are ``TeacherError`` (a ``BackendError``); any text the server supplied is
++escaped in the error's reason before it is built.
++"""
++
++from __future__ import annotations
++
++import http.client
++import ipaddress
++import json
++import os
++import socket
++import ssl
++import threading
++import time
++from collections.abc import Sequence
++from dataclasses import dataclass
++from typing import TYPE_CHECKING, Any
++from urllib.parse import urlsplit
++
++from nl_shell import config, render
++from nl_shell.backend import BackendError
++
++if TYPE_CHECKING:
++    from nl_shell.prompts import Message
++
++SOCKET_DIR = "nl-shell"
++SOCKET_NAME = "model.sock"
++DEFAULT_SOCKET_TEXT = f"$XDG_RUNTIME_DIR/{SOCKET_DIR}/{SOCKET_NAME}"
++CHAT_PATH = "/v1/chat/completions"
++# A maximal proposal/v1 answer (a 2000-code-point command, up to 4 UTF-8 bytes each,
++# JSON-escaped) plus the chat-completions envelope fits well inside this.
++MAX_RESPONSE_BYTES = 64 * 1024
++DEFAULT_TIMEOUT_S = config.DEFAULT_MODEL_TIMEOUT_S
++_CHUNK = 4096
++_EXCERPT = 200
++
++REFUSED_CONFIG_URL = (
++    "nl-shell: teacher_url in {config} is ignored without --dev-teacher; "
++    "using the local model socket. Pass --dev-teacher to use it for this session."
++)
++NO_DEV_URL = (
++    "nl-shell: --dev-teacher was given without a URL and config.toml has no "
++    "teacher_url; using the local model socket."
++)
++CLEAR_TEXT_WARNING = (
++    "nl-shell: warning: {url} is plain http:// to a host that is not this machine; "
++    "the state block goes over the network in clear text. "
++    "Use an SSH tunnel to a loopback port, or https://."
++)
++
++
++class EndpointError(ValueError):
++    """A teacher URL nl-shell will not use (bad scheme, credentials, no host)."""
++
++
++class TeacherError(BackendError):
++    """One model request failed. ``reason`` holds no unescaped server text."""
++
++
++@dataclass(frozen=True)
++class Endpoint:
++    """Where model requests go.
++
++    ``kind`` is ``"unix"`` (the local socket), ``"http"`` or ``"https"``. ``address`` is
++    the socket path or the URL; it is ``None`` for ``"unix"`` when there is no default
++    socket (``XDG_RUNTIME_DIR`` unset, empty or relative).
++    """
++
++    kind: str
++    address: str | None
++
++    def describe(self) -> str:
++        if self.address is not None:
++            return self.address
++        return f"{DEFAULT_SOCKET_TEXT} (XDG_RUNTIME_DIR is not set)"
++
++
++def default_socket(runtime_dir: str | None) -> str | None:
++    """``$XDG_RUNTIME_DIR/nl-shell/model.sock``, or None without a usable runtime dir."""
++    if not runtime_dir or not os.path.isabs(runtime_dir):
++        return None
++    return os.path.join(runtime_dir, SOCKET_DIR, SOCKET_NAME)
++
++
++def select_endpoint(
++    dev_teacher: str | bool | None,
++    teacher_url: str | None,
++    runtime_dir: str | None,
++    *,
++    config_file: str = "config.toml",
++) -> tuple[Endpoint, list[str]]:
++    """The endpoint for this session, and the messages to show on stderr.
++
++    ``dev_teacher`` is None without ``--dev-teacher``, True for the bare flag, or the URL
++    given with it. Opens no connection and does no DNS lookup. Raises ``EndpointError``
++    for a URL nl-shell will not use.
++    """
++    default = Endpoint("unix", default_socket(runtime_dir))
++    messages: list[str] = []
++    if dev_teacher is None:
++        if teacher_url:
++            messages.append(REFUSED_CONFIG_URL.format(config=config_file))
++        return default, messages
++    url = dev_teacher if isinstance(dev_teacher, str) else teacher_url
++    if not url:
++        messages.append(NO_DEV_URL)
++        return default, messages
++    scheme, host = _check_url(url)
++    if scheme == "http" and not _is_loopback(host):
++        messages.append(CLEAR_TEXT_WARNING.format(url=url))
++    return Endpoint(scheme, url), messages
++
++
++def _check_url(url: str) -> tuple[str, str]:
++    try:
++        parts = urlsplit(url)
++        parts.port  # raises ValueError for a bad port
++    except ValueError as exc:
++        raise EndpointError(f"teacher URL {url}: {exc}") from None
++    scheme = parts.scheme.lower()
++    if scheme not in ("http", "https"):
++        raise EndpointError(f"teacher URL {url}: must start with http:// or https://")
++    if parts.username is not None or parts.password is not None or "@" in parts.netloc:
++        raise EndpointError(f"teacher URL {url}: credentials in the URL are refused")
++    if not parts.hostname:
++        raise EndpointError(f"teacher URL {url}: no host")
++    if parts.query or parts.fragment:
++        raise EndpointError(f"teacher URL {url}: no query or fragment allowed")
++    return scheme, parts.hostname
++
++
++def _is_loopback(host: str) -> bool:
++    """``localhost``, 127.0.0.0/8 or ::1. Any other name counts as remote; no DNS."""
++    if host.lower() == "localhost":
++        return True
++    try:
++        return ipaddress.ip_address(host).is_loopback
++    except ValueError:
++        return False
++
++
++class _Watch:
++    """One request's total deadline, and the socket it currently reads from.
++
++    A timer calls ``cut`` at the deadline: it shuts the socket down so a read blocked in
++    any phase (connect, TLS handshake, headers, a chunk-size line, the body) returns.
++    The socket is the one handed to ``track``, not ``HTTPConnection.sock``: on
++    ``Connection: close`` http.client moves the socket to the response and sets
++    ``conn.sock`` to None, and the read must still be cut.
++    """
++
++    def __init__(self, timeout_s: float) -> None:
++        self.deadline = time.monotonic() + timeout_s
++        self._lock = threading.Lock()
++        self._sock: socket.socket | None = None
++        self._cut = False
++
++    def track(self, sock: socket.socket) -> None:
++        with self._lock:
++            self._sock = sock
++            if self._cut:
++                _shutdown(sock)
++
++    def cut(self) -> None:
++        with self._lock:
++            self._cut = True
++            if self._sock is not None:
++                _shutdown(self._sock)
++
++    def release(self) -> None:
++        """Forget the socket before it is closed, so a late ``cut`` cannot touch it."""
++        with self._lock:
++            self._sock = None
++
++    def left(self) -> float:
++        """What is left of the deadline; ``TimeoutError`` once it has passed."""
++        left = self.deadline - time.monotonic()
++        if left <= 0:
++            raise TimeoutError
++        return left
++
++    def tick(self) -> None:
++        """Give the next socket operation only what is left of the deadline."""
++        left = self.left()
++        with self._lock:
++            # fileno() is -1 once the response has read its body and closed the socket.
++            if self._sock is not None and self._sock.fileno() != -1:
++                self._sock.settimeout(left)
++
++
++def _shutdown(sock: socket.socket) -> None:
++    try:
++        # The base-class method: an SSLSocket's own shutdown would drop its TLS state
++        # under the reading thread.
++        socket.socket.shutdown(sock, socket.SHUT_RDWR)
++    except OSError:
++        pass
++
++
++def _resolve(host: str, port: int, watch: _Watch) -> list[Any]:
++    """``getaddrinfo`` within the deadline: it has no timeout of its own, so it runs in a
++    daemon thread that is abandoned if the deadline passes first."""
++    result: list[Any] = []
++
++    def lookup() -> None:
++        try:
++            result.append(socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM))
++        except BaseException as exc:  # handed to the caller below
++            result.append(exc)
++
++    thread = threading.Thread(target=lookup, name="nl-shell-dns", daemon=True)
++    thread.start()
++    thread.join(watch.left())
++    if not result:
++        raise TimeoutError
++    if isinstance(result[0], BaseException):
++        raise result[0]
++    return list(result[0])
++
++
++def _connect_tcp(host: str, port: int, watch: _Watch) -> socket.socket:
++    """Resolve once, then try each address with only what is left of the deadline."""
++    last: OSError | None = None
++    for family, kind, proto, _name, address in _resolve(host, port, watch):
++        left = watch.left()
++        sock = socket.socket(family, kind, proto)
++        watch.track(sock)
++        try:
++            sock.settimeout(left)
++            sock.connect(address)
++        except OSError as exc:
++            watch.release()
++            sock.close()
++            last = exc
++            continue
++        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
++        return sock
++    if last is None:
++        raise OSError(f"no address for {host}")
++    raise last
++
++
++class _UnixHTTPConnection(http.client.HTTPConnection):
++    """HTTP over the local model socket. The ``Host`` header is ``localhost``."""
++
++    def __init__(self, path: str, watch: _Watch) -> None:
++        super().__init__("localhost", timeout=watch.left())
++        self._path = path
++        self._watch = watch
++
++    def connect(self) -> None:
++        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++        self._watch.track(sock)
++        try:
++            sock.settimeout(self._watch.left())
++            sock.connect(self._path)
++        except BaseException:
++            self._watch.release()
++            sock.close()
++            raise
++        self.sock = sock
++
++
++class _HTTPConnection(http.client.HTTPConnection):
++    """Plain HTTP to a TCP host, connecting within the request's deadline."""
++
++    def __init__(self, host: str, port: int | None, watch: _Watch) -> None:
++        super().__init__(host, port, timeout=watch.left())
++        self._watch = watch
++
++    def connect(self) -> None:
++        self.sock = _connect_tcp(self.host, self.port, self._watch)
++
++
++class _HTTPSConnection(http.client.HTTPSConnection):
++    """HTTPS with certificate and host-name checks; connect and handshake within the
++    request's deadline (the handshake runs on a socket the deadline timer can cut)."""
++
++    def __init__(self, host: str, port: int | None, watch: _Watch) -> None:
++        self._tls = ssl.create_default_context()
++        super().__init__(host, port, timeout=watch.left(), context=self._tls)
++        self._watch = watch
++
++    def connect(self) -> None:
++        raw = _connect_tcp(self.host, self.port, self._watch)
++        try:
++            sock = self._tls.wrap_socket(
++                raw, server_hostname=self.host, do_handshake_on_connect=False
++            )
++        except BaseException:
++            self._watch.release()
++            raw.close()
++            raise
++        self._watch.track(sock)
++        self.sock = sock
++        sock.settimeout(self._watch.left())
++        sock.do_handshake()
++
++
++class TeacherClient:
++    """A ``Backend`` that asks an OpenAI-compatible chat endpoint for a proposal."""
++
++    kind = "openai-chat (constrained decoding, proposal/v1)"
++
++    def __init__(
++        self,
++        endpoint: Endpoint,
++        *,
++        model: str | None = None,
++        timeout_s: float = DEFAULT_TIMEOUT_S,
++        max_response_bytes: int = MAX_RESPONSE_BYTES,
++    ) -> None:
++        if not config.valid_timeout(timeout_s):
++            raise ValueError(
++                f"timeout_s must be > 0 and <= {config.MAX_MODEL_TIMEOUT_S:g}, "
++                f"not {timeout_s!r}"
++            )
++        self.endpoint = endpoint
++        self._model = model
++        self._timeout_s = float(timeout_s)
++        self._max = max_response_bytes
++
++    def complete(self, messages: Sequence[Message]) -> str:
++        """The raw ``message.content`` of the answer to one model input."""
++        body = json.dumps(self._request(messages)).encode("utf-8")
++        if self.endpoint.kind == "unix" and self.endpoint.address is None:
++            raise TeacherError(
++                "no model socket", not_running_at=self.endpoint.describe()
++            )
++        watch = _Watch(self._timeout_s)
++        timer = threading.Timer(self._timeout_s, watch.cut)
++        timer.daemon = True
++        timer.start()
++        conn: http.client.HTTPConnection | None = None
++        try:
++            conn, path = self._connection(watch)
++            return self._exchange(conn, path, body, watch)
++        finally:
++            timer.cancel()
++            watch.release()
++            if conn is not None:
++                conn.close()
++
++    def _request(self, messages: Sequence[Message]) -> dict[str, Any]:
++        from nl_shell import proposal
++
++        request: dict[str, Any] = {
++            "messages": [{"role": m.role, "content": m.content} for m in messages],
++            "response_format": {
++                "type": "json_schema",
++                "json_schema": {
++                    "name": "proposal_v1",
++                    "strict": True,
++                    "schema": proposal.SCHEMA,
++                },
++            },
++        }
++        if self._model is not None:
++            request["model"] = self._model
++        return request
++
++    def _connection(self, watch: _Watch) -> tuple[http.client.HTTPConnection, str]:
++        endpoint = self.endpoint
++        assert endpoint.address is not None
++        if endpoint.kind == "unix":
++            return _UnixHTTPConnection(endpoint.address, watch), CHAT_PATH
++        parts = urlsplit(endpoint.address)
++        assert parts.hostname is not None
++        if endpoint.kind == "https":
++            conn: http.client.HTTPConnection = _HTTPSConnection(
++                parts.hostname, parts.port, watch
++            )
++        else:
++            conn = _HTTPConnection(parts.hostname, parts.port, watch)
++        return conn, chat_path(parts.path)
++
++    def _exchange(
++        self,
++        conn: http.client.HTTPConnection,
++        path: str,
++        body: bytes,
++        watch: _Watch,
++    ) -> str:
++        endpoint = self.endpoint
++        response: http.client.HTTPResponse | None = None
++        try:
++            conn.connect()
++            watch.tick()
++            conn.request(
++                "POST",
++                path,
++                body=body,
++                headers={
++                    "Content-Type": "application/json",
++                    "Accept": "application/json",
++                },
++            )
++            watch.tick()
++            response = conn.getresponse()
++            status = response.status
++            if 300 <= status < 400:
++                raise TeacherError(
++                    f"the server answered with a redirect ({status}), not followed"
++                )
++            if not 200 <= status < 300:
++                excerpt = _read(response, watch, _EXCERPT, truncate=True)
++                text = excerpt.decode("utf-8", "replace").strip()
++                reason = f"HTTP status {status} {response.reason}".strip()
++                if text:
++                    reason += f" ({text})"
++                raise TeacherError(_escape(reason))
++            data = _read(response, watch, self._max, truncate=False)
++        except TeacherError:
++            raise
++        except ssl.SSLError as exc:
++            raise TeacherError(_escape(f"TLS error: {exc}")) from None
++        except (FileNotFoundError, ConnectionRefusedError) as exc:
++            if endpoint.kind == "unix":
++                raise TeacherError(
++                    _escape(str(exc)), not_running_at=endpoint.describe()
++                ) from None
++            raise TeacherError(_escape(f"cannot connect: {exc}")) from None
++        except (OSError, http.client.HTTPException, ValueError) as exc:
++            if time.monotonic() >= watch.deadline or isinstance(exc, TimeoutError):
++                raise TeacherError(_timed_out(self._timeout_s)) from None
++            raise TeacherError(_escape(f"{type(exc).__name__}: {exc}")) from None
++        finally:
++            if response is not None:
++                response.close()
++        return _content(data)
++
++
++def chat_path(base: str) -> str:
++    """The request path under a URL's path. A trailing ``/v1`` is the API root many
++    servers print, so ``http://host:8080/v1`` means ``/v1/chat/completions``, not
++    ``/v1/v1/chat/completions``."""
++    base = base.rstrip("/")
++    if base.endswith("/v1"):
++        base = base[: -len("/v1")]
++    return base + CHAT_PATH
++
++
++def _read(
++    response: http.client.HTTPResponse,
++    watch: _Watch,
++    limit: int,
++    *,
++    truncate: bool,
++) -> bytes:
++    """Read the body in chunks, checking the deadline before each; stop past ``limit``."""
++    chunks: list[bytes] = []
++    size = 0
++    while True:
++        watch.tick()
++        chunk = response.read1(min(_CHUNK, limit + 1 - size))
++        if not chunk:
++            break
++        chunks.append(chunk)
++        size += len(chunk)
++        if size > limit:
++            if truncate:
++                return b"".join(chunks)[:limit]
++            raise TeacherError(f"the response is larger than {limit} bytes")
++    if time.monotonic() >= watch.deadline:
++        raise TimeoutError
++    return b"".join(chunks)
++
++
++def _content(data: bytes) -> str:
++    try:
++        doc = json.loads(data.decode("utf-8"))
++    except (UnicodeDecodeError, ValueError, RecursionError):
++        raise TeacherError("the response is not JSON") from None
++    try:
++        content = doc["choices"][0]["message"]["content"]
++    except (KeyError, IndexError, TypeError):
++        content = None
++    if not isinstance(content, str):
++        raise TeacherError("the response has no string choices[0].message.content")
++    return content
++
++
++def _timed_out(timeout_s: float) -> str:
++    return f"no complete answer within {timeout_s:g} s (model.timeout_s)"
++
++
++def _escape(text: str) -> str:
++    return render.escape(text)
+diff --git a/tests/test_backend.py b/tests/test_backend.py
+index a8e4045..198f998 100644
+--- a/tests/test_backend.py
++++ b/tests/test_backend.py
+@@ -544,6 +544,7 @@ def test_status_lists_the_loaded_prompt_files(
+     user = user_prompts_file()
+     if with_user_file:
+         user.write_text("system: Mine.\n", encoding="utf-8")
++    monkeypatch.setenv("XDG_RUNTIME_DIR", "/nonexistent/nl-shell-test-runtime")
+     code, out, err, started, stub = start(
+         monkeypatch, capsys, ":status", release=ubuntu_release
+     )
+@@ -556,6 +557,13 @@ def test_status_lists_the_loaded_prompt_files(
+     ]
+     if with_user_file:
+         expected.append(f"prompts: {user}")
++    # The model client's two lines (#77) follow the prompt files.
++    from nl_shell import teacher_client
++
++    expected += [
++        "model endpoint: /nonexistent/nl-shell-test-runtime/nl-shell/model.sock",
++        f"model backend: {teacher_client.TeacherClient.kind}",
++    ]
+     assert out.splitlines() == expected
+ 
+ 
+diff --git a/tests/test_cli.py b/tests/test_cli.py
+index a11ce58..b0f02dd 100644
+--- a/tests/test_cli.py
++++ b/tests/test_cli.py
+@@ -53,9 +53,14 @@ def test_main_runs_the_interactive_repl(monkeypatch, tmp_path):
+         return FakeRepl()
+ 
+     monkeypatch.setattr(cli.Repl, "interactive", classmethod(interactive))
++    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+     assert cli.main([], targets_root=root, os_release_paths=[release]) == 0
++    from nl_shell import teacher_client
++
+     assert seen["status_lines"] == [
+         "target: testos-1 (Test OS 1)",
+         "target matches this OS",
+         f"prompts: {root / 'testos-1' / 'prompts' / 'prompts.yaml'}",
++        f"model endpoint: {tmp_path / 'run' / 'nl-shell' / 'model.sock'}",
++        f"model backend: {teacher_client.TeacherClient.kind}",
+     ]
+diff --git a/tests/test_targets.py b/tests/test_targets.py
+index 7d81a6f..a74b371 100644
+--- a/tests/test_targets.py
++++ b/tests/test_targets.py
+@@ -22,6 +22,7 @@ from nl_shell.repl import Repl
+ REPO = Path(__file__).resolve().parents[1]
+ VERSION_LINE = f"nl-shell {nl_shell.__version__}"
+ MISMATCH = "target does not match this OS"
++RUNTIME_DIR = "/nonexistent/nl-shell-test-runtime"  # no socket there; nothing connects
+ 
+ UBUNTU_2604 = """\
+ id = "ubuntu-26.04"
+@@ -157,6 +158,8 @@ def start(fake, monkeypatch, capsys):
+ 
+         monkeypatch.setattr(targets, "select", spy)
+         monkeypatch.setattr(Repl, "interactive", classmethod(interactive))
++        # The default model socket (#77) shows in `:status`; pin where it points.
++        monkeypatch.setenv("XDG_RUNTIME_DIR", RUNTIME_DIR)
+         try:
+             code = cli.main(argv, targets_root=fake.root, os_release_paths=fake.paths)
+         finally:
+@@ -173,6 +176,16 @@ def prompts_line(fake, target_id):
+     return f"prompts: {fake.root / target_id / 'prompts' / 'prompts.yaml'}"
+ 
+ 
++def model_lines():
++    """The two `:status` lines #77 adds: the model endpoint and the backend kind."""
++    from nl_shell import teacher_client
++
++    return (
++        f"model endpoint: {RUNTIME_DIR}/nl-shell/model.sock\n"
++        f"model backend: {teacher_client.TeacherClient.kind}\n"
++    )
++
++
+ def no_match_message(detected, config_file, available="testos-1, ubuntu-26.04"):
+     return (
+         f"nl-shell: no target matches this OS (detected: {detected}).\n"
+@@ -195,6 +208,7 @@ def test_exact_match_is_active_and_matching(fake, start):
+         "target: ubuntu-26.04 (Ubuntu 26.04 LTS)\n"
+         "target matches this OS\n"
+         f"{prompts_line(fake, 'ubuntu-26.04')}\n"
++        f"{model_lines()}"
+     )
+     sel = run.selection
+     assert sel.target.id == "ubuntu-26.04"
+@@ -252,6 +266,7 @@ def test_named_target_on_another_os_starts_marked_not_matching(fake, start):
+         "target: ubuntu-26.04 (Ubuntu 26.04 LTS)\n"
+         "target does not match this OS (detected: debian 13)\n"
+         f"{prompts_line(fake, 'ubuntu-26.04')}\n"
++        f"{model_lines()}"
+     )
+     sel = run.selection
+     assert sel.target.id == "ubuntu-26.04"
+@@ -561,6 +576,7 @@ def test_unreadable_etc_os_release_with_named_target_starts_not_matching(fake, s
+         "target: ubuntu-26.04 (Ubuntu 26.04 LTS)\n"
+         "target does not match this OS (detected: unknown unknown)\n"
+         f"{prompts_line(fake, 'ubuntu-26.04')}\n"
++        f"{model_lines()}"
+     )
+     sel = run.selection
+     assert sel.matches is False
+@@ -703,12 +719,14 @@ def test_status_lines_do_not_leak_between_runs(fake, start):
+         "target: ubuntu-26.04 (Ubuntu 26.04 LTS)\n"
+         "target matches this OS\n"
+         f"{prompts_line(fake, 'ubuntu-26.04')}\n"
++        f"{model_lines()}"
+     )
+     assert second.out == (
+         f"{VERSION_LINE}\n"
+         "target: testos-1 (Test OS 1)\n"
+         "target does not match this OS (detected: ubuntu 26.04)\n"
+         f"{prompts_line(fake, 'testos-1')}\n"
++        f"{model_lines()}"
+     )
+     # And a Repl built afterwards, with no target, shows neither.
+     out = io.StringIO()
+diff --git a/tests/test_teacher_client.py b/tests/test_teacher_client.py
+new file mode 100644
+index 0000000..42e2971
+--- /dev/null
++++ b/tests/test_teacher_client.py
+@@ -0,0 +1,784 @@
++"""The model client and `--dev-teacher` (#77).
++
++Every test talks to an in-process fake OpenAI-compatible server (stdlib `http.server`) on
++127.0.0.1 or on a Unix socket; nothing leaves the host and no model runs. The modules
++#77 and #143 add are imported inside the tests, so with the production change reverted
++each test fails on its own assertions instead of the file failing to import.
++"""
++
++from __future__ import annotations
++
++import http.server
++import io
++import json
++import shutil
++import socket
++import socketserver
++import tempfile
++import threading
++import time
++from pathlib import Path
++
++import pytest
++
++from nl_shell import cli
++from nl_shell.repl import Repl
++
++TARGET_TOML = """\
++id = "testos-1"
++display_name = "Test OS 1"
++shell = "bash"
++package_owner_query = ["owner-of"]
++
++[os_release]
++ID = "testos"
++VERSION_ID = "1"
++
++[sudo]
++implementation = "test-sudo"
++version = "1.0"
++"""
++PROMPTS_YAML = """\
++system: You propose one bash command.
++examples:
++  - request: show disk usage
++    response: '{"kind": "command", "command": "df -h", "risk": "read-only"}'
++request_template: "{state}{request}"
++"""
++VALID = '{"kind": "command", "command": "df -h", "risk": "read-only"}'
++NO_USABLE = "No usable proposal came back from the model."
++OSC52_STATUS = (
++    b"HTTP/1.1 500 \x1b]52;c;ZWNobyBwd25lZA==\x07\x1b[2K\rnl> fake\r\n"
++)
++HIDDEN = ("\x1b", "\x07", "\r")
++WAIT = 5  # upper bound for any wait on a fake server thread
++
++
++# --- fake server -------------------------------------------------------------------
++
++
++class Fake:
++    """One fake endpoint: records every request and answers with ``behaviour``."""
++
++    def __init__(self, server, address):
++        self.server = server
++        self.address = address
++        self.requests: list[dict] = []
++        self.behaviour = ok(VALID)
++        self.stop = threading.Event()
++
++    @property
++    def url(self) -> str:
++        host, port = self.address
++        return f"http://{host}:{port}"
++
++
++class Handler(http.server.BaseHTTPRequestHandler):
++    timeout = WAIT  # a handler never waits on a client longer than this
++
++    def do_POST(self):  # noqa: N802 (http.server naming)
++        fake: Fake = self.server.fake
++        length = int(self.headers.get("Content-Length", "0"))
++        body = self.rfile.read(length)
++        fake.requests.append(
++            {
++                "method": "POST",
++                "path": self.path,
++                "headers": {k.lower(): v for k, v in self.headers.items()},
++                "body": json.loads(body),
++            }
++        )
++        try:
++            fake.behaviour(self, fake)
++        except (BrokenPipeError, ConnectionResetError):
++            pass
++
++    def do_GET(self):  # noqa: N802
++        self.server.fake.requests.append({"method": "GET", "path": self.path})
++        self.send_error(404)
++
++    def log_message(self, *args):
++        pass
++
++
++class TCPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
++    daemon_threads = True
++    block_on_close = False
++
++
++class UnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
++    daemon_threads = True
++    block_on_close = False
++
++
++def ok(content):
++    def behaviour(handler, fake):
++        _send(handler, 200, json.dumps(
++            {"choices": [{"message": {"role": "assistant", "content": content}}]}
++        ).encode())
++    return behaviour
++
++
++def raw_body(data: bytes, status: int = 200):
++    def behaviour(handler, fake):
++        _send(handler, status, data)
++    return behaviour
++
++
++def queue(*contents):
++    """Answer request n with ``contents[n]``."""
++    pending = list(contents)
++
++    def behaviour(handler, fake):
++        ok(pending.pop(0))(handler, fake)
++    return behaviour
++
++
++def _send(handler, status, data):
++    handler.send_response(status)
++    handler.send_header("Content-Type", "application/json")
++    handler.send_header("Content-Length", str(len(data)))
++    handler.end_headers()
++    handler.wfile.write(data)
++
++
++@pytest.fixture
++def servers():
++    """Start fake servers; every one is shut down and its socket dir removed after."""
++    started: list[Fake] = []
++    dirs: list[str] = []
++
++    def tcp() -> Fake:
++        server = TCPServer(("127.0.0.1", 0), Handler)
++        return _start(server, server.server_address)
++
++    def unix(path: str) -> Fake:
++        Path(path).parent.mkdir(parents=True, exist_ok=True)
++        server = UnixServer(path, Handler)
++        return _start(server, path)
++
++    def _start(server, address) -> Fake:
++        fake = Fake(server, address)
++        server.fake = fake
++        thread = threading.Thread(
++            target=server.serve_forever, kwargs={"poll_interval": 0.05}
++        )
++        thread.daemon = True
++        thread.start()
++        started.append(fake)
++        return fake
++
++    def runtime_dir() -> str:
++        # Short: a Unix socket path must fit in about 107 bytes.
++        path = tempfile.mkdtemp(prefix="nls-")
++        dirs.append(path)
++        return path
++
++    yield type("Servers", (), {"tcp": staticmethod(tcp), "unix": staticmethod(unix),
++                               "runtime_dir": staticmethod(runtime_dir)})
++    for fake in started:
++        fake.stop.set()
++        fake.server.shutdown()
++        fake.server.server_close()
++    for path in dirs:
++        shutil.rmtree(path, ignore_errors=True)
++
++
++@pytest.fixture
++def default_socket(servers, monkeypatch):
++    """XDG_RUNTIME_DIR in a short temp dir; returns the default model socket path."""
++    run = servers.runtime_dir()
++    monkeypatch.setenv("XDG_RUNTIME_DIR", run)
++    return f"{run}/nl-shell/model.sock"
++
++
++def messages():
++    from nl_shell.prompts import Message
++
++    return [Message("system", "You propose."), Message("user", "show disk usage")]
++
++
++def client_for(fake: Fake, **kwargs):
++    from nl_shell import teacher_client
++
++    if isinstance(fake.address, str):
++        endpoint = teacher_client.Endpoint("unix", fake.address)
++    else:
++        endpoint = teacher_client.Endpoint("http", fake.url)
++    return teacher_client.TeacherClient(endpoint, **kwargs)
++
++
++def failure(client) -> str:
++    from nl_shell import backend
++
++    with pytest.raises(backend.BackendError) as exc:
++        client.complete(messages())
++    return exc.value.reason
++
++
++def scripted(lines):
++    pending = list(lines)
++
++    def read(_prompt):
++        if not pending:
++            raise EOFError
++        return pending.pop(0)
++    return read
++
++
++def load_prompts(tmp_path):
++    from nl_shell import prompts
++
++    folder = tmp_path / "target"
++    (folder / "prompts").mkdir(parents=True)
++    (folder / "prompts" / "prompts.yaml").write_text(PROMPTS_YAML, encoding="utf-8")
++    return prompts.load(folder)
++
++
++def run_cli(tmp_path, monkeypatch, argv=(), lines=(), config_text=None):
++    """``cli.main`` with an injected matching target, a scripted REPL and a StringIO."""
++    root = tmp_path / "targets"
++    folder = root / "testos-1"
++    (folder / "prompts").mkdir(parents=True)
++    (folder / "target.toml").write_text(TARGET_TOML, encoding="utf-8")
++    (folder / "prompts" / "prompts.yaml").write_text(PROMPTS_YAML, encoding="utf-8")
++    release = tmp_path / "os-release"
++    release.write_text('ID=testos\nVERSION_ID="1"\n', encoding="utf-8")
++    if config_text is not None:
++        config_dir = Path(tmp_path / "home-config" / "nl-shell")
++        config_dir.mkdir(parents=True)
++        (config_dir / "config.toml").write_text(config_text, encoding="utf-8")
++        monkeypatch.setenv("XDG_CONFIG_HOME", str(config_dir.parent))
++    out = io.StringIO()
++    seen: dict = {}
++
++    def interactive(cls, status_lines=(), **kwargs):
++        seen["status_lines"] = [line() for line in status_lines]
++        seen["kwargs"] = kwargs
++        return cls(scripted(lines), out, status_lines, **kwargs)
++
++    monkeypatch.setattr(cli.Repl, "interactive", classmethod(interactive))
++    rc = cli.main(list(argv), targets_root=root, os_release_paths=[release])
++    return rc, out.getvalue(), seen
++
++
++# --- (a) request shape -------------------------------------------------------------
++
++
++def test_request_shape(servers, default_socket):
++    from nl_shell import proposal
++
++    fake = servers.unix(default_socket)
++    sent = messages()
++    assert client_for(fake).complete(sent) == VALID
++    assert len(fake.requests) == 1
++    request = fake.requests[0]
++    assert (request["method"], request["path"]) == ("POST", "/v1/chat/completions")
++    body = request["body"]
++    assert body["messages"] == [{"role": m.role, "content": m.content} for m in sent]
++    response_format = body["response_format"]
++    assert response_format["type"] == "json_schema"
++    assert response_format["json_schema"]["schema"] == proposal.SCHEMA
++    assert "authorization" not in request["headers"]
++    assert "model" not in body
++
++
++@pytest.mark.parametrize("config_text, model", [
++    ('teacher_model = "m1"\n', "m1"),
++    ("", None),
++])
++def test_teacher_model_from_config(tmp_path, monkeypatch, servers, default_socket,
++                                   config_text, model):
++    fake = servers.unix(default_socket)
++    rc, out, _ = run_cli(tmp_path, monkeypatch, lines=["show disk usage"],
++                         config_text=config_text)
++    assert rc == 0
++    assert "Proposed command (risk: read-only" in out
++    assert len(fake.requests) == 1
++    assert fake.requests[0]["body"].get("model") == model
++    assert ("model" in fake.requests[0]["body"]) == (model is not None)
++
++
++# --- (b) strict transport handling -------------------------------------------------
++
++
++def test_http_error_status_is_rejected(servers):
++    fake = servers.tcp()
++    fake.behaviour = lambda handler, _fake: handler.send_error(503, "busy")
++    reason = failure(client_for(fake))
++    assert "503" in reason
++    assert len(fake.requests) == 1
++
++
++def test_redirect_is_not_followed(servers):
++    fake, other = servers.tcp(), servers.tcp()
++
++    def redirect(handler, _fake):
++        handler.send_response(307)
++        handler.send_header("Location", other.url + "/v1/chat/completions")
++        handler.send_header("Content-Length", "0")
++        handler.end_headers()
++
++    fake.behaviour = redirect
++    reason = failure(client_for(fake))
++    assert "redirect" in reason
++    assert len(fake.requests) == 1
++    assert other.requests == []
++
++
++@pytest.mark.parametrize("data", [
++    b"not json",
++    b'{"choices": []}',
++    b"{}",
++    b'{"choices": [{"message": {"content": null}}]}',
++    b'{"choices": [{"message": {"content": {"kind": "command"}}}]}',
++    b"[1, 2]",
++])
++def test_bad_body_is_rejected(servers, data):
++    fake = servers.tcp()
++    fake.behaviour = raw_body(data)
++    reason = failure(client_for(fake))
++    assert "JSON" in reason or "content" in reason
++    assert len(fake.requests) == 1
++
++
++def test_oversize_body_stops_reading_at_the_cap(servers):
++    fake = servers.tcp()
++    written = []
++
++    def endless(handler, fake):
++        handler.send_response(200)
++        handler.send_header("Content-Type", "application/json")
++        handler.end_headers()
++        while not fake.stop.is_set() and sum(written) < 64 * 1024 * 1024:
++            handler.wfile.write(b" " * 4096)
++            written.append(4096)
++
++    fake.behaviour = endless
++    start = time.monotonic()
++    reason = failure(client_for(fake, timeout_s=WAIT))
++    assert time.monotonic() - start < WAIT
++    assert "larger than" in reason
++    assert len(fake.requests) == 1
++
++
++def test_size_cap_override(servers):
++    fake = servers.tcp()
++    reason = failure(client_for(fake, max_response_bytes=10))
++    assert "larger than 10 bytes" in reason
++
++
++def test_server_that_never_answers_times_out(servers):
++    fake = servers.tcp()
++    fake.behaviour = lambda _handler, fake: fake.stop.wait(2)
++    start = time.monotonic()
++    reason = failure(client_for(fake, timeout_s=0.5))
++    assert time.monotonic() - start < 2
++    assert "within 0.5 s" in reason
++    assert len(fake.requests) == 1
++
++
++def slow_drip(handler, fake):
++    handler.send_response(200)
++    handler.send_header("Content-Type", "application/json")
++    handler.send_header("Content-Length", "100")
++    handler.end_headers()
++    handler.wfile.flush()
++    for _ in range(100):
++        if fake.stop.wait(0.2):
++            return
++        handler.wfile.write(b" ")
++        handler.wfile.flush()
++
++
++def test_slow_drip_body_hits_the_total_deadline(servers):
++    fake = servers.tcp()
++    fake.behaviour = slow_drip
++    start = time.monotonic()
++    reason = failure(client_for(fake, timeout_s=0.5))
++    assert time.monotonic() - start < 2
++    assert "within 0.5 s" in reason
++
++
++def test_model_timeout_from_config(tmp_path):
++    from nl_shell import config
++
++    path = tmp_path / "config.toml"
++    path.write_text('target = "x"\n', encoding="utf-8")
++    assert config.load(path).model_timeout_s == 10
++    path.write_text("[model]\ntimeout_s = 0.5\n", encoding="utf-8")
++    assert config.load(path).model_timeout_s == 0.5
++    path.write_text("[model]\ntimeout_s = 3\n", encoding="utf-8")
++    assert config.load(path).model_timeout_s == 3
++    path.write_text("[model]\ntimeout_s = 3600\n", encoding="utf-8")
++    assert config.load(path).model_timeout_s == 3600
++    # 1e10 once crashed the REPL with an OverflowError from the deadline timer.
++    for bad in ('"10"', "true", "0", "-1", "nan", "inf", "[1]", "3600.5", "1e10"):
++        path.write_text(f"[model]\ntimeout_s = {bad}\n", encoding="utf-8")
++        with pytest.raises(config.ConfigError):
++            config.load(path)
++
++
++def test_huge_timeout_is_refused_by_the_client():
++    from nl_shell import teacher_client
++
++    endpoint = teacher_client.Endpoint("http", "http://127.0.0.1:9")
++    for bad in (1e10, 0, -1, float("nan"), float("inf")):
++        with pytest.raises(ValueError):
++            teacher_client.TeacherClient(endpoint, timeout_s=bad)
++
++
++def test_cli_refuses_a_huge_timeout(tmp_path, monkeypatch, capsys, default_socket):
++    rc, _, seen = run_cli(tmp_path, monkeypatch, lines=["show disk usage"],
++                          config_text="[model]\ntimeout_s = 1e10\n")
++    assert rc == 1
++    assert "timeout_s" in capsys.readouterr().err
++    assert seen == {}
++
++
++def chunk_size_drip(handler, fake):
++    """Chunked, then the chunk-size line one byte every 0.2 s, never ending it."""
++    handler.wfile.write(
++        b"HTTP/1.1 200 OK\r\n"
++        b"Content-Type: application/json\r\n"
++        b"Transfer-Encoding: chunked\r\n"
++        b"Connection: close\r\n\r\n"
++    )
++    handler.wfile.flush()
++    for _ in range(100):
++        if fake.stop.wait(0.2):
++            return
++        handler.wfile.write(b"0")
++        handler.wfile.flush()
++
++
++@pytest.mark.parametrize("where", ["tcp", "unix"])
++def test_chunk_size_drip_after_connection_close_hits_the_deadline(
++    servers, default_socket, where
++):
++    # With `Connection: close` http.client hands the socket to the response and drops
++    # it from the connection; the deadline must still cut the read.
++    fake = servers.tcp() if where == "tcp" else servers.unix(default_socket)
++    fake.behaviour = chunk_size_drip
++    start = time.monotonic()
++    reason = failure(client_for(fake, timeout_s=0.5))
++    assert time.monotonic() - start < 2
++    assert "within 0.5 s" in reason
++
++
++def test_dns_lookup_is_inside_the_deadline(monkeypatch):
++    from nl_shell import teacher_client
++
++    released = threading.Event()
++
++    def slow_lookup(*args, **kwargs):
++        released.wait(3)
++        raise socket.gaierror(socket.EAI_NONAME, "no such host")
++
++    monkeypatch.setattr(socket, "getaddrinfo", slow_lookup)
++    endpoint = teacher_client.Endpoint("http", "http://teacher.test:8080")
++    start = time.monotonic()
++    try:
++        reason = failure(teacher_client.TeacherClient(endpoint, timeout_s=0.5))
++    finally:
++        released.set()
++    assert time.monotonic() - start < 2
++    assert "within 0.5 s" in reason
++
++
++def test_connect_attempts_share_the_deadline(monkeypatch):
++    from nl_shell import teacher_client
++
++    # A listener whose backlog is full: a further connect hangs (SYN dropped).
++    listener = socket.socket()
++    held = []
++    try:
++        listener.bind(("127.0.0.1", 0))
++        listener.listen(0)
++        address = listener.getsockname()
++        first = socket.create_connection(address, timeout=WAIT)
++        held.append(first)
++        lookups = []
++
++        def three_addresses(host, port, *args, **kwargs):
++            lookups.append(host)
++            info = (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", address)
++            return [info, info, info]
++
++        monkeypatch.setattr(socket, "getaddrinfo", three_addresses)
++        endpoint = teacher_client.Endpoint("http", f"http://teacher.test:{address[1]}")
++        start = time.monotonic()
++        reason = failure(teacher_client.TeacherClient(endpoint, timeout_s=0.5))
++        elapsed = time.monotonic() - start
++    finally:
++        for sock in held:
++            sock.close()
++        listener.close()
++    assert lookups == ["teacher.test"]
++    # Each of the three attempts given the full 0.5 s would take 1.5 s.
++    assert elapsed < 1.2
++    assert "within 0.5 s" in reason
++
++
++def test_trailing_v1_in_the_url_is_not_doubled(servers):
++    from nl_shell import teacher_client
++
++    fake = servers.tcp()
++    for url in (fake.url + "/v1", fake.url + "/v1/"):
++        client = teacher_client.TeacherClient(teacher_client.Endpoint("http", url))
++        assert client.complete(messages()) == VALID
++    assert [r["path"] for r in fake.requests] == ["/v1/chat/completions"] * 2
++
++
++def test_cli_uses_model_timeout(tmp_path, monkeypatch, servers, default_socket):
++    fake = servers.unix(default_socket)
++    fake.behaviour = slow_drip
++    start = time.monotonic()
++    rc, out, _ = run_cli(tmp_path, monkeypatch, lines=["show disk usage"],
++                         config_text="[model]\ntimeout_s = 0.5\n")
++    assert time.monotonic() - start < 2
++    assert rc == 0
++    assert "The model server could not be used: " in out
++    assert len(fake.requests) == 1
++
++
++def test_https_to_plain_http_server_is_a_tls_error(servers):
++    from nl_shell import teacher_client
++
++    fake = servers.tcp()
++    port = fake.address[1]
++    endpoint = teacher_client.Endpoint("https", f"https://127.0.0.1:{port}")
++    reason = failure(teacher_client.TeacherClient(endpoint, timeout_s=WAIT))
++    assert "TLS" in reason
++    assert fake.requests == []
++
++
++# --- (c) endpoint rules -------------------------------------------------------------
++
++
++def test_select_endpoint_rules():
++    from nl_shell.teacher_client import Endpoint, EndpointError, select_endpoint
++
++    run = "/run/user/1000"
++    sock = "/run/user/1000/nl-shell/model.sock"
++    lan = "http://192.168.1.20:8080"
++    loop = "http://127.0.0.1:8080"
++
++    assert select_endpoint(None, None, run) == (Endpoint("unix", sock), [])
++    endpoint, notes = select_endpoint(None, loop, run)
++    assert endpoint == Endpoint("unix", sock)
++    assert len(notes) == 1 and "--dev-teacher" in notes[0]
++    assert select_endpoint(True, loop, run) == (Endpoint("http", loop), [])
++    assert select_endpoint("http://localhost:9", loop, run) == (
++        Endpoint("http", "http://localhost:9"), [])
++    assert select_endpoint("https://teacher.lan", None, run) == (
++        Endpoint("https", "https://teacher.lan"), [])
++    for remote in (lan, "http://teacher.lan", "http://[fe80::1]:8080"):
++        endpoint, notes = select_endpoint(remote, None, run)
++        assert endpoint == Endpoint("http", remote)
++        assert len(notes) == 1 and "SSH tunnel" in notes[0]
++    for local in ("http://127.9.9.9", "http://[::1]:8080", "http://LOCALHOST"):
++        assert select_endpoint(local, None, run)[1] == []
++    for no_runtime in (None, "", "relative/dir"):
++        assert select_endpoint(None, None, no_runtime)[0] == Endpoint("unix", None)
++    for bad in ("ftp://host", "http://user:pw@host", "http://user@host", "http://",
++                "http://host?x=1"):
++        with pytest.raises(EndpointError):
++            select_endpoint(bad, None, run)
++
++
++def test_default_socket_without_flag_or_url(tmp_path, monkeypatch, servers,
++                                            default_socket):
++    fake = servers.unix(default_socket)
++    rc, out, _ = run_cli(tmp_path, monkeypatch, lines=["show disk usage"])
++    assert rc == 0
++    assert "Proposed command (risk: read-only, 1 line):" in out
++    assert len(fake.requests) == 1
++
++
++def test_config_url_without_flag_is_refused(tmp_path, monkeypatch, capsys, servers,
++                                            default_socket):
++    local, teacher = servers.unix(default_socket), servers.tcp()
++    rc, out, _ = run_cli(tmp_path, monkeypatch, lines=["show disk usage"],
++                         config_text=f'teacher_url = "{teacher.url}"\n')
++    assert rc == 0
++    assert "teacher_url" in capsys.readouterr().err
++    assert "Proposed command" in out
++    assert len(local.requests) == 1
++    assert teacher.requests == []
++
++
++def test_config_url_with_bare_flag_is_used(tmp_path, monkeypatch, servers,
++                                           default_socket):
++    local, teacher = servers.unix(default_socket), servers.tcp()
++    rc, out, _ = run_cli(tmp_path, monkeypatch, argv=["--dev-teacher"],
++                         lines=["show disk usage"],
++                         config_text=f'teacher_url = "{teacher.url}"\n')
++    assert rc == 0
++    assert "Proposed command" in out
++    assert len(teacher.requests) == 1
++    assert local.requests == []
++
++
++def test_flag_url_wins_over_config_url(tmp_path, monkeypatch, servers, default_socket):
++    configured, given = servers.tcp(), servers.tcp()
++    rc, _, _ = run_cli(tmp_path, monkeypatch, argv=["--dev-teacher", given.url],
++                       lines=["show disk usage"],
++                       config_text=f'teacher_url = "{configured.url}"\n')
++    assert rc == 0
++    assert len(given.requests) == 1
++    assert configured.requests == []
++
++
++def test_non_loopback_http_warns_on_stderr(tmp_path, monkeypatch, capsys,
++                                           default_socket):
++    # No request line, so nothing connects to the (unroutable) address.
++    rc, _, _ = run_cli(tmp_path, monkeypatch,
++                       argv=["--dev-teacher", "http://192.0.2.1:8080"])
++    assert rc == 0
++    assert "SSH tunnel" in capsys.readouterr().err
++
++
++# --- (d) through Repl ---------------------------------------------------------------
++
++
++def test_repl_shows_the_proposal(tmp_path, servers, default_socket):
++    fake = servers.unix(default_socket)
++    out = io.StringIO()
++    repl = Repl(scripted(["show disk usage"]), out, backend=client_for(fake),
++                prompts=load_prompts(tmp_path))
++    assert repl.run() == 0
++    assert out.getvalue().startswith(
++        "Proposed command (risk: read-only, 1 line):\n  | df -h\n"
++    )
++
++
++REJECTED = [
++    '{"kind": "command", "command": "ls", "risk": "read-only", "extra": 1}',
++    '{"kind": "command", "command": "ls"}',
++    '{"kind": "command", "command": "ls", "risk": "read-only", '
++    '"reason": "unclear-request"}',
++    json.dumps({"kind": "command", "command": "a" * 2001, "risk": "read-only"}),
++    '{"kind": "command", "command": "ls", ',
++    '[{"kind": "command", "command": "ls", "risk": "read-only"}]',
++]
++
++
++def test_repl_rejects_bad_proposals_and_keeps_reading(
++    tmp_path, servers, default_socket
++):
++    fake = servers.unix(default_socket)
++    fake.behaviour = queue(*REJECTED, VALID)
++    out = io.StringIO()
++    lines = [f"request {n}" for n in range(len(REJECTED) + 1)]
++    repl = Repl(scripted(lines), out, backend=client_for(fake),
++                prompts=load_prompts(tmp_path))
++    assert repl.run() == 0
++    replies = out.getvalue().splitlines()
++    assert replies[: len(REJECTED)] == [NO_USABLE] * len(REJECTED)
++    assert replies[len(REJECTED)].startswith("Proposed command (risk: read-only")
++    assert len(fake.requests) == len(REJECTED) + 1
++
++
++def test_repl_with_no_model_server(tmp_path, default_socket):
++    from nl_shell import teacher_client
++
++    endpoint = teacher_client.Endpoint("unix", default_socket)
++    out = io.StringIO()
++    repl = Repl(scripted(["show disk usage", "list files here"]), out,
++                backend=teacher_client.TeacherClient(endpoint),
++                prompts=load_prompts(tmp_path))
++    assert repl.run() == 0
++    expected = f"The model server isn't running (no answer at {default_socket})."
++    assert out.getvalue().splitlines() == [expected, expected]
++
++
++def test_repl_with_no_runtime_dir(tmp_path, monkeypatch):
++    from nl_shell import teacher_client
++
++    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
++    endpoint, _ = teacher_client.select_endpoint(None, None, None)
++    out = io.StringIO()
++    repl = Repl(scripted(["show disk usage"]), out,
++                backend=teacher_client.TeacherClient(endpoint),
++                prompts=load_prompts(tmp_path))
++    assert repl.run() == 0
++    assert out.getvalue().startswith("The model server isn't running (no answer at ")
++
++
++def control_status(handler, _fake):
++    body = b"\x1b[31merror\x07\r body"
++    handler.wfile.write(
++        OSC52_STATUS
++        + b"Content-Type: text/plain\r\n"
++        + f"Content-Length: {len(body)}\r\n".encode()
++        + b"Connection: close\r\n\r\n"
++        + body
++    )
++
++
++def test_server_text_is_escaped(tmp_path, servers, default_socket):
++    fake = servers.unix(default_socket)
++    fake.behaviour = control_status
++    reason = failure(client_for(fake))
++    for char in HIDDEN:
++        assert char not in reason
++    assert "500" in reason
++
++    out = io.StringIO()
++    repl = Repl(scripted(["show disk usage", "list files"]), out,
++                backend=client_for(fake), prompts=load_prompts(tmp_path))
++    assert repl.run() == 0
++    text = out.getvalue()
++    for char in HIDDEN:
++        assert char not in text
++    lines = text.splitlines()
++    assert len(lines) == 2  # one reply per request: the REPL kept reading
++    assert lines[0].startswith("The model server could not be used: HTTP status 500 ")
++
++
++# --- (e) :status --------------------------------------------------------------------
++
++
++def test_status_names_endpoint_and_backend(tmp_path, monkeypatch, default_socket):
++    from nl_shell import teacher_client
++
++    _, _, seen = run_cli(tmp_path, monkeypatch)
++    assert seen["status_lines"][-2:] == [
++        f"model endpoint: {default_socket}",
++        f"model backend: {teacher_client.TeacherClient.kind}",
++    ]
++    _, _, seen = run_cli(tmp_path / "flag", monkeypatch,
++                         argv=["--dev-teacher", "http://127.0.0.1:9"])
++    assert seen["status_lines"][-2] == "model endpoint: http://127.0.0.1:9"
++
++
++# --- (f) no TCP on the default path -------------------------------------------------
++
++
++def test_default_path_opens_no_tcp(tmp_path, monkeypatch, servers, default_socket):
++    local, teacher = servers.unix(default_socket), servers.tcp()
++    calls = []
++    connect = socket.socket.connect
++    create_connection = socket.create_connection
++
++    def record_connect(self, address):
++        calls.append((self.family, address))
++        return connect(self, address)
++
++    def record_create_connection(address, *args, **kwargs):
++        calls.append((socket.AF_INET, address))
++        return create_connection(address, *args, **kwargs)
++
++    monkeypatch.setattr(socket.socket, "connect", record_connect)
++    monkeypatch.setattr(socket, "create_connection", record_create_connection)
++    rc, out, _ = run_cli(tmp_path, monkeypatch, lines=["show disk usage"],
++                         config_text=f'teacher_url = "{teacher.url}"\n')
++    assert rc == 0
++    tcp = [c for c in calls if c[0] in (socket.AF_INET, socket.AF_INET6)]
++    unix = [c for c in calls if c[0] == socket.AF_UNIX]
++    assert tcp == []
++    assert unix == [(socket.AF_UNIX, default_socket)]
++    assert teacher.requests == []
++    assert len(local.requests) == 1
++    assert "Proposed command" in out

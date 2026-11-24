@@ -1,0 +1,6 @@
+Round 4 is a real, mostly sound implementation; rebuild to fix the live findings only, keeping the design:
+1. Large `[model] timeout_s` (e.g. 1e10) crashes the REPL with an uncaught OverflowError from settimeout/Timer. Put an upper bound on timeout_s in config.load (ConfigError) and/or map OverflowError to TeacherError; add 1e10 to test_model_timeout_from_config.
+2. Total deadline is lost once http.client hands the socket to the response (Connection: close sets conn.sock=None; _cut/_tick only consult conn.sock), so a slow chunk-size line overruns timeout_s. Keep cancelling via the response's socket; add a real fake-server regression with Transfer-Encoding: chunked + Connection: close dripping chunk-size bytes past the deadline.
+3. Deadline does not cover DNS/connect on the --dev-teacher TCP path (create_connection gives each address the full timeout). Either bound connect to the remaining time (resolve once, per-attempt min(left, ...)) with a test, or narrow the docstring (teacher_client.py:19) and threat-model item 11 wording to "send and read".
+Nice-to-have in the same rebuild: handle or document a trailing /v1 in the --dev-teacher URL (currently becomes /v1/v1/chat/completions -> 404).
+Build on the #143 base (#143 is accepted): rebuild only #77's part (patch-77-on-143.diff), not the combined 115 KB patch.

@@ -1,0 +1,34 @@
+feat(gate): add the policy gate's fail-closed shell layer
+
+nl-shell has no policy gate yet: nothing reads a proposed command and
+decides how risky it is. This adds the nl_shell.gate package and its
+shell layer, the part that parses a command with tree-sitter-bash and
+hands each simple command to the per-command rules as a structured
+invocation (words, literal flags, assignments, redirects, stdin source).
+
+The gate assumes nothing is safe until it can prove it:
+
+- A tree with an ERROR or MISSING node, or text tree-sitter-bash is
+  known to read differently from bash, is untrusted. A model proposal
+  is rejected; typed input is at least "mutating" and says
+  "unparseable".
+- Every node is walked and every simple command gives one invocation.
+  The walk is checked against the tree on every call, not just in tests.
+- Stdin and the literal flag are recorded only from a short list of
+  proven forms; everything else is "unknown", the worst case.
+- Only redirects to descriptors 0-2 and to safe targets are accepted, so
+  fd 3 (the control channel) cannot be reached.
+- Input over 8 KiB is refused before parsing, and the walk has a work
+  budget. Any gate failure is "privileged", rejected, "could not class";
+  classify never raises.
+- Reason strings escape quoted input, so no control or hidden
+  characters reach the output.
+
+The command layer and the live-session step ship as stubs that class
+every command at least "mutating", so nothing is read-only yet and the
+gate is not wired into the REPL. tree-sitter 0.26.0 and tree-sitter-bash
+0.25.1 are pinned exactly, since the rules depend on how this grammar
+reads bash. The threat model's "What must hold" section states the six
+properties above.
+
+Fixes #196

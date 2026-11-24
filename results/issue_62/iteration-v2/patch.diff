@@ -1,0 +1,938 @@
+diff --git a/src/nl_shell/failure_classes.py b/src/nl_shell/failure_classes.py
+new file mode 100644
+index 0000000..ac33097
+--- /dev/null
++++ b/src/nl_shell/failure_classes.py
+@@ -0,0 +1,354 @@
++"""Failure classes by exit code: a deterministic first pass over a finished command (#62).
++
++The classifier reads trusted facts only: the exit status from the control channel's done
++record (ADR-0014 Decision 2; never the PTY output), the session state the control channel
++reported with it, and the command text the user confirmed. It never sees stderr:
++"bash: x: command not found" is text an attacker can shape (threat model item 1), and
++stderr goes, if at all, to the quarantined reader (ADR-0017), which only the "other" class
++is sent to.
++
++Order (first match wins):
++
++1. Nothing ran (a ``D`` record without ``S``, pty-protocol v1 §4.1: an empty line, a
++   comment, a syntax error): not run. ``$?`` may then be an earlier command's status.
++2. exit status 0: no failure.
++3. A privilege wrapper (the confirmed command's first word is sudo, su, pkexec or doas)
++   exiting with that wrapper's own failure status: a privilege-wrapper failure. Nothing
++   about it may touch the password (ADR-0006, ADR-0015), so there is no correction offer
++   and it never goes to the reader.
++4. 127 not found, 126 not executable, 130 interrupted, 129-192 killed by signal n
++   (128 + n, n = 1-64), as bash(1) EXIT STATUS defines them.
++5. Everything else: other, the only class sent to the reader.
++
++The package that provides a not-found command comes from local data that the active
++target names in its ``target.toml`` (``[command_provider]``, ADR-0023: this code names
++no OS). It is read-only and local (ADR-0003). A package is suggested only when the
++not-found word is certain: a simple command whose first word the session could not
++resolve (not a builtin, keyword, function or alias, and not an executable on the
++session's ``$PATH``). If bash found the first word, a 127 came from something that word
++ran (``timeout 5 x``, ``npm run x``), and naming the first word's package would be a
++confident wrong answer, which is worse than none.
++"""
++
++from __future__ import annotations
++
++import enum
++import os
++import posixpath
++import re
++import signal
++import sqlite3
++from collections.abc import Callable, Iterable
++from contextlib import closing
++from dataclasses import dataclass
++from pathlib import Path
++
++from nl_shell.pty_protocol import Done, Snapshot
++from nl_shell.router import BASH_BUILTINS, first_token
++from nl_shell.session import CommandResult
++from nl_shell.targets import CommandProvider
++
++# A lookup takes a command word and returns the names of packages that provide it.
++Lookup = Callable[[str], Iterable[str]]
++
++NOT_FOUND = 127
++NOT_EXECUTABLE = 126
++INTERRUPTED = 130  # 128 + SIGINT
++SIGNAL_BASE = 128
++MAX_SIGNAL = 64
++
++# The status each privilege wrapper exits with when it fails itself, before or instead of
++# running the command:
++# - su(1) EXIT STATUS: 1 is su's own error before it runs the command.
++# - pkexec(1) RETURN VALUE: 126 the authentication dialog was dismissed, 127 not authorized
++#   or authentication failed.
++# - sudo: classic sudo(8) EXIT VALUE says 1 when sudo itself fails. The sudo-rs man page on
++#   the reference host documents no exit status, so 1 is UNVERIFIED for sudo-rs; the real
++#   check is #24 (sudo-rs behaviour) and #75 (VM test). doas(1) also exits 1 on its own
++#   failure.
++# A command run under the wrapper that itself exits with the same status is classed as a
++# wrapper failure too: that only drops the correction offer and the reader, the safe side.
++WRAPPER_FAILURE_STATUS = {
++    "sudo": frozenset({1}),
++    "su": frozenset({1}),
++    "doas": frozenset({1}),
++    "pkexec": frozenset({126, 127}),
++}
++
++# First words after which the first word is not the command that was not found. The
++# session check (``_resolves``) catches any other first word that bash found; this list
++# also covers a done record that comes without session state.
++_COMMAND_WRAPPERS = frozenset(
++    {"env", "nohup", "time", "nice", "command", "exec", "xargs"} | set(WRAPPER_FAILURE_STATUS)
++)
++# Output of `compgen -k` in bash 5: words bash itself handles, never looked up on $PATH.
++_BASH_KEYWORDS = frozenset(
++    "if then else elif fi case esac for select while until do done in function time "
++    "{ } ! [[ ]] coproc".split()
++)
++# Text that makes the confirmed command more than one simple command: `$?` is then the
++# status of the last one, which need not be the first word.
++_COMPOUND = ("|", ";", "&", "\n", "`", "$(")
++# `alias -p` prints `alias NAME='VALUE'`; `enable -n` prints `enable -n NAME`.
++_ALIAS_LINE = re.compile(r"alias (?:-- )?([^=\s]+)=")
++_DISABLED_LINE = re.compile(r"enable -n (\S+)")
++
++# Debian package-name rule, matched against the whole string (re.fullmatch, so a trailing
++# newline or any suffix is rejected).
++_PACKAGE_NAME = re.compile(r"[a-z0-9][a-z0-9+.-]+")
++_MAX_PACKAGES = 5
++_MAX_SHOWN_WORD = 64
++
++
++class FailureClass(enum.Enum):
++    NONE = "none"
++    NOT_RUN = "not_run"
++    NOT_FOUND = "not_found"
++    NOT_EXECUTABLE = "not_executable"
++    INTERRUPTED = "interrupted"
++    SIGNAL = "signal"
++    PRIVILEGE_WRAPPER = "privilege_wrapper"
++    OTHER = "other"
++
++
++_NOT_AN_ERROR = frozenset({FailureClass.NONE, FailureClass.NOT_RUN, FailureClass.INTERRUPTED})
++# Nothing to correct when nothing ran or nothing failed; Ctrl-C is not a mistake to correct;
++# and nothing may touch the sudo password (ADR-0006).
++_NO_CORRECTION = frozenset(
++    {
++        FailureClass.NONE,
++        FailureClass.NOT_RUN,
++        FailureClass.INTERRUPTED,
++        FailureClass.PRIVILEGE_WRAPPER,
++    }
++)
++
++
++@dataclass(frozen=True)
++class Failure:
++    """The class of one finished command and its fixed response.
++
++    ``status`` is bash's ``$?`` from the done record (the last command of a pipeline);
++    ``pipestatus`` is ``PIPESTATUS`` from the same record, for callers. ``message`` is a
++    fixed template, never model text. ``is_error`` is False for no failure, for nothing
++    run and for an interrupt (Ctrl-C is not an error). ``offer_correction`` is False for
++    those and for a privilege-wrapper failure; ``to_reader`` is True only for ``OTHER``.
++
++    ``command_word`` is set only for ``NOT_FOUND`` when the not-found word is certain, and
++    only when it is safe to display (printable, at most 64 characters): no escape or bidi
++    character from the confirmed text reaches it or ``message``.
++    """
++
++    kind: FailureClass
++    status: int
++    pipestatus: tuple[int, ...]
++    message: str
++    is_error: bool
++    offer_correction: bool
++    to_reader: bool
++    signal_number: int | None = None
++    signal_name: str | None = None
++    wrapper: str | None = None
++    command_word: str | None = None  # the not-found word, only when certain and printable
++    packages: tuple[str, ...] = ()  # packages that provide command_word
++
++
++def classify(
++    result: Done | CommandResult, command: str, lookup: Lookup | None = None
++) -> Failure:
++    """Classify a finished command.
++
++    ``result`` is the session's completion result (``session.CommandResult``) or the bare
++    done record it was built from (``pty_protocol.Done``). Its status, pipestatus, ``ran``
++    and snapshot are read, never its output. A bare ``Done`` carries no session state, so
++    the not-found word can't be checked against the session and no package is suggested.
++    ``command`` is the command text the user confirmed. ``lookup`` names the packages that
++    provide a command word (see ``provider_lookup``); None gives no suggestion.
++    """
++    if not isinstance(result, (Done, CommandResult)):
++        raise TypeError(
++            "classify() needs the done record (pty_protocol.Done or session.CommandResult), "
++            f"not {type(result).__name__}"
++        )
++    status = result.status
++    pipestatus = tuple(result.pipestatus)
++    snapshot = result.snapshot if isinstance(result, CommandResult) else None
++
++    def failure(kind: FailureClass, message: str, **kwargs) -> Failure:
++        return Failure(
++            kind=kind,
++            status=status,
++            pipestatus=pipestatus,
++            message=message,
++            is_error=kind not in _NOT_AN_ERROR,
++            offer_correction=kind not in _NO_CORRECTION,
++            to_reader=kind is FailureClass.OTHER,
++            **kwargs,
++        )
++
++    # D without S: bash read the line but ran nothing (§4.1). For an empty line or a
++    # comment `$?` is the previous command's status, so it must not be classed.
++    if isinstance(result, CommandResult) and not result.ran:
++        return failure(FailureClass.NOT_RUN, "No command ran.")
++
++    if status == 0:
++        return failure(FailureClass.NONE, "")
++
++    # The first shell word of the confirmed command, with the router's tokenizer. The policy
++    # gate's parse (#12) replaces this once it exists.
++    word = first_token(command)
++    wrapper = posixpath.basename(word)
++    if status in WRAPPER_FAILURE_STATUS.get(wrapper, ()):
++        return failure(
++            FailureClass.PRIVILEGE_WRAPPER, _wrapper_message(wrapper, status), wrapper=wrapper
++        )
++
++    if status == NOT_FOUND:
++        certain = (
++            _is_simple(command, word)
++            and _is_shown_safely(word)
++            and snapshot is not None
++            and not _resolves(word, snapshot)
++        )
++        if not certain:
++            return failure(FailureClass.NOT_FOUND, "Command not found.")
++        packages = _packages(lookup, word)
++        if not packages:
++            message = f"Command not found: {word}."
++        else:
++            names = ", ".join(packages)
++            noun = "package" if len(packages) == 1 else "packages"
++            message = f"Command not found: {word}. It is provided by the {noun} {names}."
++        return failure(FailureClass.NOT_FOUND, message, command_word=word, packages=packages)
++
++    if status == NOT_EXECUTABLE:
++        return failure(
++            FailureClass.NOT_EXECUTABLE,
++            "The command was found but could not be run (permission or noexec).",
++        )
++
++    if status == INTERRUPTED:
++        return failure(
++            FailureClass.INTERRUPTED,
++            "Interrupted (Ctrl-C).",
++            signal_number=status - SIGNAL_BASE,
++            signal_name="SIGINT",
++        )
++
++    if SIGNAL_BASE < status <= SIGNAL_BASE + MAX_SIGNAL:
++        number = status - SIGNAL_BASE
++        name = _signal_name(number)
++        message = f"The command was killed by {name} (signal {number})."
++        if number == signal.SIGKILL:
++            message += (
++                " If nobody killed it, the kernel's out-of-memory (OOM) killer may have,"
++                " because the system ran out of memory."
++            )
++        return failure(FailureClass.SIGNAL, message, signal_number=number, signal_name=name)
++
++    return failure(FailureClass.OTHER, f"The command failed with exit status {status}.")
++
++
++def _wrapper_message(wrapper: str, status: int) -> str:
++    if wrapper == "pkexec":
++        if status == 126:
++            return "pkexec did not run the command: the authentication dialog was dismissed."
++        return (
++            "pkexec did not run the command: you are not authorized, or authentication "
++            "failed."
++        )
++    if wrapper == "su":
++        return (
++            "su failed with exit status 1: the password was wrong, or su could not run the "
++            "command."
++        )
++    return (
++        f"{wrapper} failed with exit status 1: the password was wrong, or you may not use "
++        f"{wrapper}. A command run under {wrapper} that exits with 1 looks the same."
++    )
++
++
++def _is_simple(command: str, word: str) -> bool:
++    """True when ``word`` is the only command whose status ``$?`` can be."""
++    if not word or any(mark in command for mark in _COMPOUND):
++        return False
++    if "=" in word or "/" in word:  # a leading assignment, or a path (no package for it)
++        return False
++    return word not in _COMMAND_WRAPPERS
++
++
++def _is_shown_safely(word: str) -> bool:
++    """No control, escape or bidi character, and short enough to show."""
++    return word.isprintable() and len(word) <= _MAX_SHOWN_WORD
++
++
++def _resolves(word: str, snapshot: Snapshot) -> bool:
++    """True when the session could have found ``word``, so its 127 came from elsewhere.
++
++    Uses the snapshot the control channel reported after the command: functions, aliases,
++    disabled builtins and ``$PATH``. When ``$PATH`` holds an empty or relative entry the
++    session's working directory would matter, which the snapshot doesn't carry, so the
++    word counts as found (no suggestion: the safe side).
++    """
++    if word in _BASH_KEYWORDS or word in snapshot.functions:
++        return True
++    if word in {m.group(1) for m in _ALIAS_LINE.finditer(snapshot.aliases)}:
++        return True
++    disabled = {m.group(1) for m in _DISABLED_LINE.finditer(snapshot.disabled_builtins)}
++    if word in BASH_BUILTINS and word not in disabled:
++        return True
++    for entry in snapshot.path.split(":"):
++        if not entry or not os.path.isabs(entry):
++            return True
++        candidate = os.path.join(entry, word)
++        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
++            return True
++    return False
++
++
++def _packages(lookup: Lookup | None, word: str) -> tuple[str, ...]:
++    if lookup is None:
++        return ()
++    names = lookup(word)
++    if isinstance(names, str):
++        names = (names,)
++    kept: list[str] = []
++    for name in names:
++        if isinstance(name, str) and _PACKAGE_NAME.fullmatch(name) and name not in kept:
++            kept.append(name)
++            if len(kept) == _MAX_PACKAGES:
++                break
++    return tuple(kept)
++
++
++def _signal_name(number: int) -> str:
++    try:
++        return signal.Signals(number).name
++    except ValueError:
++        if signal.SIGRTMIN < number < signal.SIGRTMAX:
++            return f"SIGRTMIN+{number - signal.SIGRTMIN}"
++        return f"signal {number}"
++
++
++def provider_lookup(provider: CommandProvider | None) -> Lookup:
++    """The package lookup the target's ``[command_provider]`` describes.
++
++    The data is opened read-only and never fetched (ADR-0003). When the target has no
++    provider or its data is absent or unreadable, the lookup returns nothing.
++    """
++
++    def lookup(word: str) -> tuple[str, ...]:
++        if provider is None or provider.format != "sqlite":
++            return ()
++        path = Path(provider.path)
++        if not path.is_file():
++            return ()
++        try:
++            uri = path.as_uri() + "?mode=ro"
++            with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as db:
++                rows = db.execute(provider.query, (word,)).fetchall()
++        except (sqlite3.Error, OSError, ValueError):
++            return ()
++        return tuple(row[0] for row in rows if row and isinstance(row[0], str))
++
++    return lookup
+diff --git a/src/nl_shell/targets.py b/src/nl_shell/targets.py
+index b250e75..6a689e2 100644
+--- a/src/nl_shell/targets.py
++++ b/src/nl_shell/targets.py
+@@ -30,6 +30,7 @@ TARGET_FILE = "target.toml"
+ SUPPORTED_SHELLS = ("bash",)  # ADR-0023 "Shells later"
+ UNKNOWN = "unknown"
+ MISMATCH_REASON = "target does not match this OS"
++COMMAND_PROVIDER_FORMATS = ("sqlite",)  # [command_provider] format (#62)
+ 
+ # A target id is a plain folder name: no separators, no `.` or `..`, nothing hidden.
+ _PLAIN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+@@ -61,6 +62,20 @@ class NoMatchingTarget(TargetError):
+         super().__init__(text)
+ 
+ 
++@dataclass(frozen=True)
++class CommandProvider:
++    """``[command_provider]``: local data that names the package providing a command (#62).
++
++    ``format`` is the kind of source (only ``sqlite``), ``path`` the absolute path of the
++    file, opened read-only, and ``query`` one SQL statement with a single ``?`` for the
++    command word that returns package names in its first column.
++    """
++
++    format: str
++    path: str
++    query: str
++
++
+ @dataclass(frozen=True)
+ class Target:
+     """One loaded ``target.toml``. ``fields`` is the whole parsed file, read-only."""
+@@ -75,6 +90,8 @@ class Target:
+     sudo_version: str
+     folder: Path
+     fields: Mapping[str, Any] = field(repr=False, compare=False)
++    # Optional: a target without it gives no package suggestion for "command not found".
++    command_provider: CommandProvider | None = None
+ 
+     def matches(self, release: Mapping[str, str]) -> bool:
+         """True when os-release ``ID`` and ``VERSION_ID`` equal this target's, exactly."""
+@@ -193,6 +210,25 @@ def _validate(doc: dict[str, Any], folder: Path, path: Path) -> Target:
+         raise TargetError(
+             f"{path}: `package_owner_query` must be a non-empty list of non-empty strings"
+         )
++    provider = None
++    if "command_provider" in doc:
++        source = table("command_provider")
++        kind = string(source, "format", "command_provider.format")
++        if kind not in COMMAND_PROVIDER_FORMATS:
++            raise TargetError(
++                f"{path}: command_provider.format {kind!r} is not supported "
++                f"(supported: {', '.join(COMMAND_PROVIDER_FORMATS)})"
++            )
++        data_path = string(source, "path", "command_provider.path")
++        if not Path(data_path).is_absolute():
++            raise TargetError(f"{path}: `command_provider.path` must be an absolute path")
++        sql = string(source, "query", "command_provider.query")
++        if sql.count("?") != 1:
++            raise TargetError(
++                f"{path}: `command_provider.query` must have exactly one `?` "
++                "(the command word)"
++            )
++        provider = CommandProvider(format=kind, path=data_path, query=sql)
+     return Target(
+         id=target_id,
+         display_name=display_name,
+@@ -204,6 +240,7 @@ def _validate(doc: dict[str, Any], folder: Path, path: Path) -> Target:
+         sudo_version=string(sudo, "version", "sudo.version"),
+         folder=folder,
+         fields=MappingProxyType(doc),
++        command_provider=provider,
+     )
+ 
+ 
+diff --git a/targets/ubuntu-26.04/target.toml b/targets/ubuntu-26.04/target.toml
+index d2e90a3..9ec1712 100644
+--- a/targets/ubuntu-26.04/target.toml
++++ b/targets/ubuntu-26.04/target.toml
+@@ -10,6 +10,13 @@
+ #                        no `ID_LIKE` or nearby-version fallback
+ #   [sudo]               the sudo implementation on this OS and the version nl-shell's sudo
+ #                        handling was checked against (ADR-0015)
++#   [command_provider]   optional: local data naming the package that provides a command, for
++#                        the "command not found" suggestion (#62). `format` is the kind of
++#                        source (only `sqlite`), `path` the file (opened read-only, never
++#                        fetched), `query` one SQL statement with a single `?` for the command
++#                        word that returns package names in its first column. Here: the
++#                        command-not-found database, tables commands(command, pkgID) and
++#                        packages(pkgID, name). No suggestion when the file is absent.
+ 
+ id = "ubuntu-26.04"
+ display_name = "Ubuntu 26.04 LTS"
+@@ -23,3 +30,10 @@ VERSION_ID = "26.04"
+ [sudo]
+ implementation = "sudo-rs"
+ version = "0.2.13"
++
++[command_provider]
++format = "sqlite"
++path = "/var/lib/command-not-found/commands.db"
++query = """
++SELECT packages.name FROM commands JOIN packages ON packages.pkgID = commands.pkgID
++WHERE commands.command = ? ORDER BY packages.name"""
+diff --git a/tests/test_failure_classes.py b/tests/test_failure_classes.py
+new file mode 100644
+index 0000000..e4101a0
+--- /dev/null
++++ b/tests/test_failure_classes.py
+@@ -0,0 +1,467 @@
++"""Failure classes by exit code (#62).
++
++The table uses completion results built directly (a ``session.CommandResult`` with a
++snapshot whose ``$PATH`` is a temporary folder the test controls) and a fake package
++lookup, so it never depends on the host's package data or programs, on sudo, or on a real
++failing command. No test runs sudo, su or pkexec. The modules this issue adds are imported
++inside the tests, never at module level, so the file still loads (and fails) on a tree
++without them. Only the real-lookup test may skip, when the host has no command-not-found
++data.
++"""
++
++import inspect
++import os
++from pathlib import Path
++
++import pytest
++
++REPO = Path(__file__).resolve().parents[1]
++
++FAKE_PROVIDERS = {
++    "htop": ["htop"],
++    "cat": ["coreutils"],
++    "make": ["make"],
++    "env": ["coreutils"],
++    "sudo": ["sudo"],
++    "timeout": ["coreutils"],
++    "npm": ["npm"],
++    "ll": ["ll-package"],
++    "mkfn": ["mkfn"],
++    "echo": ["coreutils"],
++}
++
++
++def fake_lookup(word):
++    return list(FAKE_PROVIDERS.get(word, []))
++
++
++def snapshot(path="", functions=(), aliases="", disabled=""):
++    from nl_shell.pty_protocol import Snapshot
++
++    return Snapshot(
++        seq=1,
++        functions=tuple(functions),
++        aliases=aliases,
++        traps="",
++        disabled_builtins=disabled,
++        extdebug="",
++        path=path,
++        stopped_jobs=0,
++        hooks="",
++        variables="",
++    )
++
++
++def completed(status, path, pipestatus=None, ran=True, **state):
++    """A ``CommandResult`` as ``Session.run`` builds it from the D record and snapshot."""
++    from nl_shell.session import CommandResult
++
++    return CommandResult(
++        seq=1,
++        ran=ran,
++        status=status,
++        pipestatus=pipestatus or (status,),
++        output=b"bash: htop: command not found\n",  # attacker-shaped; must not matter
++        output_truncated=False,
++        snapshot=snapshot(path=path, **state),
++        variables_changed=False,
++    )
++
++
++@pytest.fixture
++def bin_dir(tmp_path):
++    """An absolute, empty folder used as the session's whole ``$PATH``."""
++    folder = tmp_path / "bin"
++    folder.mkdir()
++    return folder
++
++
++def install(folder, name):
++    program = folder / name
++    program.write_text("#!/bin/sh\nexit 127\n", encoding="utf-8")
++    program.chmod(0o755)
++
++
++def classify(status, command, path, lookup=fake_lookup, **kwargs):
++    from nl_shell.failure_classes import classify as real_classify
++
++    return real_classify(completed(status, str(path), **kwargs), command, lookup)
++
++
++def kind(name):
++    from nl_shell.failure_classes import FailureClass
++
++    return FailureClass[name]
++
++
++# (id, status, command, class, packages, offer_correction, to_reader)
++TABLE = [
++    ("ok", 0, "htop", "NONE", (), False, False),
++    ("not-found-known", 127, "htop", "NOT_FOUND", ("htop",), True, False),
++    ("not-found-unknown", 127, "frobnicate --x", "NOT_FOUND", (), True, False),
++    ("not-found-pipeline", 127, "cat f | htop", "NOT_FOUND", (), True, False),
++    ("not-found-and-list", 127, "make && htop", "NOT_FOUND", (), True, False),
++    ("not-found-list", 127, "true; htop", "NOT_FOUND", (), True, False),
++    ("not-found-assignment", 127, "FOO=1 htop", "NOT_FOUND", (), True, False),
++    ("not-found-env", 127, "env htop", "NOT_FOUND", (), True, False),
++    ("not-found-substitution", 127, "echo $(htop)", "NOT_FOUND", (), True, False),
++    ("not-found-backtick", 127, "echo `htop`", "NOT_FOUND", (), True, False),
++    ("not-found-newline", 127, "true\nhtop", "NOT_FOUND", (), True, False),
++    ("not-found-under-sudo", 127, "sudo htop", "NOT_FOUND", (), True, False),
++    ("not-executable", 126, "./script.sh", "NOT_EXECUTABLE", (), True, False),
++    ("interrupted", 130, "sleep 100", "INTERRUPTED", (), False, False),
++    ("sigkill", 137, "big-job", "SIGNAL", (), True, False),
++    ("sigterm", 143, "big-job", "SIGNAL", (), True, False),
++    ("sudo-1", 1, "sudo apt update", "PRIVILEGE_WRAPPER", (), False, False),
++    ("sudo-path-1", 1, "/usr/bin/sudo apt update", "PRIVILEGE_WRAPPER", (), False, False),
++    ("doas-1", 1, "doas apt update", "PRIVILEGE_WRAPPER", (), False, False),
++    ("pkexec-126", 126, "pkexec apt update", "PRIVILEGE_WRAPPER", (), False, False),
++    ("pkexec-127", 127, "pkexec htop", "PRIVILEGE_WRAPPER", (), False, False),
++    ("su-1", 1, "su -c 'apt update'", "PRIVILEGE_WRAPPER", (), False, False),
++    ("other-1", 1, "grep x f", "OTHER", (), True, True),
++    ("other-2", 2, "ls /nope", "OTHER", (), True, True),
++    ("other-100", 100, "apt-get install x", "OTHER", (), True, True),
++    ("other-128", 128, "git x", "OTHER", (), True, True),
++    ("other-255", 255, "ssh host", "OTHER", (), True, True),
++    ("other-sudo-2", 2, "sudo ls /nope", "OTHER", (), True, True),
++]
++
++
++@pytest.mark.parametrize(
++    "status, command, cls, packages, offer, reader",
++    [row[1:] for row in TABLE],
++    ids=[row[0] for row in TABLE],
++)
++def test_classification_table(bin_dir, status, command, cls, packages, offer, reader):
++    result = classify(status, command, bin_dir)
++    assert result.kind is kind(cls)
++    assert result.status == status
++    assert result.packages == packages
++    assert result.offer_correction is offer
++    assert result.to_reader is reader
++
++
++def test_only_other_goes_to_the_reader(bin_dir):
++    for _, status, command, cls, *_rest in TABLE:
++        result = classify(status, command, bin_dir)
++        assert result.to_reader is (cls == "OTHER"), (status, command)
++
++
++def test_no_failure(bin_dir):
++    result = classify(0, "htop", bin_dir)
++    assert result.is_error is False
++    assert result.message == ""
++
++
++def test_not_found_suggests_the_package(bin_dir):
++    result = classify(127, "htop -d 5", bin_dir)
++    assert result.command_word == "htop"
++    assert result.packages == ("htop",)
++    assert "htop" in result.message
++    assert result.is_error is True
++
++
++def test_not_found_without_lookup_gives_no_suggestion(bin_dir):
++    assert classify(127, "htop", bin_dir, lookup=None).packages == ()
++
++
++# A 127 from a first word bash DID find came from whatever that word ran: suggesting the
++# first word's package would be a confident wrong answer.
++@pytest.mark.parametrize(
++    "command, installed, state",
++    [
++        ("timeout 5 frobnicate", "timeout", {}),
++        ("npm run build", "npm", {}),
++        ("ll", None, {"aliases": "alias ll='ls -l --frob'\n"}),
++        ("mkfn", None, {"functions": ("mkfn",)}),
++        ("eval frobnicate", None, {}),
++    ],
++    ids=["program-on-path", "npm-script", "alias", "function", "builtin"],
++)
++def test_not_found_from_a_found_first_word_gives_no_suggestion(
++    bin_dir, command, installed, state
++):
++    if installed:
++        install(bin_dir, installed)
++    result = classify(127, command, bin_dir, **state)
++    assert result.kind is kind("NOT_FOUND")
++    assert result.packages == ()
++    assert result.command_word is None
++    assert result.message == "Command not found."
++
++
++def test_disabled_builtin_can_be_not_found(bin_dir):
++    # `enable -n echo` and no echo on $PATH: bash really did not find `echo`.
++    result = classify(127, "echo hi", bin_dir, disabled="enable -n echo\n")
++    assert result.packages == ("coreutils",)
++
++
++@pytest.mark.parametrize("path", ["", "relative/bin", "{bin}:", "{bin}::/x"])
++def test_path_with_cwd_entry_gives_no_suggestion(bin_dir, path):
++    # An empty or relative $PATH entry depends on the session's directory, which the
++    # snapshot doesn't carry: the word may have been found, so no suggestion.
++    result = classify(127, "htop", path.format(bin=bin_dir))
++    assert result.packages == ()
++
++
++def test_bare_done_record_gives_no_suggestion():
++    from nl_shell.failure_classes import classify as real_classify
++    from nl_shell.pty_protocol import Done
++
++    result = real_classify(Done(seq=1, status=127, pipestatus=(127,)), "htop", fake_lookup)
++    assert result.kind is kind("NOT_FOUND")
++    assert result.packages == ()
++    assert result.to_reader is False
++
++
++def test_bare_done_record_classifies():
++    from nl_shell.failure_classes import classify as real_classify
++    from nl_shell.pty_protocol import Done
++
++    assert real_classify(Done(1, 1, (1,)), "sudo apt update").kind is kind(
++        "PRIVILEGE_WRAPPER"
++    )
++    assert real_classify(Done(1, 2, (2,)), "ls /nope").kind is kind("OTHER")
++
++
++@pytest.mark.parametrize("status", [0, 1, 2, 127, 130])
++@pytest.mark.parametrize("command", ["", "# a note", "if then"])
++def test_nothing_ran_is_not_classed(bin_dir, status, command):
++    # D without S (protocol §4.1): `$?` may be an earlier command's status.
++    result = classify(status, command, bin_dir, ran=False)
++    assert result.kind is kind("NOT_RUN")
++    assert result.is_error is False
++    assert result.offer_correction is False
++    assert result.to_reader is False
++    assert "not found" not in result.message.lower()
++
++
++@pytest.mark.parametrize(
++    "word",
++    ["\x1b[2Jfoo", "foo‮gnp", "a" * 65, "x\x07"],
++    ids=["escape", "bidi-override", "65-chars", "bell"],
++)
++def test_unsafe_word_reaches_no_message(bin_dir, word):
++    result = classify(127, word, bin_dir, lookup=lambda w: ["htop"])
++    assert result.kind is kind("NOT_FOUND")
++    assert result.message == "Command not found."
++    assert result.packages == ()
++    assert result.command_word is None
++    assert "None" not in result.message
++
++
++def test_64_char_word_is_shown(bin_dir):
++    word = "a" * 64
++    result = classify(127, word, bin_dir, lookup=lambda w: ["htop"])
++    assert result.command_word == word
++    assert result.packages == ("htop",)
++    assert result.message == f"Command not found: {word}. It is provided by the package htop."
++
++
++def test_not_executable_message(bin_dir):
++    assert "permission or noexec" in classify(126, "./script.sh", bin_dir).message
++
++
++def test_interrupted_is_not_an_error(bin_dir):
++    result = classify(130, "sleep 100", bin_dir)
++    assert result.offer_correction is False
++    assert result.is_error is False
++    assert "error" not in result.message.lower()
++    assert "fail" not in result.message.lower()
++
++
++def test_sigkill_names_the_signal_and_the_oom_killer(bin_dir):
++    result = classify(137, "big-job", bin_dir)
++    assert (result.signal_number, result.signal_name) == (9, "SIGKILL")
++    assert "SIGKILL" in result.message
++    assert "out-of-memory" in result.message
++
++
++def test_sigterm(bin_dir):
++    result = classify(143, "big-job", bin_dir)
++    assert (result.signal_number, result.signal_name) == (15, "SIGTERM")
++    assert "SIGTERM" in result.message
++    assert "out-of-memory" not in result.message
++
++
++def test_sudo_failure_message_never_reruns_sudo(bin_dir):
++    result = classify(1, "sudo apt update", bin_dir)
++    assert result.wrapper == "sudo"
++    assert "password was wrong" in result.message
++    assert "may not use sudo" in result.message
++    assert result.offer_correction is False
++    assert result.to_reader is False
++    lowered = result.message.lower()
++    for phrase in ("sudo -", "sudo apt", "try again", "re-run", "rerun", "run it again"):
++        assert phrase not in lowered
++    # A fixed template: the same text whatever command ran under sudo.
++    assert classify(1, "sudo systemctl restart x", bin_dir).message == result.message
++
++
++def test_pipestatus_is_kept_and_status_is_the_last_command(bin_dir):
++    result = classify(1, "false | true | grep x", bin_dir, pipestatus=(1, 0, 1))
++    assert result.pipestatus == (1, 0, 1)
++    assert result.status == 1
++
++
++def test_bare_int_raises_type_error():
++    from nl_shell.failure_classes import classify as real_classify
++
++    with pytest.raises(TypeError):
++        real_classify(127, "htop", fake_lookup)
++
++
++def test_signature_takes_no_stderr_or_output():
++    from nl_shell.failure_classes import classify as real_classify
++
++    names = list(inspect.signature(real_classify).parameters)
++    assert names
++    for name in names:
++        assert "stderr" not in name.lower()
++        assert "output" not in name.lower()
++
++
++def test_classifier_source_names_no_os():
++    from nl_shell import failure_classes
++
++    text = Path(failure_classes.__file__).read_text(encoding="utf-8")
++    for needle in ("/var/", "/usr/", "commands.db", "ubuntu"):
++        assert needle not in text.lower(), needle
++
++
++# "htop\n" separates re.fullmatch from a `$`-anchored re.match, which accepts one trailing
++# newline.
++@pytest.mark.parametrize("name", ["HTOP", "htop; rm -rf ~", "htop\nevil", "-htop", "htop\n"])
++def test_bad_provider_names_are_dropped(bin_dir, name):
++    result = classify(127, "htop", bin_dir, lookup=lambda word: [name])
++    assert result.kind is kind("NOT_FOUND")
++    assert result.packages == ()
++
++
++@pytest.mark.parametrize("name", ["libc6", "g++", "python3.12"])
++def test_good_provider_names_are_kept(bin_dir, name):
++    assert classify(127, "htop", bin_dir, lookup=lambda word: [name]).packages == (name,)
++
++
++def test_target_loader_reads_command_provider():
++    from nl_shell import targets
++
++    target = targets.load("ubuntu-26.04")
++    provider = target.command_provider
++    assert provider is not None
++    assert provider.format == "sqlite"
++    assert Path(provider.path).is_absolute()
++    assert provider.query.count("?") == 1
++
++
++TARGET_BASE = """\
++id = "testos-1"
++display_name = "Test OS 1"
++shell = "bash"
++package_owner_query = ["owner-of"]
++
++[os_release]
++ID = "testos"
++VERSION_ID = "1"
++
++[sudo]
++implementation = "test-sudo"
++version = "1.0"
++"""
++
++
++def write_target(root, extra=""):
++    folder = root / "testos-1"
++    folder.mkdir()
++    # A bare key must come before the first table, or TOML puts it inside that table.
++    text = TARGET_BASE + extra if extra.startswith("[") else extra + TARGET_BASE
++    (folder / "target.toml").write_text(text, encoding="utf-8")
++
++
++def test_command_provider_is_optional(tmp_path):
++    from nl_shell import targets
++
++    write_target(tmp_path)
++    assert targets.load("testos-1", tmp_path).command_provider is None
++
++
++@pytest.mark.parametrize(
++    "extra, error",
++    [
++        ('command_provider = "x"\n', "must be a table"),
++        ('[command_provider]\nformat = "csv"\npath = "/x"\nquery = "?"\n', "not supported"),
++        ('[command_provider]\nformat = "sqlite"\npath = "x.db"\nquery = "?"\n', "absolute"),
++        ('[command_provider]\nformat = "sqlite"\npath = "/x"\nquery = "select 1"\n', "`?`"),
++        ('[command_provider]\nformat = "sqlite"\nquery = "?"\n', "command_provider.path"),
++    ],
++    ids=["not-table", "format", "relative-path", "no-placeholder", "missing-path"],
++)
++def test_command_provider_is_validated(tmp_path, extra, error):
++    from nl_shell import targets
++
++    write_target(tmp_path, extra)
++    with pytest.raises(targets.TargetError, match=error):
++        targets.load("testos-1", tmp_path)
++
++
++def test_provider_lookup_reads_sqlite_read_only(tmp_path):
++    import sqlite3
++
++    from nl_shell.failure_classes import provider_lookup
++    from nl_shell.targets import CommandProvider
++
++    db = tmp_path / "c.db"
++    with sqlite3.connect(db) as conn:
++        conn.execute("CREATE TABLE t (cmd TEXT, pkg TEXT)")
++        conn.execute("INSERT INTO t VALUES ('htop', 'htop')")
++    conn.close()
++    lookup = provider_lookup(
++        CommandProvider("sqlite", str(db), "SELECT pkg FROM t WHERE cmd = ?")
++    )
++    assert lookup("htop") == ("htop",)
++    assert lookup("nope") == ()
++    # Read-only: a writing query fails inside the lookup and gives nothing.
++    writer = provider_lookup(
++        CommandProvider("sqlite", str(db), "INSERT INTO t VALUES (?, 'x') RETURNING pkg")
++    )
++    assert writer("evil") == ()
++    with sqlite3.connect(db) as conn:
++        assert conn.execute("SELECT count(*) FROM t").fetchone() == (1,)
++    conn.close()
++
++
++def test_provider_lookup_without_data_returns_nothing(tmp_path):
++    from nl_shell.failure_classes import provider_lookup
++    from nl_shell.targets import CommandProvider
++
++    missing = CommandProvider("sqlite", str(tmp_path / "absent.db"), "SELECT 1 WHERE ? = 1")
++    assert provider_lookup(missing)("htop") == ()
++    assert provider_lookup(None)("htop") == ()
++    assert not (tmp_path / "absent.db").exists()
++
++
++def test_real_target_lookup_finds_htop():
++    from nl_shell import targets
++    from nl_shell.failure_classes import provider_lookup
++
++    provider = targets.load("ubuntu-26.04").command_provider
++    assert provider is not None
++    if not Path(provider.path).is_file():
++        pytest.skip(f"no command-not-found data at {provider.path}")
++    assert "htop" in provider_lookup(provider)("htop")
++
++
++def test_real_lookup_with_session_path_skips_found_wrapper(bin_dir):
++    # The reviewer's case end to end: `timeout` is on the session's $PATH, so a 127 from
++    # `timeout 5 frobnicate` names no package, even with the real lookup.
++    from nl_shell import targets
++    from nl_shell.failure_classes import classify as real_classify
++    from nl_shell.failure_classes import provider_lookup
++
++    install(bin_dir, "timeout")
++    lookup = provider_lookup(targets.load("ubuntu-26.04").command_provider)
++    result = real_classify(
++        completed(127, os.fspath(bin_dir)), "timeout 5 frobnicate", lookup
++    )
++    assert result.packages == ()
++    assert "timeout" not in result.message

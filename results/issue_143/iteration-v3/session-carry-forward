@@ -1,0 +1,4 @@
+Production code is correct and reviewed clean; the only reason to iterate is a test gap in the hidden-character vectors.
+tests/test_backend.py `HIDDEN` (around lines 493-503) tests only one point per range, so narrowing `render.is_hidden` (src/nl_shell/render.py:39-47) would not turn the suite red.
+Add these boundary vectors as inputs (proposal rejection and :context escaping): U+0000, U+001F, U+009B (C1 CSI), U+061C, U+2029, U+E007F.
+Keep production code unchanged unless one of the new vectors actually fails. Do not widen scope: blank glyphs, non-ASCII whitespace and duplicate YAML keys stay out (#144 / notes).
