@@ -1,0 +1,8 @@
+Rebuild the same slice; fix the v4 Check findings, keep the v3 brief's design.
+1. Slowdown (C4/T3 red): `_bracket_command` (parse.py:678-708) rescans per ERROR node -> quadratic. 8 KiB `$[` goes 0.43 s -> 5.85 s, `[$[` 19 s. Compute word starts/ends once per source, make `_unquoted_bracket` linear, cache misses too. Do not loosen the 5 s test.
+2. Bypass: `coproc sud[o] -i` / typed `echo pw | coproc sud? -S true` not rejected. Give `coproc` a runs-command-at row (or equivalent) so decision D reaches its command word. Add both tests.
+3. Bypass: `{ sud[o] -i; }`, `echo pw | { sud[o] -S true; }`, `f() { sud[o] -i; }; f` not caught. The ERROR node starts at `{`; check every word start inside the node (skip leading reserved words), not only node.start_byte. Add tests.
+4. Bypass (High): attached / `=` text-option values are not scanned: `env -S'sudo -i'`, `env --split-string='sudo -i'`, `script -c'sudo -i'`, `script --command='sudo -i'`, and piped `-S true` forms. Scan the parsed option values, not the raw argv words. Add tests for the attached and `=` forms of every text option on a runs-text row, typed-with-pipe and proposal.
+5. Unreadable first word in text-effect scan (`eval 'sud? -i'`, `bash -c 'sud[o] -i'`, `env -S 'sud? -i'`): treat it as decision D's unreadable word in `_text_scan` (rules.py:527-531) so the threat-model sudo sentence stays true.
+Not decided at this sign-off: opaque wrappers with no row (`chrt 1 sud? -i`, ionice, taskset, nsenter, ...) and the double-unquoting `eval "\$'\\x73udo' -i"` case (child-2 / #205). Follow the brief as written for these.
+Human chose iterate-do over the size backstop's iterate-plan suggestion (patch 232 KB, attempt 4).

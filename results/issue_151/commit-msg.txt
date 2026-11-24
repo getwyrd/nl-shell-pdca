@@ -1,0 +1,26 @@
+Add a client that asks a local model server for proposals
+
+The REPL can already turn a natural-language request into a model input
+and parse a proposal from the answer, but nothing could send that input to
+a real model: the only backend was the test stub. This adds
+nl_shell.teacher_client.TeacherClient, a backend that posts the request to
+an OpenAI-compatible /v1/chat/completions endpoint (llama.cpp's
+llama-server or vLLM, no API key) over a Unix socket or an http(s) URL and
+returns the raw answer text for the existing strict proposal parser.
+
+A model server that is down, slow, broken or hostile must not end the
+shell session or write its own text to the terminal. So:
+
+- one total deadline covers name lookup, connect, TLS, send and read,
+  including a server that drips bytes or chunk headers;
+- redirects are never followed, proxies are not read, TLS checks the
+  certificate and host name, and the response size is capped;
+- every failure is a new backend.BackendError; Repl._propose catches it
+  and shows one fixed reply, and any server text in that reply is folded
+  to one line, cut to 200 characters and escaped.
+
+The reply texts are interim until the "model unavailable" state of
+ADR-0018 section 7 is built. Nothing wires the client into the CLI yet;
+choosing the endpoint from config comes in a follow-up.
+
+Fixes #151

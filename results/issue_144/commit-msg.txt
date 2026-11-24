@@ -1,0 +1,35 @@
+Reject blank and invisible Unicode in proposed commands
+
+A model's proposed command could carry characters that print as nothing or
+as a blank, such as U+3164 HANGUL FILLER, variation selectors, U+2800
+BRAILLE BLANK, no-break spaces or private-use code points. "ls" followed by
+U+3164 is a different word to bash than "ls", but it looked the same at the
+confirm step, so the user could approve something other than what they read.
+Long stacks of combining marks (e followed by many U+0301) could also draw
+over nearby characters.
+
+The hidden-character check that came with the proposal parser (#143) used a
+short hand-picked list and missed all of these. It is now defined by Unicode
+properties, following UTS #39 (Unicode Security Mechanisms): every control,
+format (Cf), private-use (Co) and unassigned (Cn) code point, every
+Default_Ignorable_Code_Point, every White_Space character other than space,
+LF and TAB, plus a short named list of known blank glyphs (U+2800, U+1D159,
+U+16FE4, U+13441, U+13442). A run of more than two combining marks is also
+refused. A command holding either is rejected wherever it appears, inside
+quotes or not. Every display path (proposals, :context, errors) escapes the
+same characters, and only the third and later marks of a run, through the
+one shared predicate.
+
+The properties come from vendored Unicode 16.0.0 tables in
+src/nl_shell/_unicode_tables.py, not from Python's unicodedata, so the
+policy is the same on every supported Python (3.12 and 3.13 ship older
+Unicode data). scripts/gen_unicode_tables.py regenerates the tables from the
+UCD files in /usr/share/unicode/ and refuses to run on any version other
+than 16.0.0.
+
+Ordinary non-Latin text (Cyrillic, Greek, Japanese, accented Latin) is
+still accepted and shown unchanged. Look-alike letters and words that mix
+scripts are not caught here; the threat model now says so, and the
+mixed-script rule is left to the parser-based policy gate (#12).
+
+Fixes #144

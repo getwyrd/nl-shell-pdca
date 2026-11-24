@@ -1,0 +1,25 @@
+Review #120: keep idle PTY background output in a bounded session buffer without leaking it to the terminal or later command results, including after interrupted runs.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | NEEDS-HUMAN | Accept the widened discard boundary — the added timeout-free wait and up-to-50-ms settling interval lose more background bytes than the brief's first-read boundary; target/docs/design/specs/pty-protocol/v1.md:494 and brief.md:136. |
+| C2 Reproduction (red pre-fix) | PASS | Frozen real-PTY evidence shows six failures with production reverted, including two actual background-job completion timeouts rather than collection errors; gate-logs/C4-verify.log:14. |
+| C3 Change | PASS | The change stays within session buffering, tests and its security/specification contract; terminal display remains a later integration, target/src/nl_shell/session.py:811 and target/.oss-scanner/threat_model.md:153. |
+| C4 Verification (red→green) | PASS | Captured gate output establishes 26 green tests versus six red production-revert failures; local repetition is unavailable because python3 lacks pytest, so this verdict relies on gate-logs/C4-verify.log:10. |
+| C5 Causal adequacy | PASS | Continuous idle consumption removes the unread-PTY cause; unconditional restart and pre-paste disarming address the carried-forward exception defect, with explicit regression coverage; target/src/nl_shell/session.py:948, target/src/nl_shell/session.py:962 and target/tests/test_session_terminal.py:806. |
+| T1 Structure | PASS | Exclusive reader handover and locked bounded storage give clear ownership without a second simultaneous PTY consumer; target/src/nl_shell/session.py:530 and target/src/nl_shell/session.py:846. |
+| T2 Shape | PASS | The threat model records both buffering protection and residual output loss, matching the affected security surface; target/.oss-scanner/threat_model.md:153 and target/.oss-scanner/threat_model.md:273; captured scanner agrees at gate-logs/T2-threat-model.log:10. |
+| T3 Runtime | PASS | Frozen full-suite evidence is 1107 passed, one skipped with forkpty warnings; independent local syntax, buffer overflow/count/take assertions and documentation links passed, but local pytest execution was unavailable; gate-logs/T3-suite.log:37. |
+| T4 Contribution | N/A | Contribution artifacts are absent by design; their substantive audit must run at publish, as recorded in gate-logs/T4-contribution.log:10. |
+| T5 Judgment | NEEDS-HUMAN | Confirm prior art for all affected paths in merged history and closed/rejected work — the brief records only a session-terminal history query, while the supplied repository has one synthetic base commit and no remotes, preventing independent completion; brief.md:113 and target/src/nl_shell/session.py:830. |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Accept session-only delivery and the documented output-loss window — confirm notices and filtered prompt display remain #74/#78, so end-user conformance is incomplete; target/docs/design/specs/pty-protocol/v1.md:548 and target/.oss-scanner/threat_model.md:156. |
+
+Evidence limits: the supplied target is readable and contains the patch. No target-state defect was found. Python 3.14.4 is available, but `python3 -m pytest tests/test_session_terminal.py -q --basetemp=/tmp/pdca-review-lh1ncz7o/pytest-green` exits with `No module named pytest`; `python` is absent. Consequently no stash/revert test was performed, and C2/C4/T3 are adjudicated from the complete frozen logs, not claimed as independently reproduced. The logs exercise real bash/PTys rather than a replacement tool or curated buffer fixture; no undischarged external dependency is established by the supplied evidence.
+
+Independent checks: extracted and executed the actual `_Background` class using Python's AST and threading module; a 1-MiB payload retained exactly 65536 bytes, reported 983040 dropped bytes, and cleared on take. Both changed Python files parsed. `python3 scripts/docs_links.py` reported 64 links across 57 Markdown files with zero broken. `scripts/docs_checks.py` without arguments only printed its required `immutability BASE HEAD` usage and supplied no substantive verdict. Gate wrappers are instance-scoped and unavailable here; their complete captured outputs were read. No INTEGRATION.md was supplied, so no project-specific human-only list could be inspected.
+
+The capability-probe smell test did not fire: the added syscall observation determines the output attribution boundary; it does not mask an eager optional-capability side effect. The boundary expansion is nevertheless a human scope decision under C1. No builder-fixable defect was established in this review.
+
+For later integration acceptance, run `python3 -m pytest tests/test_session_terminal.py -q` in an environment with the declared development dependencies; the current tests exercise screen exclusion, idle writer completion, overflow accounting, exception recovery and reader shutdown. They do not establish the deferred confirm notice or filtered prompt rendering.
+
+<!-- pdca:leaf-complete -->

@@ -1,0 +1,26 @@
+Review adding the fixed-rule relative Markdown link check to nl-shell CI, including the three regression tests required by iteration 3.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The fixed parsing rule and explicit exclusions make success decidable, with three concrete regression obligations in the final carry-forward (brief.md:73; target/tests/test_docs_links.py:113). |
+| C2 Reproduction (red pre-fix) | PASS | Independently stashing the new production script makes all 39 parameterized cases fail; frozen pytest evidence separately records 42 assertion failures without collection errors (review-rerun.json:7; gate-logs/C4-verify.log:14). |
+| C3 Change | PASS | The patch is limited to the separate link checker, its tests, and the CI step after the existing freeze check; the sibling freeze implementation is untouched (patch.diff:1; target/.github/workflows/docs-checks.yml:45). |
+| C4 Verification (red→green) | PASS | Independent direct subprocess checks reproduced 39 failures without the script and 39 passes after restoration; the frozen gate records all 42 pytest cases green then red (review-rerun.json:1; gate-logs/C4-verify.log:10). |
+| C5 Causal adequacy | PASS | Missing tracked destinations now produce actionable failures, and each requested quote-strip, longer-close, and nested-image mutation changes the expected result; no capability probe masks an eager cause (target/scripts/docs_links.py:313; target/tests/test_docs_links.py:113; review-mutations.json:1). |
+| T1 Structure | PASS | The stdlib checker remains outside the shipped package, and subprocess tests exercise real temporary git repositories with explicit identity (target/scripts/docs_links.py:43; target/tests/test_docs_links.py:21; target/tests/test_docs_links.py:35). |
+| T2 Shape | PASS | CI retains pull_request, read-only contents permission, and the existing checkout/freeze step; the frozen scanner reports no security-relevant path touched (target/.github/workflows/docs-checks.yml:9; gate-logs/T2-threat-model.log:10). |
+| T3 Runtime | PASS | The frozen suite log shows 148 passing tests; independent execution on this target reports 60 relative links in 53 Markdown files with zero broken (gate-logs/T3-suite.log:14; review-rerun.json:56; target/scripts/docs_links.py:287). |
+| T4 Contribution | N/A | Contribution artifacts are intentionally absent at Check; the substantive contribution audit is deferred to its mandatory publish rerun (gate-logs/T4-contribution.log:10). |
+| T5 Judgment | NEEDS-HUMAN | Confirm affected-path prior art across merged history and closed/rejected work, and supply any applicable INTEGRATION.md §4 obligations — this target contains only one synthetic base commit, no remote, and no integration-policy file, so those checks cannot be established from the supplied evidence (target/AGENTS.md:24; patch.diff:1). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Confirm decision 5's deliberately limited parser remains suitable for documentation CI and confirm the draft PR workflow succeeds — executable parser checks pass, but the bundle contains no hosted workflow result and does not establish product acceptance (brief.md:12; target/scripts/docs_links.py:27; target/.github/workflows/docs-checks.yml:47). |
+
+Independent evidence and limits:
+
+- The supplied target is readable and contains the prerequisite freeze workflow. There is no stale-target caveat. Source citations above are grounded in that target; bundle and log citations identify supplied evidence.
+- `/usr/bin/python3` is Python 3.14.4, but pytest is unavailable locally (`No module named pytest`). Accordingly, the full pytest verdicts rely on the actual captured C4 and T3 execution logs, not an asserted local suite rerun. The instance-scoped wrappers were not sought in other checkouts. The frozen evidence shows a real pytest run, not a substituted tool or an unmet external dependency.
+- Independently extracted the 39 parameterized fixtures from the test source using the stdlib AST parser, created committed git fixtures inside this review root, and ran the real script via `python3 -I`. All 39 passed, all 39 failed while only the production script was stashed, and all 39 passed after stash restoration. This reproduces the new-check absence, not a claim that the old implementation misparsed links. The live scan also passed. Full results: `review-rerun.json`.
+- Evaluated three temporary in-memory mutations of the production parser without editing the submitted code: removing quote stripping exposes `missing.md`; replacing `>=` with `==` hides `after-longer.md`; skipping nested-link rescanning hides `missing.png`. The original parser produces the expected results in all three cases. Full results: `review-mutations.json`.
+- Ran `git diff --check` successfully. The target's submitted files were restored after the red leg. No implementation changes were made.
+- Ran affected-path history inspection for `scripts/docs_links.py`, `tests/test_docs_links.py`, and `.github/workflows/docs-checks.yml`: only `ca7c4d3 pre-fix base a972610a6ed1f9dc2c7571258120402d398a9f56` is available; `git remote -v` is empty. No closed/rejected-work evidence or INTEGRATION.md is supplied. Prior-art confirmation therefore remains owed rather than being reported as completed.
+
+<!-- pdca:leaf-complete -->

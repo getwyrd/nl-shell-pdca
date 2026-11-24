@@ -1,0 +1,23 @@
+Review the deterministic exit-code failure classifier, including privilege suppression and safe injected package suggestions (#155, child of #62).
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The brief defines precedence, trusted inputs, accepted overmatching and provider boundaries sufficiently to assess this child; human policy reconfirmation remains due at validation (brief.md:26, brief.md:44). |
+| C2 Reproduction (red pre-fix) | PASS | Frozen evidence shows 148 assertion-phase failures and one pass without the production module, with no collection/setup errors; local pytest is unavailable (gate-logs/C4-verify.log:3343). |
+| C3 Change | PASS | The two added files stay within the specified classifier/test scope and consume the real CommandResult rather than a replacement protocol type (target/src/nl_shell/failure_classes.py:134, target/tests/test_failure_classes.py:41). |
+| C4 Verification (red→green) | PASS | Frozen gate output establishes 149 focused passes versus 148 pre-fix failures; independent pytest rerun failed because this host has no pytest, so this verdict relies on captured evidence, not a fresh suite run (gate-logs/C4-verify.log:14, gate-logs/C4-verify.log:3343). |
+| C5 Causal adequacy | NEEDS-HUMAN [impl] | Correct ANSI-C NUL handling and add a regression: independently reproduced classify(status=1, command="$'sudo\\0ignored' x") returning OTHER with both correction and reader enabled, although Bash printf confirms that quoted word becomes sudo; decode must respect Bash's NUL truncation (target/src/nl_shell/failure_classes.py:231, target/src/nl_shell/failure_classes.py:240, target/src/nl_shell/failure_classes.py:165). |
+| T1 Structure | PASS | The classifier separates precedence, privilege matching, suggestion eligibility and display filtering; no caller/provider integration is pulled into this child (target/src/nl_shell/failure_classes.py:134, target/src/nl_shell/failure_classes.py:297). |
+| T2 Shape | PASS | The frozen scanner reports no security-relevant path touched under its configured rules; trusted-output isolation and display filtering are explicit, while the privilege edge case is recorded under C5 (gate-logs/T2-threat-model.log:10, target/src/nl_shell/failure_classes.py:359). |
+| T3 Runtime | PASS | Full captured suite output reports 801 passes with one forkpty deprecation warning; local pytest is missing, preventing an independent full-suite rerun (gate-logs/T3-suite.log:30). |
+| T4 Contribution | N/A | Contribution artifacts are absent by design at Check; the substantive contribution audit must rerun at publish (gate-logs/T4-contribution.log:10). |
+| T5 Judgment | NEEDS-HUMAN | Establish affected-path prior art across merged history and closed/rejected work before sign-off; git log --all for both added paths returns no entries in this one-commit snapshot, no remote is configured, and no frozen prior-art evidence or INTEGRATION.md is supplied (target/src/nl_shell/failure_classes.py:1, target/tests/test_failure_classes.py:1). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Reconfirm the four binding policy decisions, particularly suppressing correction for any matching word, and accept this classifier-only delivery boundary; those product tradeoffs require human sign-off (brief.md:26, brief.md:33, brief.md:44). |
+
+Independent edge-case check used the actual CommandResult and Snapshot classes from the target, with status 1 and empty output. It returned `FailureClass.OTHER True True` for the literal confirmed text `$'sudo\0ignored' x`. Running `bash --noprofile --norc -c "printf '<%s>\\n' \$'sudo\\0ignored'"` printed `<sudo>`, exit 0; no privileged executable was run. The ANSI-C decoder currently retains the decoded NUL and suffix, so basename matching misses the program. Truncate each decoded ANSI-C quoted segment at its first NUL and test the resulting privilege classification.
+
+Local verification attempt: `python3 -m pytest -q -p no:cacheprovider tests/test_failure_classes.py` could not start (`No module named pytest`). Consequently no stash/revert was performed: without a test runner, changing the disposable tree would not produce independent red/green evidence. All four frozen gate logs were read; their wrapper paths are instance-scoped. The focused and suite PASS verdicts above are explicitly log-based. Injected lookup fixtures implement the brief's intended unit-test boundary; the real package provider is outside this child's scope, not an unmet external dependency.
+
+The C5 capability-probe smell test found no probe masking a load-time capability requirement. The remaining C5 issue is a directly observed decoding defect. This report is advisory and does not decide acceptance.
+
+<!-- pdca:leaf-complete -->

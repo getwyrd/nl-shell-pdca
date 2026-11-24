@@ -1,0 +1,9 @@
+Human chose iterate-do and explicitly overrode the size-backstop recommendation (iterate-plan); do not re-split this round.
+Fix the confirmed bypasses from round-3 adversary/security review, each with a test:
+- Here-doc delimiter with quotes (<<E"F", <<$'E', <<\E): compute bash's quote-removed delimiter; fail closed if a body line equals it or heredoc_end differs; fail closed on a here-doc inside an ERROR tree (incl. `cat <<E;cat <<F` on one line).
+- Descriptor paths: reject globbed redirect targets (>/dev/f?/3, >>/d*/fd/3) and /proc/<x>/root/ (and task/<tid>/root) prefixes (>/proc/self/root/dev/fd/3, >/proc/self/root/proc/self/fd/3).
+- Named fd with array subscript ({a[0]}>&-, {a[0]}>x) must be rejected.
+- Line continuation inside double quotes after $ or backquote ("$\<newline>(rm x)") must fail closed.
+- bash 5.3 funsub ${ cmd; } / ${| cmd; } (also in here-doc bodies) must fail closed.
+- Correct the threat-model "linear time" claim (tree-sitter parse is quadratic on "${"*n, ~2.3 s at the 64 KiB cap).
+Open scope questions NOT decided by the human this round (non-literal redirect targets like >$F; ((PATH=0)) arithmetic assignments): do not widen behaviour for them; keep the threat-model wording accurate to what the code actually rejects.

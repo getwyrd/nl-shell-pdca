@@ -1,0 +1,349 @@
+diff --git a/docs/design/architecture/01-introduction-and-goals.md b/docs/design/architecture/01-introduction-and-goals.md
+index 781858a..5b4ad69 100644
+--- a/docs/design/architecture/01-introduction-and-goals.md
++++ b/docs/design/architecture/01-introduction-and-goals.md
+@@ -13,7 +13,7 @@ tags:
+ 
+ ## 1.1 What this is
+ 
+-nl-shell is a natural-language REPL for Ubuntu 26.04. You type what you want; a small model
++nl-shell is a natural-language REPL whose first and currently only OS target is Ubuntu 26.04 (ADR-0023). You type what you want; a small model
+ running on your own GPU proposes a bash command; a deterministic policy gate decides whether
+ it runs directly or waits for your confirmation; a persistent bash session runs it.
+ 
+@@ -34,14 +34,14 @@ the command that runs, and the password never reaches the model, a log or the hi
+ | 1 | **Safety** | No unconfirmed mutating or privileged command; no secret leaks; untrusted text cannot steer a command past the gate |
+ | 2 | **Locally complete** | Works with the network unplugged; no cloud, keys or telemetry (ADR-0003) |
+ | 3 | **Fast** | Sub-second proposals on any 16 GB NVIDIA or AMD card; functional on CPU |
+-| 4 | **Knows 26.04** | Proposes the 26.04 way (sudo-rs, uutils, Wayland, systemd) without lookups |
++| 4 | **Knows the target (initially 26.04)** | For `ubuntu-26.04`, proposes the 26.04 way (sudo-rs, uutils, Wayland, systemd) without lookups |
+ | 5 | **Installable** | Anyone with a supported GPU installs it without training anything |
+ 
+ When goals conflict, the lower number wins: a slower confirm beats an unsafe shortcut.
+ 
+ ## 1.4 Stakeholders and target users
+ 
+-- **Users:** Ubuntu 26.04 desktop users who know roughly what they want but not the exact
++- **Users (first target):** Ubuntu 26.04 desktop users who know roughly what they want but not the exact
+   command, and experienced users who want to type less. They have a 16 GB NVIDIA or AMD
+   card, or accept slow CPU-only mode.
+ - **Developer:** builds the teacher/student pipeline on their own hardware (section 7).
+diff --git a/docs/design/architecture/02-constraints.md b/docs/design/architecture/02-constraints.md
+index 33e90e7..79e22e6 100644
+--- a/docs/design/architecture/02-constraints.md
++++ b/docs/design/architecture/02-constraints.md
+@@ -15,7 +15,7 @@ tags:
+ 
+ | Constraint | Source |
+ |---|---|
+-| Target OS is Ubuntu 26.04 LTS: sudo-rs as `sudo`, uutils core utilities (cp, mv, rm stay GNU), Wayland-only GNOME 50, systemd-only, kernel 7.0 | Plan; section 8.8 |
++| First and currently only target OS is Ubuntu 26.04 LTS: sudo-rs as `sudo`, uutils core utilities (cp, mv, rm stay GNU), Wayland-only GNOME 50, systemd-only, kernel 7.0 | Plan; section 8.8 |
+ | Target hardware: one 16 GB NVIDIA or AMD Radeon card; total VRAM use ≤ 6 GB so the desktop keeps working; CPU-only must function | Plan (this section is the normative home of the budget; ADR-0019) |
+ | Bash is the executor | ADR-0002 |
+ | No network needed at runtime | ADR-0003 |
+diff --git a/docs/design/architecture/03-context-and-scope.md b/docs/design/architecture/03-context-and-scope.md
+index 39e1036..cf0a329 100644
+--- a/docs/design/architecture/03-context-and-scope.md
++++ b/docs/design/architecture/03-context-and-scope.md
+@@ -17,7 +17,7 @@ graph LR
+     user(["User at the terminal"])
+     nls["nl-shell"]
+     bash["bash (PTY)"]
+-    sudo["sudo-rs"]
++    sudo["Target sudo (sudo-rs on ubuntu-26.04)"]
+     sys["The system:<br/>files, packages, services"]
+     docs["Local reference docs<br/>man, --help, tldr snapshot"]
+     hist["~/.bash_history"]
+diff --git a/docs/design/architecture/04-solution-strategy.md b/docs/design/architecture/04-solution-strategy.md
+index 59e9a64..41a4aac 100644
+--- a/docs/design/architecture/04-solution-strategy.md
++++ b/docs/design/architecture/04-solution-strategy.md
+@@ -20,7 +20,7 @@ everything else waits for a confirm. A command the gate classed privileged switc
+ terminal into **passthrough** when the session's own sudo prompt appears; nothing is captured
+ then, and no other command can enter it. Untrusted text the model needs to understand goes
+ through a **quarantined reader** that may only return structured data. The command model is
+-a **student** distilled from a larger **teacher** and trained to know Ubuntu 26.04.
++a **student** distilled from a larger **teacher** and trained for its target (initially Ubuntu 26.04).
+ 
+ ## 4.2 Key strategies
+ 
+@@ -30,7 +30,7 @@ a **student** distilled from a larger **teacher** and trained to know Ubuntu 26.
+ | Prompt injection through output | Taint labels; quarantined reader | 0016, 0017 |
+ | The sudo password | PTY passthrough, never captured | 0014, 0015 |
+ | Fast on consumer GPUs | Small distilled student; llama.cpp GGUF on every vendor | 0008, 0009 |
+-| Knows 26.04 without lookups | Grounded training data filtered by execution in a 26.04 VM | 0009 |
++| Knows the target without lookups | Grounded training data filtered by execution in that target's VM (initially 26.04) | 0009 |
+ | Privacy | Locally complete; generic training data; local personalization | 0003, 0010 |
+ | Interaction shape | Own the session in a PTY front end; keep stock bash as the executor | 0002, 0014, 0024 |
+ 
+diff --git a/docs/design/architecture/05-building-block-view.md b/docs/design/architecture/05-building-block-view.md
+index 53b44a8..22107cc 100644
+--- a/docs/design/architecture/05-building-block-view.md
++++ b/docs/design/architecture/05-building-block-view.md
+@@ -8,8 +8,9 @@ tags:
+ ---
+ # 5. Building block view
+ 
+-> Living document. Components not yet built are marked *(planned)* in 5.3; they become
+-> real paths as M0 lands.
++> Living document. The component view describes the intended system; target-consumer
++> implementation status is distinguished below. Components not yet built are marked
++> *(planned)* in 5.3.
+ 
+ ## 5.1 Components
+ 
+@@ -28,6 +29,9 @@ graph TB
+     reader["Quarantined reader<br/>(separate model request, no PTY)"]
+     llama["llama.cpp<br/>GGUF student"]
+     refdocs["Local reference index"]
++    targets["Target folder<br/>targets/&lt;id&gt;/"]
++    targets -.->|"command prompts at start-up"| backend
++    targets -.->|"planned integration"| gate
+ 
+     user --> input
+     input -->|"natural language"| backend
+@@ -53,13 +57,43 @@ graph TB
+ | PTY session | One persistent bash with a control channel on fd 3 for start/done records and session snapshots (spec `pty-protocol/v1`); input forwarding; sudo passthrough | Yes (password, completion) |
+ | Quarantined reader | Reads raw untrusted text as a separate model request; returns only fixed choices and validated names (ADR-0017) | Yes |
+ | Session log, history | JSONL per turn; appends executed commands to `~/.bash_history`; silent during passthrough | Yes (secrets) |
++| Target folder `targets/<id>/` | Active-target data shared by REPL start-up, gate, installer and pipeline; status below | Yes (policy and model integrity) |
+ | Installer | GPU detection, weight download and verification, install-time doc harvest | Yes (integrity) |
+ 
++### Target folder and consumers
++
++[ADR-0023](../adr/0023-os-targets.md) defines `targets/<id>/`; the shared gate
++procedure consumes target-owned OS inputs ([policy-gate/v1](../specs/policy-gate/v1.md)).
++`ubuntu-26.04` is the first and currently only target; bash remains the only shell.
++The folder currently contains `target.toml`, `sensitive.toml`, `gate-vectors.toml`
++and `prompts/`. Targets are not packaged yet (#48, #50).
++
++- **REPL start-up (built):** Loads `target.toml` and command `prompts/`; selects by
++  exact os-release `ID` and `VERSION_ID`, never `ID_LIKE` or a nearby version. With
++  no match the user must name a target via `--target` or `config.toml`. A mismatched
++  named target currently produces a warning.
++- **REPL target inputs (planned):** Read `model.toml`, check SHA-256 and refuse
++  mismatched weights; read `sensitive.toml` for sensitive-data handling. These inputs
++  are not built.
++- **Gate integration (planned, #12, #190):** Use the target's package-owner query,
++  `sensitive.toml` and planned `allowlist.toml`. On a mismatched named target,
++  every command must need confirmation. These integrations are not built;
++  gate-vector loading from `gate-vectors.toml` is built for conformance tests.
++- **Reader module (built, not yet wired into the REPL):** Loads
++  `prompts/reader.yaml` and resolves the target's `command_provider` for local lookups.
++- **Installer (planned, #48, #50):** Reads `model.toml` to download and verify weights;
++  ships every target's runtime files. Model integrity and adapter compatibility
++  remain requirements awaiting implementation (section 7).
++- **Pipeline (planned):** Reads `harvest.toml` for harvest inputs and the reference
++  VM, `prompts/` for training and `eval/` for training/release evaluation.
++  `harvest.toml` and `eval/` are build-time material, not runtime files; neither
++  exists yet, nor do `model.toml` or `allowlist.toml`.
++
+ ## 5.2 Build-time components (not shipped)
+ 
+ | Component | Responsibility |
+ |---|---|
+-| Reference VM and harvest | Ubuntu 26.04 VM with snapshots; harvests man pages, `--help`, packages, units, `/etc` defaults |
++| Reference VM and harvest | Per-target VM with snapshots (initially `ubuntu-26.04`); harvests man pages, `--help`, packages, units, `/etc` defaults |
+ | Data pipeline | Back-translation, grounded generation, correction pairs, synthetic sessions, execution filter |
+ | Training | QLoRA fine-tuning of the student; intent-classifier training |
+ | Eval suite | The metrics in section 10, against any backend |
+@@ -73,4 +107,8 @@ Python package `nl_shell` under `src/`, tests under `tests/`, run with `python3
+ | `nl_shell.cli` | Entry point (`nl-shell`, `python -m nl_shell`) | built (M0.1) |
+ | `nl_shell.repl` | The read loop; exit commands | built (M0.1) |
+ | `nl_shell.router` | Input router: heuristic command vs. natural language (first token is on `$PATH` or a bash builtin, and the line does not read as an English sentence: an unbalanced `'` outside a `#` comment, or 4+ plain words with a function word like "the" or "in" and no single-quoted word); the M3 classifier keeps it as its fallback | built (M0.7) |
+-| PTY session, state capture, policy gate, confirm UI, model backend, prefix modes, session log | — | *(planned, M0.2–M0.10)* |
++| `nl_shell.targets`, `nl_shell.os_release` | Target loading and exact os-release selection | built; target packaging planned (#48, #50) |
++| `nl_shell.gate.vectors` | Target gate-vector loading | built; gate integration above remains planned |
++| `nl_shell.prompts` | Command prompt loading from the selected target | built, loaded at start-up |
++| `nl_shell.reader`, `nl_shell.command_provider` | Reader prompt and target package-query lookup | built modules; reader not yet wired into REPL |
++| PTY session, state capture, policy gate integration, confirm UI, session log | — | *(planned)* |
+diff --git a/docs/design/architecture/06-runtime-view.md b/docs/design/architecture/06-runtime-view.md
+index 74a8c65..39598b4 100644
+--- a/docs/design/architecture/06-runtime-view.md
++++ b/docs/design/architecture/06-runtime-view.md
+@@ -35,6 +35,9 @@ the REPL shows the command and waits for the user's confirm or edit before runni
+ 
+ ## 6.2 sudo
+ 
++This flow describes the `ubuntu-26.04` target, whose sudo implementation is sudo-rs.
++Other targets must specify and validate their own sudo behavior.
++
+ 1. The user confirms a privileged command (the gate always asks).
+ 2. bash runs it; sudo-rs writes the session's own prompt (`SUDO_PROMPT`, random per
+    session) to the PTY.
+diff --git a/docs/design/architecture/07-deployment-view.md b/docs/design/architecture/07-deployment-view.md
+index fc071ce..97ff7b7 100644
+--- a/docs/design/architecture/07-deployment-view.md
++++ b/docs/design/architecture/07-deployment-view.md
+@@ -12,12 +12,30 @@ tags:
+ 
+ ## 7.1 The user's machine (the deliverable)
+ 
+-- The REPL + GGUF weights + an install script. No teacher, no training pipeline, no PyTorch.
+-- One `llama-server` per user, run as the systemd user service `nl-shell-model.service` on
++The intended deliverable below includes planned installer and packaging work, not
++an assertion that these already ship.
++
++- The REPL and an install script, with GGUF weights downloaded separately. No teacher,
++  no training pipeline, no PyTorch.
++- **Target packaging (planned, #48, #50):** The package contains every target's runtime
++  files: `target.toml`, `model.toml`, `allowlist.toml`, `sensitive.toml`,
++  `gate-vectors.toml` and `prompts/`. Build-time `harvest.toml` and `eval/` are not shipped.
++- **Model integrity (planned):** Weights are not stored in git or the package;
++  `model.toml` records each file's URL, size, SHA-256, base model/license, training run
++  (pipeline commit and dataset hash), and quantization where offered. The installer
++  downloads at install or explicit update into `$XDG_DATA_HOME/nl-shell/models/`,
++  verifying SHA-256 against `model.toml` before use. The REPL must refuse to load
++  weights on a hash mismatch with the active target's manifest. Downloads happen only at install or explicit update,
++  never at runtime; offline operation is preserved. These checks are requirements
++  awaiting implementation.
++- **Personalization adapters (planned):** Stored per target and base-weight hash;
++  the REPL must not load an adapter on different weights. Compatibility enforcement
++  remains awaiting implementation.
++- For `ubuntu-26.04`, one `llama-server` per user, run as the systemd user service `nl-shell-model.service` on
+   a Unix socket, serving both the command model and the reader (ADR-0018).
+ - llama.cpp backend picked at install time (ADR-0019): CUDA on NVIDIA; Vulkan (Mesa RADV)
+   by default on AMD, ROCm opt-in; CPU as the last resort.
+-- Local reference index harvested at install time from dpkg-owned man pages and an
++- Local reference index harvested at install time from package-owned man pages (the target's package-owner query; `dpkg -S` on `ubuntu-26.04`) and an
+   allowlist of `--help` outputs, without running arbitrary binaries (#23, #49).
+ - Files under the XDG base directories (ADR-0020): config and prompts in
+   `~/.config/nl-shell/`, weights and the reference index in `~/.local/share/nl-shell/`,
+@@ -46,7 +64,9 @@ VRAM budget on a 16 GB card:
+ |---|---|---|
+ | Teacher (data generation, dev fallback) | Framework Desktop, Ryzen AI Max+ 395, 128 GB unified | llama.cpp / vLLM, OpenAI-compatible endpoint on the LAN |
+ | Student training + inference | Desktop, NVIDIA 16 GB | Unsloth QLoRA |
+-| Reference system | Ubuntu 26.04 VM | Source of truth; execution sandbox with snapshots |
++| Reference system per target | VM for that target (initially Ubuntu 26.04) | Source of truth; harvest and execution sandbox with snapshots |
++
++**[OPEN]** Weight URL host in `model.toml` (M5.4).
+ 
+-**[OPEN]** Distribution channel for weights and package: GitHub releases, Hugging Face, a
+-PPA, or a mix (M5.4).
++**[OPEN]** Package distribution channel (M5.4). The manifest decision resolves neither
++this channel nor the weights' host.
+diff --git a/docs/design/architecture/08-crosscutting-concepts.md b/docs/design/architecture/08-crosscutting-concepts.md
+index 9c9e7f1..855bd49 100644
+--- a/docs/design/architecture/08-crosscutting-concepts.md
++++ b/docs/design/architecture/08-crosscutting-concepts.md
+@@ -32,7 +32,7 @@ Every item in the state block carries a taint label by provenance (ADR-0016):
+ | Label | Examples |
+ |---|---|
+ | trusted | what the user typed, their confirms and edits, exit codes from the control channel, a cwd made of plain path characters |
+-| local-reference | dpkg-owned man pages and `--help` (harvested in the reference VM), the tldr snapshot, retrieved *untainted* history |
++| local-reference | Package-owned man pages and `--help` (harvested in the active target's reference VM; `dpkg` ownership on `ubuntu-26.04`), the tldr snapshot, retrieved *untainted* history |
+ | untrusted | stdout, stderr, file contents, file names, env (beyond a fixed list), reader output, anything from the network |
+ 
+ What the label changes depends on the command's class:
+@@ -52,7 +52,8 @@ Taint is about **who could have written the text**, not whether it looks harmful
+ ## 8.3 The policy gate and risk classes
+ 
+ Every command, typed or proposed (including raw `\cmd` input), is classed by the
+-procedure in [`specs/policy-gate/v1.md`](../specs/policy-gate/v1.md) (ADR-0013):
++shared procedure, with OS-specific inputs from the active target (examples below
++use `ubuntu-26.04`), in [`specs/policy-gate/v1.md`](../specs/policy-gate/v1.md) (ADR-0013):
+ 
+ | Class | Examples | Behaviour |
+ |---|---|---|
+@@ -110,7 +111,7 @@ the command's done record on the control channel, never on printed text.
+ ## 8.5 The quarantined reader (dual-LLM pattern)
+ 
+ A second model call that reads raw untrusted text and may only answer with fixed choices
+-and names that exist in the local dpkg/apt index; there is no free-text field (ADR-0017).
++and names confirmed by the active target's package data/query (`dpkg`/`apt` for `ubuntu-26.04`); there is no free-text field (ADR-0017).
+ The command model sees only that answer, labelled untrusted. The reader has no PTY, no tools
+ and no network. This is the **dual-LLM pattern** (Willison, 2023) with constrained output,
+ not CaMeL: it limits prompt injection to the choice of an enum value and a few existing
+@@ -139,11 +140,11 @@ Prefixes avoid `!` and `%`, which collide with bash history expansion and job sp
+ The **teacher** is a large model on the developer's hardware: it generates training data
+ and is a dev-only fallback. The **student** is the 1.5–3B model fine-tuned from that data;
+ it is what ships (ADR-0009). Training data is **grounded** (generated from a tool's real man
+-page) and **execution-filtered** (kept only if it ran correctly in a fresh 26.04 snapshot).
++page) and **execution-filtered** (kept only if it ran correctly in a fresh snapshot of the target's VM).
+ 
+-## 8.8 Ubuntu 26.04 specifics
++## 8.8 `ubuntu-26.04` target specifics
+ 
+-What the student must know, and what it must unlearn:
++For this first and currently only target, what the student must know and unlearn:
+ 
+ - sudo-rs is `sudo` (0.2.13 on 26.04, checked): no plugin system, `pwfeedback` on by
+   default ([Phoronix](https://www.phoronix.com/news/sudo-rs-password-feedback)); supports
+@@ -161,8 +162,8 @@ What the student must know, and what it must unlearn:
+ 
+ ## 8.9 Locally complete
+ 
+-Every runtime component works offline (ADR-0003). Lookup order: trained knowledge → local
+-`man`/`--help`/apt → (only if ever added, off by default) a quarantined web lookup.
++Every runtime component works offline (ADR-0003). Lookup order: trained knowledge →
++local `man`/`--help`/package data for the active target (`apt` on `ubuntu-26.04`) → (only if ever added, off by default) a quarantined web lookup.
+ 
+ ## 8.10 Security
+ 
+diff --git a/docs/design/architecture/10-quality-risks-glossary.md b/docs/design/architecture/10-quality-risks-glossary.md
+index b17c356..37a7b70 100644
+--- a/docs/design/architecture/10-quality-risks-glossary.md
++++ b/docs/design/architecture/10-quality-risks-glossary.md
+@@ -25,7 +25,7 @@ tags:
+ | Q4 | Output contains terminal escape sequences | Confirm UI shows the command as bash parses it; nothing hidden | 1 |
+ | Q5 | Network unplugged | Every runtime feature works | 2 |
+ | Q6 | A request on a 16 GB test-matrix card | First token and full command sub-second | 3 |
+-| Q7 | A request typed with an old habit (`ifconfig`, `apt-key`) | Proposal uses the 26.04 way | 4 |
++| Q7 | A request typed with an old habit (`ifconfig`, `apt-key`) | Proposal uses the active target's way (26.04 for `ubuntu-26.04`) | 4 |
+ | Q8 | Fresh install on a supported machine | Correct backend chosen; works without training | 5 |
+ | Q9 | Model server killed mid-request | The prompt returns within the timeout; typed commands keep working (ADR-0018 point 7) | 3 |
+ 
+@@ -41,7 +41,7 @@ lands, it is canonical and this table points to it.
+ | `bash -n` syntax pass rate | ≥ 99% |
+ | Sandbox execution success | tracked per category |
+ | Unrequested destructive proposals | ≈ 0 (**blocking**) |
+-| 26.04-specific probe accuracy | ≥ teacher |
++| Target-specific probe accuracy (initially 26.04) | ≥ teacher |
+ | Latency (first token / full command) | sub-second on every 16 GB test-matrix card |
+ | VRAM footprint | ≤ 6 GB total |
+ | CPU-only mode | functional, latency documented |
+@@ -52,11 +52,11 @@ lands, it is canonical and this table points to it.
+ |---|---|---|
+ | Gate misclassification | The one deterministic safety decision; a miss runs a command unconfirmed | Table-driven tests; unparseable → mutating; model can only raise the class |
+ | Prompt injection via output | Small models are easy to steer | Taint forces confirm; quarantined reader; sudo blocked on taint |
+-| Password leak through the PTY | Passthrough must start before the first keystroke | Tested prompt detection; re-verify on sudo-rs updates |
++| Password leak through the PTY | Passthrough must start before the first keystroke | Tested prompt detection; re-verify on target sudo updates (sudo-rs for `ubuntu-26.04`) |
+ | Model and data licenses | Teacher output may not be usable for a distributed model; base-model licenses differ by size | Checked before M2 data generation and M3 training (release-gating issues) |
+ | Small-model quality | A 1.5–3B model may miss the eval targets | Grounded, execution-filtered data; local reference retrieval; dev-only teacher fallback |
+-| AMD support | ROCm coverage of consumer cards varies; ROCm doesn't list 26.04 | Vulkan by default (ADR-0019); test matrix includes AMD; LoRA, not QLoRA, for AMD fine-tuning |
+-| 26.04 point releases | Tools and defaults drift | Retrain loop (M4.3) |
++| AMD support on `ubuntu-26.04` | ROCm coverage of consumer cards varies; ROCm doesn't list 26.04 | Vulkan by default (ADR-0019); test matrix includes AMD; LoRA, not QLoRA, for AMD fine-tuning |
++| `ubuntu-26.04` point releases | Tools and defaults drift | Retrain loop (M4.3) |
+ | Router misroutes English | Plain English that starts with a command name (`find`, `watch`, `who`) runs as a command | The gate still applies; English-sentence rule in the M0 router; M3 classifier; `\` and `@` prefixes force the route |
+ 
+ ## 12. Glossary
+@@ -67,9 +67,9 @@ lands, it is canonical and this table points to it.
+ | **Command model** | The model that turns a request plus the state block into a proposed command. The student, once M4 lands |
+ | **Control channel** | The pipe on fd 3 the PTY session writes start/done records and snapshots to; printed text can't reach it (ADR-0014) |
+ | **Confirm** | The user's explicit yes (or edit) before a non-read-only command runs |
+-| **Correction pair** | Training pair mapping an outdated habit to the 26.04 way |
++| **Correction pair** | Training pair mapping an outdated habit to the target's way (initially 26.04) |
+ | **Degraded mode** | The session state nl-shell enters when the control channel misbehaves or its hooks were changed: no further command is sent to the session until it is restarted |
+-| **Execution filter** | Keeping a training pair only if its command ran correctly in a fresh 26.04 snapshot |
++| **Execution filter** | Keeping a training pair only if its command ran correctly in a fresh snapshot of the target's VM (initially 26.04) |
+ | **GGUF** | llama.cpp's model file format; one format for every GPU vendor |
+ | **Grounded generation** | The teacher writes training pairs from a tool's real man page, not from memory |
+ | **Intent classifier** | Tiny model that decides whether plain input is bash or natural language |
+@@ -79,7 +79,7 @@ lands, it is canonical and this table points to it.
+ | **PTY** | Pseudo-terminal; lets nl-shell run one persistent bash that behaves like a real terminal |
+ | **QLoRA** | Memory-efficient fine-tuning that trains small adapter weights on a quantized model. Used on NVIDIA; on AMD, Unsloth supports LoRA officially but QLoRA (bitsandbytes on ROCm) isn't demonstrated |
+ | **Quarantined reader** | Separate model call that reads untrusted text and may only answer in a fixed schema |
+-| **Reference VM** | The Ubuntu 26.04 VM used as source of truth and execution sandbox at build time |
++| **Reference VM** | A per-target VM (initially Ubuntu 26.04) used as source of truth and execution sandbox at build time |
+ | **Risk class** | read-only, mutating, session-altering, destructive or privileged |
+ | **Session snapshot** | Aliases, functions, traps, `PATH` and hook hashes reported after every command; the gate resolves command words against it |
+ | **State block** | What the command model knows about the session: cwd, last command, exit code, output tail, ls, filtered env, retrieved history examples — each item with its taint label |
+@@ -102,7 +102,7 @@ proposal that must not get past the confirm.
+ |---|---|---|
+ | 0 — Unit and table tests | Gate classification table, state-block building, taint labels, log schema | From M0, every PR |
+ | 1 — PTY integration | Real bash in a PTY: persistence, exit codes, sudo passthrough with a test sudoers setup | From M0, in a throwaway VM |
+-| 2 — Sandbox execution | Candidate commands in a fresh 26.04 snapshot | From M2 (the execution filter) |
++| 2 — Sandbox execution | Candidate commands in a fresh snapshot of the target's VM (initially 26.04) | From M2 (the execution filter) |
+ | 3 — Model eval | The eval suite against teacher and student | From M4 |
+ | 4 — Test matrix | Eval and latency per card, plus CPU-only | M5 |
+ 

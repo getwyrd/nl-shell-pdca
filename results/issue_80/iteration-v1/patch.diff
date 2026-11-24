@@ -1,0 +1,350 @@
+diff --git a/.oss-scanner/threat_model.md b/.oss-scanner/threat_model.md
+--- a/.oss-scanner/threat_model.md
++++ b/.oss-scanner/threat_model.md
+@@ -98,8 +98,7 @@
+ - what the user types and their confirm and edit decisions;
+ - exit codes and completion from the control channel (ADR-0014);
+ - a cwd made of plain path characters;
+-- dpkg-owned man pages and an allowlist of `--help` outputs harvested in the reference VM,
+-  and the vendored tldr snapshot (local-reference, ADR-0016);
++- dpkg-owned man pages and an allowlist of `--help` outputs harvested in the reference VM;
+ - nl-shell's own config files in the user's home directory, except that a model endpoint
+   in them is refused without `--dev-teacher` (ADR-0020);
+ - the target's command-provider data, `/var/lib/command-not-found/commands.db` on the
+@@ -107,6 +106,10 @@
+   package-managed, opened read-only and never fetched (ADR-0003), and not writable by an
+   attacker. The package names read from it are still filtered to the Debian package-name
+   rule, because they end up in text shown to the user.
++
++Local-reference: the vendored tldr snapshot (ADR-0016) is pinned source acquired
++explicitly at build time and verified before offline consumption. It is reference data,
++not executable commands or trusted instructions.
+ 
+ ## What must hold
+ 
+diff --git a/scripts/tldr_snapshot.py b/scripts/tldr_snapshot.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/tldr_snapshot.py
+@@ -0,0 +1,86 @@
++"""Verify and export the pinned local tldr source; never execute its contents."""
++
++import argparse
++import hashlib
++import json
++from pathlib import Path
++import sys
++
++REVISION = "eacda7020c4102729187c38c35ce28fac00365c9"
++REPOSITORY = "https://github.com/tldr-pages/tldr"
++PREFIXES = ["pages/common/", "pages/linux/"]
++INVENTORY = "4ce7ecdff5a4da72bfef4378f027ad141b7daa28dc6b0a68f57905a6e080d960"
++LICENSE_BLOB = "9b4ebcb9a886af3506c5d42f1dcf1253a520efbe"
++
++
++def blob_id(content):
++    return hashlib.sha1(b"blob " + str(len(content)).encode("ascii") + b"\0" + content).hexdigest()
++
++
++def read_snapshot(root):
++    """Validate the entire snapshot before returning any export records."""
++    metadata = json.loads((root / "source.json").read_text(encoding="utf-8"))
++    if (
++        metadata["repository"] != REPOSITORY
++        or metadata["revision"] != REVISION
++        or metadata["prefixes"] != PREFIXES
++        or metadata["language"] != "en"
++        or metadata["inventory_sha256"] != INVENTORY
++    ):
++        raise ValueError("unexpected source identity")
++    license_bytes = (root / "LICENSE.md").read_bytes()
++    if blob_id(license_bytes) != LICENSE_BLOB:
++        raise ValueError("upstream license mismatch")
++    notice = (root / "NOTICE.md").read_text(encoding="utf-8")
++    if not all(word in notice for word in ("tldr-pages", "contributors", REVISION, "CC BY 4.0", "repackag")):
++        raise ValueError("missing attribution")
++    corpus = (root / "pages.jsonl").read_bytes()
++    if hashlib.sha256(corpus).hexdigest() != metadata["corpus_sha256"]:
++        raise ValueError("corpus digest mismatch")
++    records = [json.loads(line) for line in corpus.decode("utf-8").splitlines()]
++    paths = [record["path"] for record in records]
++    if paths != sorted(set(paths)) or len(paths) != 6837:
++        raise ValueError("duplicate, missing or unsorted pages")
++    if set(metadata["pages"]) != set(paths):
++        raise ValueError("manifest inventory mismatch")
++    inventory = bytearray()
++    total = 0
++    for record in records:
++        path = record["path"]
++        if (
++            not any(path.startswith(prefix) for prefix in PREFIXES)
++            or not path.endswith(".md")
++            or len(Path(path).parts) != 3
++            or ".." in Path(path).parts
++        ):
++            raise ValueError("invalid page path")
++        content = record["content"].encode("utf-8")
++        total += len(content)
++        blob = blob_id(content)
++        expected = {"bytes": len(content), "git_blob": blob, "sha256": hashlib.sha256(content).hexdigest()}
++        if metadata["pages"][path] != expected:
++            raise ValueError("page integrity mismatch: " + path)
++        inventory.extend(f"{path}\0{100644}\0{blob}\n".encode("utf-8"))
++    if total != 4050595 or hashlib.sha256(inventory).hexdigest() != INVENTORY:
++        raise ValueError("pinned inventory mismatch")
++    return [
++        dict(record, revision=REVISION, language="en", provenance="local-reference")
++        for record in records
++    ]
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("command", choices=["export"])
++    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1] / "data/tldr")
++    args = parser.parse_args()
++    try:
++        records = read_snapshot(args.root)
++    except (OSError, ValueError, KeyError, TypeError) as error:
++        parser.exit(1, f"invalid tldr snapshot: {error}\n")
++    for record in records:
++        sys.stdout.write(json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/test_tldr_snapshot.py b/tests/test_tldr_snapshot.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_tldr_snapshot.py
+@@ -0,0 +1,119 @@
++"""Real-corpus regression: collection also works without the production addition."""
++
++import hashlib
++import json
++from pathlib import Path
++import shutil
++import subprocess
++import sys
++
++ROOT = Path(__file__).resolve().parents[1]
++REVISION = "eacda7020c4102729187c38c35ce28fac00365c9"
++ANCHOR = "4ce7ecdff5a4da72bfef4378f027ad141b7daa28dc6b0a68f57905a6e080d960"
++
++# The hook runs before runpy enters production. Attempts remain visible even if
++# production catches the hook's exception. Controls run in separate children.
++WRAPPER = r'''
++import json, os, runpy, socket, subprocess, sys
++attempts = []
++def audit(event, args):
++    if event in {
++        "socket.connect", "socket.getaddrinfo", "socket.sendto",
++        "socket.gethostbyname", "socket.gethostbyaddr", "subprocess.Popen",
++        "os.system", "os.exec", "os.posix_spawn", "os.spawn",
++    }:
++        attempts.append(event)
++        raise RuntimeError("forbidden operation: " + event)
++sys.addaudithook(audit)
++try:
++    mode = sys.argv[1]
++    if mode == "network":
++        socket.socket().connect_ex(("127.0.0.1", 9))
++    elif mode == "process":
++        subprocess.run([sys.executable, "-c", "pass"], check=True)
++    else:
++        sys.argv = [sys.argv[2], "export", "--root", sys.argv[3]]
++        runpy.run_path(sys.argv[0], run_name="__main__")
++finally:
++    sys.stderr.write("AUDIT:" + json.dumps(attempts) + "\n")
++    if attempts:
++        sys.exit(91)
++'''
++
++
++def child(mode="export", root=None):
++    result = subprocess.run(
++        [sys.executable, "-c", WRAPPER, mode, str(ROOT / "scripts/tldr_snapshot.py"),
++         str(root or ROOT / "data/tldr")],
++        capture_output=True, timeout=30,
++    )
++    audit_lines = [line[6:] for line in result.stderr.splitlines() if line.startswith(b"AUDIT:")]
++    assert len(audit_lines) == 1, result.stderr.decode()
++    return result, json.loads(audit_lines[0])
++
++
++def git_blob(content):
++    return hashlib.sha1(b"blob " + str(len(content)).encode("ascii") + b"\0" + content).hexdigest()
++
++
++def test_pinned_full_export():
++    first, attempts = child()
++    assert first.returncode == 0, first.stderr.decode()
++    assert attempts == []
++    second, attempts = child()
++    assert second.returncode == 0, second.stderr.decode()
++    assert attempts == []
++    assert first.stdout == second.stdout
++    records = [json.loads(line) for line in first.stdout.splitlines()]
++    assert len(records) == 6837
++    paths = [r["path"] for r in records]
++    assert paths == sorted(set(paths))
++    inventory = bytearray()
++    total = 0
++    for record in records:
++        assert set(record) == {"path", "content", "revision", "language", "provenance"}
++        assert record["revision"] == REVISION
++        assert record["language"] == "en"
++        assert record["provenance"] == "local-reference"
++        assert record["path"].startswith(("pages/common/", "pages/linux/"))
++        content = record["content"].encode("utf-8")
++        total += len(content)
++        inventory.extend(f'{record["path"]}\0{100644}\0{git_blob(content)}\n'.encode())
++    assert total == 4050595
++    assert hashlib.sha256(inventory).hexdigest() == ANCHOR
++    pages = {r["path"]: r["content"] for r in records}
++    assert git_blob(pages["pages/common/tar.md"].encode()) == "0dbcb8da7c04cbc911d6ac4b9d96ff660718ee33"
++    assert git_blob(pages["pages/linux/apt.md"].encode()) == "f5cd78e6aa90c7fdbe24e3012be943612f3f3f50"
++    assert "{{" in pages["pages/common/tar.md"]
++    assert "`sudo apt" in pages["pages/linux/apt.md"]
++    shipped = [json.loads(line) for line in (ROOT / "data/tldr/pages.jsonl").read_text().splitlines()]
++    assert shipped == [{"path": r["path"], "content": r["content"]} for r in records]
++    assert git_blob((ROOT / "data/tldr/LICENSE.md").read_bytes()) == "9b4ebcb9a886af3506c5d42f1dcf1253a520efbe"
++    notice = (ROOT / "data/tldr/NOTICE.md").read_text()
++    assert all(s in notice for s in ("tldr-pages", "team", "contributors", REVISION, "CC BY 4.0", "repackag"))
++
++
++def test_audit_positive_controls():
++    for mode, event in (("network", "socket.connect"), ("process", "subprocess.Popen")):
++        result, attempts = child(mode)
++        assert result.returncode == 91
++        assert attempts == [event]
++
++
++def test_corruption_rejected_before_export(tmp_path):
++    source = ROOT / "data/tldr"
++    assert (source / "pages.jsonl").is_file(), "real pinned corpus must be shipped"
++    for name, mutation in (
++        ("pages.jsonl", lambda data: data + b'{}\n'),
++        ("source.json", lambda data: data.replace(REVISION.encode(), b"0" * 40)),
++        ("LICENSE.md", lambda data: data + b"corrupt"),
++    ):
++        destination = tmp_path / name.replace(".", "_")
++        shutil.copytree(source, destination)
++        path = destination / name
++        path.write_bytes(mutation(path.read_bytes()))
++        result, attempts = child(root=destination)
++        assert result.returncode != 0
++        assert result.stdout == b""
++        assert attempts == []
++        assert b"invalid tldr snapshot" in result.stderr
+diff --git a/data/tldr/README.md b/data/tldr/README.md
+new file mode 100644
+--- /dev/null
++++ b/data/tldr/README.md
+@@ -0,0 +1,87 @@
++# Pinned English tldr source
++
++The required source is https://github.com/tldr-pages/tldr at
++`eacda7020c4102729187c38c35ce28fac00365c9`, selecting every regular Markdown
++file under `pages/common/` and `pages/linux/`. It is generic reference input for
++future #23 harvest selection, not an index or install integration. Examples are
++reference data and must never be executed by the reader. Selection does not
++certify examples for a particular OS release. Private history is not included.
++
++The page content is CC BY 4.0, distinct from the repository's Apache-2.0 code.
++Future dataset/weights release review remains #34's responsibility.
++
++## Offline consumption
++
++From the repository root:
++
++```sh
++python3 scripts/tldr_snapshot.py export > tldr-export.jsonl
++```
++
++`--root data/tldr` optionally selects another snapshot directory. Validation
++finishes before the first output record. Each JSONL record contains `path`
++(the original upstream identity), `content` (unchanged UTF-8 text), `revision`,
++`language: "en"` and `provenance: "local-reference"`. Output is sorted by path.
++The utility imports only the Python standard library and performs no network
++access or process launch. Integrity errors exit nonzero without emitting pages.
++
++## Explicit acquisition and deterministic rebuild
++
++Acquisition requires GitHub HTTPS access, independently of offline consumption.
++Run these commands in a working directory inside the harness-provided worktree;
++do not execute upstream scripts or page snippets:
++
++```sh
++git clone --no-checkout https://github.com/tldr-pages/tldr .pdca-source/tldr
++git -C .pdca-source/tldr archive eacda7020c4102729187c38c35ce28fac00365c9 pages/common pages/linux LICENSE.md > .pdca-source/pinned.tar
++```
++
++Convert from the repository root with Python 3 (no extraction or execution):
++
++```python
++import hashlib
++import json
++from pathlib import Path
++import tarfile
++
++revision = "eacda7020c4102729187c38c35ce28fac00365c9"
++prefixes = ["pages/common/", "pages/linux/"]
++def blob(data):
++    return hashlib.sha1(b"blob " + str(len(data)).encode("ascii") + b"\0" + data).hexdigest()
++def line(record):
++    return json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
++with tarfile.open(".pdca-source/pinned.tar") as archive:
++    members = sorted((m for m in archive.getmembers() if m.isfile()
++                      and any(m.name.startswith(p) for p in prefixes)), key=lambda m: m.name)
++    pages = {}
++    records = []
++    inventory = bytearray()
++    total = 0
++    for member in members:
++        assert member.name.endswith(".md") and member.mode == 0o644
++        data = archive.extractfile(member).read()
++        total += len(data)
++        pages[member.name] = {"bytes": len(data), "git_blob": blob(data),
++                              "sha256": hashlib.sha256(data).hexdigest()}
++        inventory.extend(f"{member.name}\0{100644}\0{blob(data)}\n".encode())
++        records.append({"path": member.name, "content": data.decode("utf-8")})
++    digest = hashlib.sha256(inventory).hexdigest()
++    assert len(records) == 6837 and total == 4050595
++    assert digest == "4ce7ecdff5a4da72bfef4378f027ad141b7daa28dc6b0a68f57905a6e080d960"
++    license_bytes = archive.extractfile("LICENSE.md").read()
++    assert blob(license_bytes) == "9b4ebcb9a886af3506c5d42f1dcf1253a520efbe"
++corpus = "".join(map(line, records)).encode("utf-8")
++root = Path("data/tldr")
++(root / "pages.jsonl").write_bytes(corpus)
++(root / "LICENSE.md").write_bytes(license_bytes)
++metadata = {"repository": "https://github.com/tldr-pages/tldr", "revision": revision,
++            "prefixes": prefixes, "language": "en", "inventory_sha256": digest,
++            "transformation": "Sorted path/content JSONL; original UTF-8 text preserved",
++            "corpus_sha256": hashlib.sha256(corpus).hexdigest(), "pages": pages}
++(root / "source.json").write_bytes((json.dumps(metadata, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"))
++```
++
++The fixed inventory anchor binds actual page bytes to the Plan-verified upstream
++Git tree. Per-page hashes and the corpus digest additionally bind the manifest
++and corpus. Run the regression after rebuilding; never replace the fixed test
++anchor with one calculated from an unverified replacement corpus.
+diff --git a/data/tldr/NOTICE.md b/data/tldr/NOTICE.md
+new file mode 100644
+--- /dev/null
++++ b/data/tldr/NOTICE.md
+@@ -0,0 +1,14 @@
++# tldr attribution
++
++The tldr-pages team and contributors created the upstream reference pages:
++https://github.com/tldr-pages/tldr/tree/eacda7020c4102729187c38c35ce28fac00365c9
++
++Page content is licensed under Creative Commons Attribution 4.0 International
++(CC BY 4.0): https://creativecommons.org/licenses/by/4.0/ . The upstream
++LICENSE.md must accompany the snapshot, separately from nl-shell's Apache-2.0
++code license.
++
++Selection/repackaging: only English pages/common/ and pages/linux/ Markdown
++pages are included, sorted and repackaged as path/content JSONL with original
++text and placeholders unchanged. This does not include upstream executable
++scripts and does not imply upstream endorsement of nl-shell.

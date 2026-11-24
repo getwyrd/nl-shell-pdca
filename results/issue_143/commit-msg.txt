@@ -1,0 +1,33 @@
+Build model requests from prompts.yaml and show them with :context
+
+A plain-language line or an @request now goes through the path a real model
+will use: nl-shell builds the model input from an editable prompts file, hands
+it to a model backend, and checks the answer strictly against proposal/v1. A
+valid command proposal is shown framed, one "  | " line per command line,
+with a note that nothing runs yet. A clarify or refuse answer gets a fixed
+reply. Anything else, including any answer with a hidden or control character
+in the command, is rejected and never repaired, and the REPL keeps running.
+
+There is no real model client yet (#77), so an interactive session says that
+no model backend is configured. A recording stub backend in src/ returns fixed
+answers and keeps every input it was sent, so tests (and #13) can drive the
+whole path without a model or GPU.
+
+The default prompts live in targets/ubuntu-26.04/prompts/prompts.yaml, found
+through the active target's folder. ~/.config/nl-shell/prompts.yaml overrides
+it key by key. Both are read with PyYAML's safe loader. A malformed file,
+unknown key or wrong type stops start-up with the file's path, the same way a
+bad target.toml does. PyYAML>=6 becomes a runtime dependency.
+
+:context now prints the exact model input of the last request, replacing the
+placeholder from 2ba3fb562c9f9f1d9e0db85c85b95723bd5f6848. :status lists each
+loaded prompts file.
+
+Every text nl-shell prints from a proposal, from :context or from a start-up
+error passes through one hidden-character check and one escape function, so
+terminal escapes, bidi overrides and similar characters show up as visible
+\xHH / \uHHHH text instead of acting on the terminal. This covers the existing
+target.toml error print from 4c755f220335c6e6012e9d5ed46a3b11baa6b609 too. The
+threat model now credits the parser with rejecting such proposals.
+
+Fixes #143

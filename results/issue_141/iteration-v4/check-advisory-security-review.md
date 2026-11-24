@@ -1,0 +1,21 @@
+# Security review (advisory) — issue 141, persistent-bash-session-tamper-checks
+
+Attacker-reachable inputs this diff touches: **session state** (threat model "Where untrusted input enters" item 4: shell variables, traps, hooks set by a confirmed command or `~/.bashrc`) and, through it, the PTY's terminal settings and bash's fds 0-2. These feed the new `H` rows, the hook-time reading at the fd-4 wait (`src/nl_shell/session.py:243`, `:850`) and the pre-paste reading (`:925`). Rated on the threat model's scale.
+
+## Findings
+
+- NEEDS-HUMAN [impl] — **Medium** ("the session doesn't enter degraded mode when its hooks were changed"; it also breaks the brief's own invariant). `src/nl_shell/session.py:243` / `:850`. **Input:** shell variables a confirmed command can set (`MAILCHECK`, `MAILPATH`), plus a file it can write. **What goes wrong:** the hook-time reading at the fd-4 wait is *not* the last point where non-nl-shell code runs before readline. After `PROMPT_COMMAND` finishes, bash runs its mail check. The text after `?` in a `MAILPATH` entry goes through command substitution, so code runs after the reading and before readline takes the terminal. Readline then turns ISIG on while it holds the terminal, so the pre-paste reading (`:925`) can't see it either. That is the same window the brief calls the v3 defect, opened by a different hook. Neither `MAILPATH` nor `MAILCHECK` is in `H`. **Reproducer (run on the patched target, real bash 5.3.9):** (1) `run(": > $D/m; MAILCHECK=0; MAILPATH='$D/m?$(stty -isig)'")`, (2) `run("sleep 1.1; echo x >> $D/m")`, (3) `run("stty -a > $D/MARK")`. Steps 1 and 2 stay healthy. Step 3's paste **is written** (PTY write spy: 1 write), and `MARK` shows `-isig`. The session degrades only *after* that paste runs (`outside-check`, at step 3's own hook check), and the next `echo hello` is refused with 0 writes. So one paste is written into a terminal with signals off while the session counts as healthy. **Fix direction for the builder:** move the reading after the mail check, or neutralise and pin the mail-check variables after `~/.bashrc` (for example `unset MAILPATH MAIL; MAILCHECK=-1` made readonly, or carried in `H`). Then add a briefed-style test for this case. The tests only cover the trap and `PROMPT_COMMAND` paths, not other pre-prompt hooks.
+
+- NEEDS-HUMAN [human] — Scope question, `src/nl_shell/session.py:850` (the `_hook_check` docstring) and the spec text saying nothing but nl-shell's hook code has run since `H`. That is true. But the brief's invariant ("after the LAST point at which code other than nl-shell's own hooks can run before readline") is stated as if the end of `PROMPT_COMMAND` is that point, and the finding above shows it is not. A human should decide whether to close the other bash pre-prompt hooks here (mail check is the one I confirmed; I did not survey further), or list them as a Known gap under #145. The current Known-gaps list in `.oss-scanner/threat_model.md` doesn't name this.
+
+## Checked, no finding
+
+- **fd 4 (new ack pipe), inherited by every child.** A child that reads the newline, or pre-loads one by reopening the pipe, can only make bash skip the wait or block. `_wait_for_hook` (`session.py`, after `:850`) then never sees the `read` on fd 4 and degrades `outside-check` after `_SETTLE`. It fails closed, so it can deny service but can't let a paste through. The `st_dev`/`st_ino` check stops a swapped fd 4.
+- **`readonly PS4` (`session.py:147`)** plus `declare -p PS4` in `H`: plain assignment, `declare` and `printf -v` all fail as readonly (the (r) tests cover this).
+- **Stderr capture (`2>&1`) in every hook substitution**: a disabled or failing builtin no longer yields an empty value that matches the baseline.
+- **`tiocsti_path` and the stopped check**: both fail closed when the file can't be read.
+- **Reason codes**: only stored and shown. The reason text is built from nl-shell's own strings and `/proc` paths, with no attacker text beyond a `readlink` target (Low at most: an info string in an error message, not a control path).
+
+Toolchain note: the reproducer above ran on this host. I stopped there and did not look for further pre-prompt hooks, so treat "mail check is the only one" as unverified.
+
+<!-- pdca:leaf-complete -->

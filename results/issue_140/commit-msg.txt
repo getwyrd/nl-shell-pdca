@@ -1,0 +1,33 @@
+Add a persistent bash session core (not wired up yet)
+
+nl-shell has no shell session yet: there is nothing that keeps `cd` or
+`export` alive from one command to the next, and nothing that can tell
+reliably whether a command ran and how it ended. This adds that core.
+
+`Session` (src/nl_shell/session.py) starts one long-lived interactive bash
+on a PTY with ptyprocess, with a control channel on fd 3 and a generated
+rcfile, as ADR-0014 and spec pty-protocol/v1 describe. Record parsing and
+sequencing live in src/nl_shell/pty_protocol.py. Exit status, PIPESTATUS
+and "did it run" come only from the fd-3 records, never from printed text.
+A command is sent as exactly the confirmed bytes in one bracketed paste;
+bytes that could break out of the paste (ESC, C0 controls other than TAB
+and LF) are refused before anything is written.
+
+The session compares the shell's hook state against the first snapshot.
+If a command changes it, or the protocol goes wrong, the session enters
+degraded mode: it refuses every further command until restart. A shell
+that returns to a prompt without reporting completion is caught by
+watching bash block on reading the terminal (/proc/<pid>/syscall); if that
+file cannot be read, the session degrades rather than guess.
+
+The protection claimed is a closed list, written down in spec §1.3 and in
+the threat model. Wider tamper resistance is #141 and a review of other
+ways around the hooks is #145; nothing calls the session yet, and #78 must
+not wire it to confirmed commands before #141 lands.
+
+The spec, policy-gate §7.5, ADR-0013/0014 (both Proposed) and the glossary
+are updated to match: user PROMPT_COMMAND runs before the snapshot,
+H/V carry exact `declare -p` text, and "degraded" means "refuse until
+restart". The spec is still draft, so v1 changes in place.
+
+Fixes #140

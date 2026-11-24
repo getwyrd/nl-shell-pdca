@@ -1,0 +1,3 @@
+Round 7 rejected for one build bug that rule P5 covers; keep the rest of the patch as it is.
+_ALIAS_START / _ALIAS_LINE (src/nl_shell/failure_classes.py:113-114) use `alias ([^=\s]+)=`, which misses bash's `alias -p` form for a name starting with `-`: `alias -- -s='sudo'`. So `-s x` at status 1 -> other (must be privilege), and a multi-line value under `alias -- ` is parsed by line starts again. Fix: accept an optional `-- ` after `alias ` in both regexes. Add rows: `-s x` with `alias -- -s='sudo'` -> privilege, and a multi-line `alias -- -z='ls\nalias ls=sudo'` value read as one quoted value.
+Optional nit: rewrap the Known-gaps bullet line in .oss-scanner/threat_model.md to match the file.

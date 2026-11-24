@@ -1,0 +1,21 @@
+# Security review — teacher-client-transport (#151, iteration 2)
+
+**Attacker-reachable inputs this diff touches:** everything the model server sends back: the status line and reason phrase, headers, body, content length and timing, plus TLS handshake bytes. The threat model lists this as input 8 (the local model socket, same-user processes) and input 11 (the dev teacher endpoint, which a LAN peer can answer). The endpoint URL and `timeout_s` come from nl-shell's own config, which the threat model trusts, but I checked them for crashes anyway.
+
+**Verdict: no finding.** Both items from the last round are fixed and covered by tests.
+
+What I checked (lines are in `target/src/nl_shell/teacher_client.py` unless another file is named):
+
+- **Server text reaching the terminal.** Server text gets into error replies through the reason phrase (`:447`), the error body excerpt (`:453-454`) and exception text (`_describe`, `:140-143`, used at `:410-411` and `:494`). All three go through `_excerpt` (`:137`). It folds all whitespace (LF and CR too) to single spaces, cuts the text to `EXCERPT_CHARS` (200), and only then calls `render.escape`. `Repl.run` escapes every reply a second time (`target/src/nl_shell/repl.py:138`). Last round's oversized `BadStatusLine` bypass is closed. `tests/test_teacher_client.py:811-828` sends a malformed status line and a parseable one, each with a long spoof, and asserts no LF, ESC or CR and at most `EXCERPT_CHARS` of the padding. The OSC 52 / CR status-line case (`:778-797`) is also covered. No finding.
+- **Unescaped `{url!r}` in `http_target`** (`:161`, `:163`, `:165`, `:168`). This is safe: `:151` has already refused any URL that is non-ASCII or holds a byte ≤ 0x20 or 0x7F, so `repr` can only print printable ASCII. The URL comes from trusted config either way.
+- **`timeout_s` crash (last round's finding).** `_timeout` (`:180-198`) now calls `float()` inside a `try` that turns `OverflowError` into `BadEndpoint`, and never puts the value in the error text. The test list at `tests/test_teacher_client.py:484` includes `10**400`, `-(10**400)` and `10**5000`. Fixed.
+- **Hang or resource use beyond the deadline.** The caller waits only until the deadline (`:384-386`), then shuts down every socket it tracks (`:243-252`). Body reads are capped per chunk, with the deadline checked on each chunk (`:465-486`). A `Content-Length` over the cap is refused before any body is read (`:457`). A 3xx is refused before the body is read (`:448`). I checked one possible gap: `wrap_socket` detaches the tracked socket, so `abandon` cannot wake a TLS handshake (`:297-299`). I ran a TLS server that sends a 16 KiB handshake record header and then one byte every 0.3 s, with `timeout_s=0.5`. `complete` raised `DeadlineExceeded` at 0.50 s, and the worker thread was gone by 2 s. CPython's handshake treats the socket timeout as one total deadline, so this is not a finding. A worker thread stuck in a hung `getaddrinfo` (name lookup) stays alive until the lookup returns. The brief chose this design, and it never blocks the REPL.
+- **TLS.** `ssl.create_default_context()` is called with `CERT_REQUIRED` and `check_hostname=True` (`:294-296`), and there is no plain-HTTP fallback. The test at `tests/test_teacher_client.py:468` asserts this. `http.client` ignores proxy environment variables and never follows redirects. No `Authorization` header is sent. No finding.
+- **The REPL catch** (`target/src/nl_shell/repl.py` `_propose` / `backend_failure`). Only `BackendError` is caught. `TeacherClient` maps every other `Exception` to a `BackendError` (`:396-411`). `KeyboardInterrupt` passes through on purpose. The reply text is built from error text that was already escaped, and gets escaped again at output. No finding.
+- **What-must-hold properties** (gate, confirm, sudo, taint). The diff does not touch any of them. The client only returns raw content to #143's strict parser.
+
+Gate evidence: C4 passes (red 79/79 without the fix, green with it) and T3 passes (560 passed). The T2 row (threat-model update) is already in the human's deferred list from last round, so I am not raising it again here.
+
+No NEEDS-HUMAN items from this review.
+
+<!-- pdca:leaf-complete -->

@@ -1,0 +1,27 @@
+Add input-mode prefixes and meta-commands to the REPL
+
+docs/plan.md (Input Modes) lets the user override the router with a
+prefix, but the REPL ignored prefixes: "\frobnicate" or "?why did that
+fail" were treated as natural language, and ":status" was not a command.
+
+The REPL now checks for a prefix before the router runs:
+
+- "\cmd" is treated as a shell command whatever the router would say.
+  It skips only the router, never the policy gate (ADR-0013 section 7,
+  Proposed; #64). The gate is wired in by #78.
+- "?question" goes to ask mode and "@request" to a one-command proposal.
+  Both print a fixed "arrives in M0.8" reply for now.
+- "@@goal" is only reserved: it prints one reply naming #76, which owns
+  the agent loop. It exists so "@@goal" does not fall into "@".
+- ":name" runs a meta-command. ":status" prints "nl-shell <version>";
+  ":context" (#16) and ":history" (#17) say when they arrive; unknown
+  names list the known ones. ":quit" and ":exit" still end the loop,
+  and so do ": quit" / ": exit", since the text after ":" is stripped.
+- A prefix with nothing after it prints a short usage line.
+
+Lines without a prefix route exactly as before, with the same replies.
+
+The ":status" lines come from a list in the new nl_shell.input_modes
+module, so #92, #16 and #77 can add their lines by appending to it.
+
+Fixes #14

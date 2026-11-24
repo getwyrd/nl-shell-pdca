@@ -1,0 +1,26 @@
+Review issue #92’s narrowed OS-target loader: exact OS selection, explicit overrides, validated configuration, and session-specific target status, excluding allowlists and policy enforcement.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The narrowed contract is testable and consistent with exact matching and explicit override requirements; target/docs/design/adr/0023-os-targets.md:72 and brief.md:18. |
+| C2 Reproduction (red pre-fix) | PASS | Independent smoke execution fails before the fix with the missing selection interface; frozen focused tests also record 61 failures with no collection/setup errors; review-red.log:1 and gate-logs/C4-verify.log:1714. |
+| C3 Change | PASS | The patch stays within the approved loader/configuration/status slice, with no allowlist or enforcement implementation; patch.diff:24, patch.diff:431, and patch.diff:697. |
+| C4 Verification (red→green) | PASS | Independent stash/restore smoke check turns red→green; the frozen pytest log shows 91 passing focused tests after the fix and 61 failures before it; review-green.log:1 and gate-logs/C4-verify.log:10. |
+| C5 Causal adequacy | PASS | Exact match and explicit mismatch state address missing target selection directly; read-error handling implements the agreed unknown-OS case rather than masking an eager capability dependency; target/src/nl_shell/targets.py:221 and target/src/nl_shell/targets.py:244. |
+| T1 Structure | PASS | Separate configuration and target units preserve the planned extension boundaries, and session-owned status avoids cross-run state leakage; target/src/nl_shell/config.py:45 and target/src/nl_shell/input_modes.py:80. |
+| T2 Shape | PASS | Validation precedes target-path construction and checks required metadata; the frozen threat-model scanner reports no classified security-relevant path touched, a narrower claim than a security audit; target/src/nl_shell/targets.py:130 and gate-logs/T2-threat-model.log:10. |
+| T3 Runtime | PASS | Frozen full-suite output records 237 passing tests; independent scripted CLI/status smoke passes, but local pytest reproduction is unavailable because this host lacks pytest; gate-logs/T3-suite.log:15 and review-green.log:1. |
+| T4 Contribution | N/A | Contribution artifacts are intentionally absent at Check; the substantive contribution audit is owed at publish and must rerun there; gate-logs/T4-contribution.log:10. |
+| T5 Judgment | NEEDS-HUMAN | Confirm the affected-path prior-art review against merged and closed/rejected work — the brief records it, but this target has only one synthetic base commit and no supplied closed-work evidence, so independent confirmation is unavailable; brief.md:30. |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Accept the loader-only increment for intended use — allowlists and degraded enforcement remain with #139/#12, installed-package targets remain deferred, and issue #92 must remain open with the planned tracker updates; brief.md:23 and brief.md:32. |
+
+Evidence and limits:
+
+- Independently ran `review-smoke.py` against the real target module and real repository target metadata, with scratch os-release input and a scripted REPL. Exact matching starts and reports matching status; a different OS is refused without an override; naming the target starts with mismatch status. Stashing production changes produced the failure in `review-red.log`; restoring them produced `review-green.log`. Production changes were restored, with tests retained throughout. This smoke check supplements, rather than replaces, the frozen pytest evidence.
+- Attempted the focused pytest command: `/usr/bin/python3: No module named pytest`. The full gate wrappers are instance-scoped and absent here; adjudication uses their captured output, not their absence. The frozen C4 output explicitly records 91 green, then 61 failed/30 passed red, without setup or collection errors. T3 explicitly records 237 passed. No unsatisfied product dependency is established: the brief declares none and the captured host exercised the Python tests.
+- `git diff --check` passed. The documentation link scanner reported 60 relative links in 53 Markdown files, zero broken. The separate documentation immutability script requires BASE/HEAD arguments; its no-argument usage output is not a successful validation, and no documentation files are changed by this patch.
+- Target-state caveat: the disposable target identifies its base as `8c95e059f8b35506834bda1f71e45b5c9968b3c2`, whereas the brief's prior-art review names `c47c5c2`. The target lacks the cited sensitive-path ADR/data and has shifted spec lines. This is not a patch defect. Source citations above use actual target line numbers; patch citations refer directly to the supplied diff. No other checkout was consulted.
+- The brief documents an affected-path history/closed-PR check, but the flattened target cannot substantiate that history independently. No `INTEGRATION.md` is present in the supplied target or review inputs, so additional project-specific human-only items could not be enumerated.
+- The C5 smell-test found no capability probe guarding a path that requires that capability: the added exception handling concerns specified file/configuration errors. No builder-fixable defect was established by this review.
+
+<!-- pdca:leaf-complete -->

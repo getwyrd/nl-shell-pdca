@@ -1,0 +1,24 @@
+# Security review (advisory) — issue 120, buffer background PTY output
+
+**Attacker-reachable input this diff touches:** command output (threat model "Where untrusted input enters" item 1). Here that means bytes a background job writes to the PTY while no command runs. Whoever controls that job's output controls them: a cloned repo's script, a fetched page piped through a job, and so on. Nothing else on the untrusted list is touched. There are no gate, classifier, sudo, history, log or model-context changes.
+
+**Verdict: no finding at any severity on the threat model's scale.** The patch narrows an attack surface. It does not widen one.
+
+What I checked, with paths in the target source:
+
+- **Background bytes never reach the real terminal.** The reader thread `_background_loop` (`src/nl_shell/session.py:858-894`) only calls `os.read` on the PTY and `_Background.add`. It never writes to the PTY (§5.3) or the terminal. `take_background_output` (`src/nl_shell/session.py:807-826`) returns bytes to the caller, and no caller exists yet. So the High row "spoofs the confirm UI, including background output shown during a confirm" (`.oss-scanner/threat_model.md:305-306`) cannot be reached through this diff.
+- **Background bytes never enter a `CommandResult`.** `run()` stops the thread first (`src/nl_shell/session.py:927`). It drains twice: at the start, and again right before the paste (`:930`, `:944`). Each drain sends bytes to the buffer when armed, or drops them (`:1387-1396`). Only bytes read inside `_wait_for_result` feed `_Output`, which is unchanged. A background byte that lands between the second drain and the paste write is counted as the command's output. That matches the old behaviour and §4.1, and the window is a few syscalls wide. Test (d) (`test_a_chatty_background_job_is_not_stalled_and_its_tail_is_kept`, `test_background_output_is_held_back_while_idle`) checks the attacker case: `Run this?` and the 1 MiB `x` payload are absent from the next command's `output` and from the stand-in screen.
+- **Control channel and forging completion.** The thread never reads fd 3 and never touches the tracker. A record that arrives while idle is still checked by `_drain_control` at the next `run()` (`src/nl_shell/session.py:933`). Printed text still cannot forge `D`/`E`.
+- **Resource use.** The buffer is capped: 64 KiB kept, plus at most one 64 KiB chunk briefly before the trim (`_Background.add`, `src/nl_shell/session.py:541-547`). A 1 MiB flood is tested and ends with exactly 65536 bytes kept and 983040 counted as dropped. Memory does not grow with the attacker's input.
+- **Thread lifetime and fd reuse.** `close()` stops and joins the thread before the PTY fd is closed (`src/nl_shell/session.py:652`), so the thread cannot read from a reused fd number. `restart()` goes through `close()`. On a timeout the session degrades (`:1066-1068`), so the `finally` in `run()` restarts the reader (`:961-963`). Test (e) checks that `close()` returns with output still waiting and leaves no thread behind.
+- **Taint.** The docstring marks the block as untrusted (ADR-0016), as the brief asks. No taint type is added (deferred to #11), and the block goes nowhere near the state block or the model.
+- **Threat-model and spec text.** The patch updates `.oss-scanner/threat_model.md` ("Built so far (#120)…" under "What must hold", plus a new "Some background output is dropped, not shown" known gap). Both match the code: the 50 ms settle cap is `_PROMPT_SETTLE_MAX`, and the fd-0-redirected case falls to the dropped path. The T2 gate log confirms the threat model was updated.
+
+Low notes, not tagged (no action needed in this slice):
+
+- `src/nl_shell/session.py:865-876`: if bash is never seen waiting on the terminal between commands (after a confirmed `exec 0</dev/null`, or a degraded session), the thread polls `/proc/<pid>/syscall` every 5 ms until the next `run()`, and all PTY bytes in that time are dropped. That costs some CPU but is not exploitable. The threat model already lists the dropped bytes as a known gap. Getting there needs a confirmed session-altering command, which is out of scope.
+- `src/nl_shell/session.py:554-569`: the block is raw PTY bytes. It has a header line but no closing delimiter, and the tail cut can start in the middle of an escape sequence. Neither matters until something displays the block. When #78 wires the display, the block must pass through the same output filter as the §6 mirror (#163). The docstring and the new threat-model text both say so. The existing "#78 MUST NOT wire the session…" sentence (`.oss-scanner/threat_model.md:281`) names only "the §6 mirror". Naming the background block there too would make the dependency explicit. That is a wording suggestion, not a defect in this diff.
+
+No NEEDS-HUMAN items.
+
+<!-- pdca:leaf-complete -->

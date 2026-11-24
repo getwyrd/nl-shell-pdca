@@ -1,0 +1,33 @@
+Add a CI check that blocks edits to frozen design records
+
+ADR-0001 says an Accepted ADR is never edited and that a docs CI check
+enforces this, but no such check existed. A PR could rewrite an Accepted
+ADR, an accepted proposal or a stable spec and still merge green.
+
+This adds scripts/docs_checks.py (standard library only) and a
+pull_request-only "Docs checks" workflow that runs it. A design record that
+is frozen on the PR's base must stay byte-identical at the head. The one
+exception is its frontmatter status line, which may move to a listed next
+state:
+
+- ADRs: Accepted may become "Superseded by ADR-NNNN"; a Superseded ADR is
+  never edited. Proposed ADRs (including 0008) stay editable.
+- Proposals: accepted may become implemented or withdrawn.
+- Specs: stable may become superseded or withdrawn.
+
+The check diffs merge-base to head, so a stale branch does not fail on
+files it never touched. A record frozen on the base after the PR branched
+off still counts as frozen. Renames are checked at the old path, a leading
+UTF-8 BOM does not hide a file's status, and template status comments and
+quoted values are handled.
+
+The workflow runs the base commit's copy of the script under "python -I",
+so a PR can neither edit the script nor plant a module such as re.py to
+switch off its own check. The PR that first adds the script runs its own
+copy. The ADR and proposal index pages each gain one sentence stating the
+allowed status changes.
+
+tests/test_docs_checks.py builds throwaway git repos and covers the
+must-fail and must-pass cases, plus the CI step itself.
+
+Fixes #97

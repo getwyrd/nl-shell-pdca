@@ -1,0 +1,24 @@
+Review Unicode 16 character safety for model proposals and displayed text, including the round-4 Bash word-joining fix and documented Highly Restrictive exceptions.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The latest human decisions define the bounded blank list, allowed script combinations and requested word-joining repair; these supersede the earlier broader invariant (brief.md:47, brief.md:62). |
+| C2 Reproduction (red pre-fix) | PASS | Frozen red leg shows 57 failures and 9 passes without collection errors; independent execution of the base render module also misses all 19 hidden vectors (gate-logs/C4-verify.log:1545; target/tests/test_charsafety.py:99). |
+| C3 Change | PASS | The six affected paths stay within the agreed Unicode policy, generator, tests and threat-model scope; the human explicitly waived the size backstop (patch.diff:1; brief.md:61). |
+| C4 Verification (red→green) | PASS | Frozen evidence shows 66 green versus 57 red; local pytest re-run is unavailable because pytest is absent, but direct checks pass 19 hidden/escape, 14 mixed rejection and 8 acceptance vectors, and real UCD regeneration matches byte-for-byte (gate-logs/C4-verify.log:11, gate-logs/C4-verify.log:1545; target/scripts/gen_unicode_tables.py:148). |
+| C5 Causal adequacy | NEEDS-HUMAN [impl] | Close the remaining Bash continuation bypass — a command consisting of U+0441, backslash, LF, then `url x` is accepted as Command, but Bash removes backslash-LF and reconstructs the forbidden mixed-script `сurl`; normalize continuations for policy inspection and add a rejection regression (target/src/nl_shell/render.py:150, target/src/nl_shell/render.py:206). |
+| T1 Structure | PASS | One shared policy serves rejection and escaping, with generated versioned data and no added runtime dependency; no capability probe or symptom guard was introduced (target/src/nl_shell/render.py:160, target/src/nl_shell/render.py:221; target/scripts/gen_unicode_tables.py:148). |
+| T2 Shape | PASS | Direct inspection confirms the threat model covers the narrowed blank set and allowed look-alike gaps; the scanner log only says no relevant path touched and does not itself establish coverage (target/.oss-scanner/threat_model.md:131, target/.oss-scanner/threat_model.md:184; gate-logs/T2-threat-model.log:10). |
+| T3 Runtime | PASS | Frozen full-suite output records 547 passing tests and one forkpty deprecation warning; local pytest is unavailable, so this verdict rests on the captured suite rather than a claimed local re-run (gate-logs/T3-suite.log:20, gate-logs/T3-suite.log:25). |
+| T4 Contribution | N/A | Contribution artifacts are absent by design; the substantive contribution audit must re-run at publish (gate-logs/T4-contribution.log:10). |
+| T5 Judgment | NEEDS-HUMAN | Confirm affected-path prior art across merged history and closed/rejected work — local path-filtered history contains only the synthetic base commit and no remote, while the brief reports content searches rather than the required path-based check (brief.md:25; patch.diff:1). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Decide whether the repaired policy is fit for release with the already approved blank-list and look-alike limits — passing vectors cannot establish perceptual safety for all fonts, and #74 remains responsible for the explicitly allowed look-alikes (target/.oss-scanner/threat_model.md:134, target/.oss-scanner/threat_model.md:184). |
+
+Independent evidence and limitations:
+
+- The target is readable and contains the patch; citations above use that source. No production files were changed. Because pytest is missing, the full stash/red/unstash/green test procedure could not run locally; both frozen test logs were read. The base render module was evaluated from `git show HEAD:src/nl_shell/render.py` for the independent hidden-character comparison.
+- The real build dependency was exercised: `python3 scripts/gen_unicode_tables.py --output ../regenerated_tables.py` succeeded against `/usr/share/unicode`, and `cmp` against the committed tables returned zero. There is no outstanding Unicode-data dependency caveat.
+- The continuation investigation used `proposal.parse` on the literal character sequence described in C5; it returned `Command`. A separate harmless Bash invocation using `set --` and printing its first argument produced `сurl`, exit zero. No attacker-named executable was invoked. Existing tests cover quotes and backslashes but omit backslash-LF (target/tests/test_charsafety.py:169).
+- The gate wrappers are instance-scoped and unavailable here; their frozen logs supply their outcomes. No INTEGRATION.md was present in the supplied target. Prior-art investigation was confined to this target; its single-commit history cannot settle merged or closed/rejected attempts.
+
+<!-- pdca:leaf-complete -->

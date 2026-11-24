@@ -1,0 +1,10 @@
+{
+  "mode": "new-pr",
+  "branch": "fix/15-heuristic-nl-vs-command-router",
+  "pr_url": "https://github.com/eduralph/nl-shell/pull/82",
+  "base": "main",
+  "repo": "eduralph/nl-shell",
+  "by": "Eduard Ralph",
+  "date": "2026-10-14",
+  "id_pending": false
+}

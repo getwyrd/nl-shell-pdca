@@ -1,0 +1,17 @@
+# Adversarial review — issue 155 (failure-classifier-by-exit-code), round 7
+
+I found one real miss in the round-6 alias fix. The red→green evidence holds up, and the two bugs named at sign-off are fixed.
+
+## Findings
+
+- NEEDS-HUMAN [impl] — `src/nl_shell/failure_classes.py:113-114` (`_ALIAS_START` / `_ALIAS_LINE` = `alias ([^=\s]+)=`) does not match the line that real bash prints for an alias whose name starts with `-`. Bash 5.3.9 `alias -p` prints `alias -- -s='sudo'` (I checked on this host). The regex stops at the space after `--`, so `_parse_aliases` drops that alias. `_parse_aliases("alias -- -s='sudo'\n")` returns `{}`, and `is_privileged("-s x", (), that_text)` returns **False**. P1 sees no name. P2 sees no marker. P3 passes `-s` because it fully matches `_PLAIN` at `:110`. P4 has no functions. P5 never sees the alias. So `-s x` at status 1 comes back OTHER with `offer_correction=True` and `to_reader=True`. Bash does expand it: piping `alias -- -s="echo EXPANDED"` then `-s x` into `bash -O expand_aliases` prints `EXPANDED x`. P5 is meant to cover any piece that equals an alias name in `snapshot.aliases`, and this alias is in `snapshot.aliases`. That makes it a build bug under the review bound, not a rule gap. The same line-start bug from round 6 also comes back for these aliases. The value of `alias -- -z='ls\nalias ls=sudo'` is not read as one quoted value. Its inner line gets parsed as a real alias (`{'ls': "sudo'"}`). That particular case leans toward over-matching, which is safe, but it is the same parse the sign-off asked to remove. Fix: accept an optional `-- ` after `alias ` in both regexes. Add rows for `-s x` with `alias -- -s='sudo'`, and for a multi-line `alias -- ` value.
+
+- Tried and could not break: the alias depth memo (`failure_classes.py:236-250`). The saved height plus the `depth + height - 1 > MAX_ALIAS_DEPTH` check at `:240` correctly charges a later, deeper visit. On the 10-deep chain, `a8; a0`, `a8 a0`, `a0 a8` and `a1 a0` all return privileged. A cycle (`open_names`) can only produce True, which ends the whole call, so no "not privileged" result that depends on `open_names` is ever saved.
+
+- Tried and could not break: the round-6 multi-line and repeated-name parse (`:300-346`) on the real `alias -p` text. `alias s='sudo -v\nalias s=ls #'` comes back privileged. So does `alias q='a'\''b'` followed by `alias r='sudo'`. I also tried an alias whose value ends in `alias t=`, so the next real lines get swallowed into an open quote. The unclosed-quote branch at `:325-328` marks the swallowed names as None, which counts as privileged, so `s x` still comes back privileged.
+
+- About the evidence, not a refutation: the C4 red leg (`gate-logs/C4-verify.log:6500`, 269 of 270 failed) is all `ModuleNotFoundError`, because the module is new. That proves the tests import the production module and do not use a copy. It says nothing about whether the round-6 rows (`tests/test_failure_classes.py:341-349`) would have gone red on the v6 code. I could not re-run pytest here (it is not installed), so I checked the two fixed bugs directly against the production `is_privileged` instead. Green is 270 passed (`C4-verify.log:15`). T3 is 922 passed.
+
+- Small nit: in the Known-gaps bullet (`.oss-scanner/threat_model.md`, patch hunk `@@ -187`), the line "…before it skips redirections. In those cases the failed command may be offered a correction and its output" is not wrapped like the rest of the file. It is cosmetic only, and the threat-model test strings are all present.
+
+<!-- pdca:leaf-complete -->

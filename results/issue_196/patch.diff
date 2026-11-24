@@ -1,0 +1,2518 @@
+diff --git a/.oss-scanner/threat_model.md b/.oss-scanner/threat_model.md
+index e089ac7..f218a09 100644
+--- a/.oss-scanner/threat_model.md
++++ b/.oss-scanner/threat_model.md
+@@ -154,6 +154,31 @@ Trusted:
+ - **Untrusted text never becomes trusted**: reader output is untrusted, retrieved history
+   is at most local-reference, and tainted turns aren't retrieved (ADR-0016, ADR-0017).
+ - **Model output is never piped into the shell without going through the gate.**
++- **The gate assumes nothing is safe until it has proof** (`nl_shell.gate`, #196). Its
++  shell layer parses with the pinned tree-sitter-bash and holds six properties. (1) The
++  tree is trusted only with no `ERROR` or `MISSING` node and none of the features
++  tree-sitter-bash reads differently from bash (backslash-newline outside single quotes,
++  a here-doc delimiter that is not a plain or fully quoted word, `<<-`, two here-docs
++  started on one line, unquoted extglob openers, bash 5.3 `${ ` / `${|`); otherwise a
++  proposal is rejected, typed input is at least `mutating` ("unparseable"), every
++  redirect except the §2 exempt forms, here-docs and parsed here-strings is rejected,
++  and no stdin fact is kept. (2) Every named node is walked exactly once and every simple command
++  gives one invocation, checked on every classification; a node kind with no handler,
++  or a walk that misses a node, is decision C (`privileged`, rejected, "could not
++  class"). (3) Stdin is `terminal`, `pipe`, `file` or `literal` only in the listed
++  forms, else `unknown`, which consumers treat as the worst case; a command that can
++  change the shell's own stdin (`exec` with a redirect, `eval`, `source`, a non-literal
++  command word) makes every other command's stdin `unknown`; a word is literal only
++  when bash would expand nothing in it. (4) A redirect is accepted only with no
++  descriptor or a literal 0-2 and a target that is a dup or close of 0-2, a literal
++  path outside `/dev`, `/proc` and `/sys` with no `..` (apart from `/dev/null`,
++  `/dev/stdin`, `/dev/stdout`, `/dev/stderr`, `/dev/tcp/…`, `/dev/udp/…`); every other
++  redirect is rejected, so fd 3 cannot be reached by a literal descriptor, a dup, a
++  `/dev/fd` or `/proc/*/fd` path, or a non-literal target. (5) Input over 8 KiB is
++  decision C before it is parsed, and the walk has a node and depth budget; any internal
++  error is decision C, and `classify` never raises. (6) No reason string carries a raw
++  control or hidden character from the input. The command layer, §7 and §8 are still
++  stubs that fail closed: every simple command is at least `mutating`.
+ - **The command model and the reader have no network**; the model server listens only on
+   a `0600` Unix socket (ADR-0018).
+ - **Locally complete**: no telemetry and no outbound connection in the default config.
+diff --git a/pyproject.toml b/pyproject.toml
+index a120eee..bc12f9f 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -14,6 +14,10 @@ dependencies = [
+     "prompt_toolkit>=3.0",
+     "ptyprocess>=0.7",
+     "PyYAML>=6",
++    # The policy gate's parser (spec policy-gate/v1 §1.2): pinned exactly, because the
++    # gate's rules depend on how this grammar reads bash.
++    "tree-sitter==0.26.0",
++    "tree-sitter-bash==0.25.1",
+ ]
+ 
+ [project.optional-dependencies]
+diff --git a/src/nl_shell/gate/__init__.py b/src/nl_shell/gate/__init__.py
+new file mode 100644
+index 0000000..5fb97ef
+--- /dev/null
++++ b/src/nl_shell/gate/__init__.py
+@@ -0,0 +1,267 @@
++"""The policy gate (ADR-0013, spec ``docs/design/specs/policy-gate/v1.md``).
++
++``classify(command, origin=..., label=...)`` runs the spec's §1 decision procedure and
++returns a ``Result`` with the session-log ``gate`` shape
++(``{"class", "reasons", "rejected"}``, spec ``session-log/v1``). It never raises.
++
++This package ships the **shell layer** (issue #196): the character check (§1.1), the
++parse and walk (``nl_shell.gate.parse``, Rules 1-5), and the shell-level rules of §2, §3
++and §5 that need no per-command meaning. The later steps are stubs the pipeline already
++calls, for the issues that replace them:
++
++- ``rules`` (the command layer, #197/#198): every simple command is ``mutating``,
++  "not allowlisted" (decision A's floor);
++- ``live`` (§7, #192): every simple command still ``read-only`` becomes ``mutating``,
++  "live-session resolution not implemented";
++- ``sensitive`` (§8, #190) and ``words`` (#191): no-ops.
++
++Decision C: any gate failure (an unhandled node kind, the work budget, input over the size
++cap, any internal error) gives ``privileged``, rejected, reason "could not class".
++
++Each reason that quotes input escapes it (Rule 6): no reason holds a C0 or C1 control
++character or any character ``nl_shell.render.is_hidden`` reports.
++"""
++
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++
++from nl_shell import render
++from nl_shell.gate import live, parse, rules, sensitive, words
++from nl_shell.gate.parse import CLASSES, RANK, Invocation, Stdin, Word
++from nl_shell.gate.rules import Verdict
++
++__all__ = [
++    "CLASSES",
++    "COULD_NOT_CLASS",
++    "ORIGINS",
++    "Invocation",
++    "Result",
++    "Stdin",
++    "Verdict",
++    "Word",
++    "classify",
++]
++
++ORIGINS = ("proposal", "typed")
++COULD_NOT_CLASS = "could not class"
++
++# §3: assignments to these names alter the session.
++_SESSION_NAMES = frozenset(
++    (
++        "PATH",
++        "BASH_ENV",
++        "ENV",
++        "CDPATH",
++        "PROMPT_COMMAND",
++        "PS0",
++        "PS1",
++        "PS2",
++        "PS3",
++        "PS4",
++        "IFS",
++        "HISTFILE",
++        "PAGER",
++        "MANPAGER",
++        "SYSTEMD_PAGER",
++        "GIT_PAGER",
++        "LESSOPEN",
++        "LESSCLOSE",
++        "EDITOR",
++        "VISUAL",
++        "BROWSER",
++        "NODE_OPTIONS",
++    )
++)
++_SESSION_PREFIXES = ("LD_", "SUDO_", "PYTHON", "PERL5", "GIT_")
++_SUDO_REJECTED = ("SUDO_PROMPT", "SUDO_ASKPASS")  # §5
++_SYSTEM_DIRS = ("/usr/bin", "/usr/sbin", "/bin", "/sbin")
++
++
++@dataclass(frozen=True)
++class Result:
++    """The gate's answer: the session-log ``gate`` object."""
++
++    cls: str
++    reasons: tuple[str, ...]
++    rejected: bool
++
++    def as_log(self) -> dict:
++        return {"class": self.cls, "reasons": list(self.reasons), "rejected": self.rejected}
++
++
++def escape(text: str) -> str:
++    """``text`` safe to put in a reason (Rule 6): backslashes doubled, and every C0/C1
++    control and every hidden character written as an escape."""
++    out = []
++    for char in text:
++        code = ord(char)
++        if char == "\\":
++            out.append("\\\\")
++        elif code < 0x20 or 0x7F <= code <= 0x9F or render.is_hidden(char):
++            out.append(render.escape_char(char))
++        else:
++            out.append(char)
++    return "".join(out)
++
++
++class _Tally:
++    def __init__(self) -> None:
++        self.rank = -1
++        self.cls = "read-only"
++        self.reasons: list[str] = []
++        self.rejected = False
++
++    def raise_to(self, cls: str, reason: str | None = None) -> None:
++        rank = RANK[cls]
++        if rank > self.rank or (rank == self.rank and cls == "session-altering"):
++            self.rank, self.cls = rank, cls
++        if reason and reason not in self.reasons:
++            self.reasons.append(reason)
++
++    def reject(self, reason: str) -> None:
++        self.rejected = True
++        self.raise_to("mutating", reason)
++
++    def verdict(self, verdict: Verdict) -> None:
++        if verdict.cls not in RANK:
++            raise ValueError("unknown class from a later step")
++        for reason in verdict.reasons or (None,):
++            self.raise_to(verdict.cls, reason)
++        if verdict.rejected:
++            self.rejected = True
++
++    def result(self) -> Result:
++        return Result(
++            cls=self.cls,
++            reasons=tuple(escape(r) for r in self.reasons),
++            rejected=self.rejected,
++        )
++
++
++def _could_not_class(detail: str) -> Result:
++    return Result(cls="privileged", reasons=(COULD_NOT_CLASS, detail), rejected=True)
++
++
++def classify(command: str, *, origin: str = "typed", label: str | None = None) -> Result:
++    """Class ``command`` (spec ``policy-gate/v1`` §1). ``origin`` is ``proposal`` (from
++    the model) or ``typed`` (from the user); ``label`` is the model's risk label, if
++    any. Never raises: a failure is decision C."""
++    try:
++        return _classify(command, origin, label)
++    except parse.GateFailure as exc:
++        return _could_not_class(str(exc))
++    except Exception as exc:  # decision C: any internal error fails closed
++        return _could_not_class(f"internal error ({type(exc).__name__})")
++
++
++def _classify(command: str, origin: str, label: str | None) -> Result:
++    if not isinstance(command, str) or origin not in ORIGINS:
++        raise parse.GateFailure("bad arguments")
++    if label is not None and label not in CLASSES:
++        raise parse.GateFailure("unknown model label")
++    proposal = origin == "proposal"
++    tally = _Tally()
++
++    # §1.1 characters. Quoted or not (stricter than the spec's "outside quotes").
++    if render.has_hidden(command):
++        if proposal:
++            tally.reject("proposal holds a hidden character")
++        else:
++            tally.raise_to("mutating", "hidden character (shown escaped)")
++
++    layer = parse.shell_layer(command)  # Rule 5's size cap is checked before parsing
++
++    # §1.2, Rule 1.
++    for feature in layer.untrusted:
++        if proposal:
++            tally.reject(f"unparseable proposal: {feature}")
++        else:
++            tally.raise_to("mutating", f"unparseable: {feature}")
++
++    _redirects(tally, layer)
++    _assignments(tally, layer)
++    for name in layer.functions:
++        tally.raise_to("session-altering", f"function definition: {name}")
++    if layer.process_substitutions:
++        tally.raise_to("mutating", "process substitution")
++    if any(parse.has_device_socket(w.text) for w in layer.words) or parse.has_device_socket(
++        command
++    ):
++        tally.raise_to("mutating", "uses /dev/tcp or /dev/udp")
++
++    for invocation in layer.invocations:
++        _shell_rules(tally, invocation)
++        verdict = rules.classify(invocation)
++        verdict = live.resolve(invocation, verdict)
++        tally.verdict(verdict)
++        for step in (sensitive.check, words.check):
++            extra = step(invocation)
++            if extra is not None:
++                tally.verdict(extra)
++    if not layer.invocations:
++        # Nothing was proven read-only.
++        tally.raise_to("mutating", "no simple command to class")
++
++    # §1.7: the model's label raises, never lowers.
++    if label is not None and RANK[label] > RANK[tally.cls]:
++        tally.raise_to(label, f"model labelled it {label}")
++    return tally.result()
++
++
++def _redirects(tally: _Tally, layer: parse.ShellLayer) -> None:
++    for record in layer.redirects:
++        shown = record.display
++        if not record.accepted:
++            tally.reject(f"redirection rejected ({record.why}): {shown}")
++        if layer.untrusted and record.kind in ("file_redirect", "loose"):
++            # Rule 1: in untrusted text only the §2 exempt forms stand, apart from a
++            # here-doc operator (`<<`), which in bash only feeds stdin.
++            if not record.exempt and not record.heredoc_operator:
++                tally.reject(f"unparseable: redirection in untrusted text: {shown}")
++        if record.device_socket:
++            tally.raise_to("mutating", "uses /dev/tcp or /dev/udp")
++        if record.accepted and record.output and not record.exempt:
++            tally.raise_to("mutating", f"output redirection: {shown}")
++
++
++def _assignments(tally: _Tally, layer: parse.ShellLayer) -> None:
++    for assignment in layer.assignments:
++        name = assignment.name
++        if name in _SUDO_REJECTED:
++            tally.reject(f"assignment to {name} is rejected")
++        if assignment.role == "prefix" and not layer.untrusted:
++            # A prefix assignment lasts for one command (§2, below). In an untrusted
++            # tree that is not proven (`PATH=x >/dev/null; cat` parses `cat` as the
++            # name), so §3 applies.
++            continue
++        if name in _SESSION_NAMES or name.startswith(_SESSION_PREFIXES):
++            tally.raise_to("session-altering", f"assignment to {name}")
++
++
++def _shell_rules(tally: _Tally, invocation: Invocation) -> None:
++    """§2 rules that need no per-command meaning."""
++    for assignment in invocation.assignments:
++        if assignment.role == "prefix":
++            tally.raise_to("mutating", f"prefix assignment: {assignment.name}")
++    word = invocation.command_word
++    if word is None or not word.source:
++        return  # no command word (`PATH=x >/dev/null`): nothing to judge here
++    if not word.literal:
++        tally.raise_to("mutating", f"command word is not a literal: {word.source}")
++    elif "/" in word.text and not _system_path(word.text):
++        tally.raise_to(
++            "mutating",
++            f"command word is a path outside the system directories: {word.text}",
++        )
++
++
++def _system_path(path: str) -> bool:
++    if not path.startswith("/"):
++        return False
++    parts = path.split("/")
++    if ".." in parts or "." in parts:
++        return False
++    directory, _, name = re.sub(r"/+", "/", path).rpartition("/")
++    return bool(name) and directory in _SYSTEM_DIRS
+diff --git a/src/nl_shell/gate/live.py b/src/nl_shell/gate/live.py
+new file mode 100644
+index 0000000..88dd1f6
+--- /dev/null
++++ b/src/nl_shell/gate/live.py
+@@ -0,0 +1,19 @@
++"""Live-session resolution (spec ``policy-gate/v1`` §7): a fail-closed stub (issue #196).
++
++#192 replaces it with the real checks against the session snapshot. Until then every
++simple command still ``read-only`` after the command layer becomes ``mutating``, with
++``NOT_IMPLEMENTED`` as the reason. #198 and #192 assert on that exact string.
++"""
++
++from __future__ import annotations
++
++from nl_shell.gate.rules import Verdict
++
++NOT_IMPLEMENTED = "live-session resolution not implemented"
++
++
++def resolve(invocation, verdict: Verdict) -> Verdict:
++    """§7 for one simple command and the verdict the command layer gave it."""
++    if verdict.cls == "read-only":
++        return Verdict("mutating", (*verdict.reasons, NOT_IMPLEMENTED), verdict.rejected)
++    return verdict
+diff --git a/src/nl_shell/gate/parse.py b/src/nl_shell/gate/parse.py
+new file mode 100644
+index 0000000..498a8b1
+--- /dev/null
++++ b/src/nl_shell/gate/parse.py
+@@ -0,0 +1,1015 @@
++"""The policy gate's shell layer (spec ``policy-gate/v1`` §1 steps 2-4, issue #196).
++
++It parses a command with the pinned tree-sitter-bash and walks the tree with one handler
++per named node kind of the pinned grammar (``HANDLERS``). Each simple command becomes an
++``Invocation`` for the command layer (``nl_shell.gate.rules``).
++
++One principle runs through this module: **nothing is safe until it is proven**. Every fact
++it records (the tree is right, a node was walked, a word is literal, stdin comes from X, a
++redirect is safe) starts as not proven, and becomes proven only through the short lists
++of forms below. Anything else is handled as the worst case.
++
++- Rule 1 (``untrusted_features``): the tree is trusted only with no ``ERROR`` or
++  ``MISSING`` node and none of the features tree-sitter-bash reads differently from bash.
++- Rule 2 (``walk``): every named node is visited exactly once, and every ``command``,
++  ``declaration_command`` and ``unset_command`` gives exactly one invocation. Both are
++  checked against the tree on every walk; a miss is a ``GateFailure`` (decision C).
++- Rule 3 (``Stdin``, ``lex_word``): stdin sources and the literal flag are proven only
++  through the forms listed there; anything else is ``unknown`` / not literal.
++- Rule 4 (``judge_redirect``): a redirect is accepted only in the listed safe forms.
++- Rule 5: input over ``MAX_INPUT_BYTES`` is refused before it is parsed, and the walk has a
++  total-work budget (``MAX_WORK`` nodes, ``MAX_DEPTH`` levels).
++"""
++
++from __future__ import annotations
++
++import re
++from collections.abc import Callable, Iterator
++from dataclasses import dataclass, field, replace
++
++import tree_sitter
++import tree_sitter_bash
++
++# Rule 5. Proposals are capped at 2000 characters (proposal.py), so these bounds bind only
++# typed input. tree-sitter-bash's parse time grows with the square of the input, which is
++# why the size cap is checked before parsing.
++MAX_INPUT_BYTES = 8 * 1024
++MAX_WORK = 4096
++MAX_DEPTH = 100
++
++LANGUAGE = tree_sitter.Language(tree_sitter_bash.language())
++
++CLASSES = ("read-only", "mutating", "session-altering", "destructive", "privileged")
++RANK = {
++    "read-only": 0,
++    "mutating": 1,
++    "session-altering": 1,
++    "destructive": 2,
++    "privileged": 3,
++}
++
++ERROR_KIND = "ERROR"
++SIMPLE_KINDS = ("command", "declaration_command", "unset_command")
++REDIRECT_KINDS = ("file_redirect", "heredoc_redirect", "herestring_redirect")
++# Anonymous tokens that are redirect operators.
++REDIRECT_OPERATORS = frozenset(
++    (">", ">>", ">|", "&>", "&>>", "<>", ">&", "<&", ">&-", "<&-", "<", "<<", "<<-", "<<<")
++)
++_OUTPUT_FILE_OPERATORS = (">", ">>", ">|", "&>", "&>>")
++_CLOSE_OPERATORS = (">&-", "<&-")
++_INPUT_OPERATORS = ("<", "<&", "<&-")  # default descriptor 0
++_DEV_NAMES = ("/dev/null", "/dev/stdin", "/dev/stdout", "/dev/stderr")
++_DEV_SOCKETS = ("/dev/tcp/", "/dev/udp/")
++_SYSTEM_TREES = ("/dev", "/proc", "/sys")
++_PLAIN_DELIMITER = re.compile(r"[A-Za-z0-9_]+")
++_QUOTED_DELIMITER = re.compile(r"'[^']*'|\"[^\"\\$`]*\"")
++_LOW_FD = ("0", "1", "2")
++
++
++class GateFailure(Exception):
++    """The shell layer could not class the command (decision C). The message is fixed
++    text: it never quotes the input."""
++
++
++def named_kinds() -> tuple[str, ...]:
++    """Every named node kind of the pinned grammar, plus ``ERROR``."""
++    kinds = {
++        LANGUAGE.node_kind_for_id(i)
++        for i in range(LANGUAGE.node_kind_count)
++        if LANGUAGE.node_kind_is_named(i) and LANGUAGE.node_kind_is_visible(i)
++    }
++    kinds.add(ERROR_KIND)
++    return tuple(sorted(kinds))
++
++
++def parse_source(source: bytes) -> tree_sitter.Tree:
++    """Parse ``source`` with the pinned grammar (the one entry point to the parser)."""
++    return tree_sitter.Parser(LANGUAGE).parse(source)
++
++
++# --- facts ---------------------------------------------------------------------------
++
++
++@dataclass(frozen=True)
++class Stdin:
++    """Where a simple command's standard input comes from (Rule 3).
++
++    ``kind`` is one of:
++
++    - ``terminal``: a command outside any function body and outside ``>(…)``, with no
++      redirect touching fd 0, first in its pipeline or standing alone;
++    - ``pipe``: a later stage of a pipeline, or the command inside ``>(…)``;
++    - ``file``: ``<`` (or ``0<``) from a literal path; ``value`` is the path;
++    - ``literal``: a here-string whose word is literal, or a here-doc whose delimiter is
++      quoted (or unquoted with no ``$``, `` ` `` or ``\\`` in its body); ``value`` is the
++      text;
++    - ``unknown``: everything else (function bodies, ``0>&N``, ``0>&-``, a stdin
++      redirect the gate cannot place, any command in untrusted text).
++
++    Consumers MUST treat ``unknown`` as the worst case for each rule: as a pipe for the
++    sudo-pipe rule and decision B, and as the terminal for the terminal-read rule.
++    """
++
++    kind: str
++    value: str | None = None
++
++
++TERMINAL = Stdin("terminal")
++PIPE = Stdin("pipe")
++UNKNOWN = Stdin("unknown")
++
++
++@dataclass(frozen=True)
++class Word:
++    """One shell word: ``text`` after quote removal, ``literal`` when bash would expand
++    nothing in it (Rule 3), ``source`` as written."""
++
++    text: str
++    literal: bool
++    source: str
++
++
++@dataclass(frozen=True)
++class Assignment:
++    """One ``variable_assignment`` node. ``role`` is ``prefix`` (``VAR=x cmd``),
++    ``declaration`` (inside ``export``/``declare``/…) or ``standalone``."""
++
++    name: str
++    value: Word | None
++    role: str
++
++
++@dataclass(frozen=True)
++class Redirect:
++    """One redirect node, judged by Rule 4."""
++
++    kind: str  # file_redirect | heredoc_redirect | herestring_redirect | loose
++    descriptor: str | None
++    operator: str
++    target: Word | None
++    accepted: bool
++    why: str  # why it was rejected ("" when accepted)
++    output: bool  # gives the §2 "output redirection" reason
++    exempt: bool  # one of the §2 exempt forms
++    device_socket: bool  # /dev/tcp or /dev/udp
++    feed: Stdin | None  # the stdin a here-doc/here-string gives
++    display: str  # operator and target as written (to be escaped before display)
++    heredoc_operator: bool  # its operator bytes are an unquoted `<<` in the text
++    start: int
++
++
++@dataclass(frozen=True)
++class Invocation:
++    """One simple command handed to the command layer."""
++
++    kind: str  # command | declaration | unset
++    words: tuple[Word, ...]
++    assignments: tuple[Assignment, ...]
++    redirects: tuple[Redirect, ...]
++    stdin: Stdin
++    in_function: bool
++
++    @property
++    def command_word(self) -> Word | None:
++        return self.words[0] if self.words else None
++
++
++@dataclass
++class ShellLayer:
++    """Everything the walk proved about one command."""
++
++    untrusted: tuple[str, ...]
++    invocations: list[Invocation] = field(default_factory=list)
++    assignments: list[Assignment] = field(default_factory=list)
++    functions: list[str] = field(default_factory=list)
++    redirects: list[Redirect] = field(default_factory=list)
++    process_substitutions: int = 0
++    words: list[Word] = field(default_factory=list)
++
++
++# --- Rule 3: the literal flag --------------------------------------------------------
++
++
++def lex_word(source: str) -> tuple[str, frozenset[str]]:
++    """Quote-remove ``source`` as bash would and say what bash would expand in it.
++
++    Returns the text and the set of causes that make it non-literal (empty means
++    literal). ``tilde`` alone, at the very start and followed by ``/`` or nothing, is
++    reported as ``leading-tilde`` so a redirect target may allow it (Rule 4).
++    """
++    out: list[str] = []
++    causes: set[str] = set()
++    i, n = 0, len(source)
++    while i < n:
++        c = source[i]
++        if c == "\\":
++            if i + 1 < n:
++                if source[i + 1] == "\n":
++                    causes.add("line continuation")
++                else:
++                    out.append(source[i + 1])
++                i += 2
++            else:
++                out.append(c)
++                i += 1
++            continue
++        if c == "'":
++            end = source.find("'", i + 1)
++            if end < 0:
++                causes.add("unclosed quote")
++                out.append(source[i + 1 :])
++                break
++            out.append(source[i + 1 : end])
++            i = end + 1
++            continue
++        if c == '"':
++            i += 1
++            closed = False
++            while i < n:
++                d = source[i]
++                if d == '"':
++                    closed = True
++                    i += 1
++                    break
++                if d == "\\" and i + 1 < n and source[i + 1] in '$`"\\\n':
++                    if source[i + 1] == "\n":
++                        causes.add("line continuation")
++                    else:
++                        out.append(source[i + 1])
++                    i += 2
++                    continue
++                if d in "$`":
++                    causes.add("expansion")
++                out.append(d)
++                i += 1
++            if not closed:
++                causes.add("unclosed quote")
++            continue
++        if c in "$`":
++            causes.add("expansion")
++        elif c in "*?[":
++            causes.add("glob")
++        elif c in "{}":
++            causes.add("brace")
++        elif c in "()":
++            causes.add("pattern or substitution")
++        elif c in " \t\n;&|<>":
++            causes.add("metacharacter")
++        elif c == "~":
++            if i == 0:
++                follows = source[1:2]
++                causes.add("leading-tilde" if follows in ("", "/") else "tilde")
++            elif source[i - 1] in "=:":
++                causes.add("tilde")
++        out.append(c)
++        i += 1
++    return "".join(out), frozenset(causes)
++
++
++def make_word(source: str) -> Word:
++    text, causes = lex_word(source)
++    return Word(text=text, literal=not causes, source=source)
++
++
++def _normal_path(path: str) -> tuple[str, bool]:
++    """``path`` with repeated slashes and ``.`` components removed; and whether it has a
++    ``..`` component."""
++    parts = path.split("/")
++    dotdot = ".." in parts
++    kept = [p for p in parts if p not in ("", ".")]
++    if path.startswith("/"):
++        return "/" + "/".join(kept), dotdot
++    return "/".join(kept), dotdot
++
++
++def has_device_socket(text: str) -> bool:
++    collapsed = re.sub(r"/+", "/", text)
++    return any(name in collapsed for name in _DEV_SOCKETS)
++
++
++# --- Rule 4: redirects ---------------------------------------------------------------
++
++
++def judge_redirect(
++    descriptor: str | None, operator: str, target: Word | None
++) -> tuple[bool, str, bool, bool]:
++    """Rule 4. Returns ``(accepted, why, exempt, device_socket)``.
++
++    Accepted only when the descriptor is absent or a literal 0-2 and the target is a
++    dup/move/close of 0-2, ``/dev/null``/``stdin``/``stdout``/``stderr``,
++    ``/dev/tcp/…``/``/dev/udp/…``, or a literal file (an optional leading ``~``) that is
++    not under ``/dev``, ``/proc`` or ``/sys`` and has no ``..`` component.
++    """
++    if descriptor is not None and descriptor not in _LOW_FD:
++        return False, "descriptor other than 0, 1 or 2", False, False
++    if operator in _CLOSE_OPERATORS:
++        if target is not None:
++            return False, "close with a target", False, False
++        return True, "", False, False
++    if target is None:
++        return False, "no target", False, False
++    _, causes = lex_word(target.source)
++    text = target.text
++    if operator in (">&", "<&"):
++        if not causes and re.fullmatch(r"[012]-?|-", text):
++            exempt = (descriptor, operator, text) in (
++                ("2", ">&", "1"),
++                ("1", ">&", "2"),
++                (None, ">&", "2"),
++            )
++            return True, "", exempt, False
++        if not causes and re.fullmatch(r"[0-9]+-?", text):
++            return False, "duplicates a descriptor other than 0, 1 or 2", False, False
++        if operator == "<&" or descriptor is not None:
++            return False, "duplicates something other than 0, 1 or 2", False, False
++        # `>&file` sends stdout and stderr to a file: judged as a file target below.
++    if causes - {"leading-tilde"}:
++        return False, "target is not a literal path", False, False
++    path, dotdot = _normal_path(text)
++    if dotdot:
++        return False, "target has a '..' component", False, False
++    if "leading-tilde" not in causes and text.startswith("/"):
++        if path in _DEV_NAMES:
++            exempt = path == "/dev/null" and operator in _OUTPUT_FILE_OPERATORS
++            return True, "", exempt, False
++        if any(path.startswith(name) for name in _DEV_SOCKETS):
++            return True, "", False, True
++        if any(path == tree or path.startswith(tree + "/") for tree in _SYSTEM_TREES):
++            return False, "target is under /dev, /proc or /sys", False, False
++    return True, "", False, False
++
++
++def _is_output(descriptor: str | None, operator: str, kind: str) -> bool:
++    if kind != "file_redirect":
++        return False
++    if operator in _INPUT_OPERATORS and descriptor in (None, "0"):
++        return False
++    return True
++
++
++# --- Rule 1: trusting the tree -------------------------------------------------------
++
++
++def _iter_nodes(root: tree_sitter.Node) -> Iterator[tree_sitter.Node]:
++    stack = [root]
++    while stack:
++        node = stack.pop()
++        yield node
++        stack.extend(reversed(node.children))
++
++
++def _masks(root: tree_sitter.Node, size: int) -> tuple[bytearray, bytearray]:
++    """Two byte masks over the source: ``single`` (inside single or ANSI-C quotes) and
++    ``quoted`` (also inside double-quoted text, here-doc text and comments)."""
++    single = bytearray(size)
++    quoted = bytearray(size)
++    bodies, spans = [], []
++    for node in _iter_nodes(root):
++        if node.type == "heredoc_body":
++            bodies.append(node)
++        elif node.type in ("raw_string", "ansi_c_string"):
++            spans.append((node, True))
++        elif node.type in ("string_content", "heredoc_content", "comment"):
++            spans.append((node, False))
++    for body in bodies:
++        width = body.end_byte - body.start_byte
++        quoted[body.start_byte : body.end_byte] = b"\x01" * width
++        for child in body.named_children:
++            if child.type != "heredoc_content":
++                width = child.end_byte - child.start_byte
++                quoted[child.start_byte : child.end_byte] = bytes(width)
++    for node, is_single in spans:
++        width = node.end_byte - node.start_byte
++        quoted[node.start_byte : node.end_byte] = b"\x01" * width
++        if is_single:
++            single[node.start_byte : node.end_byte] = b"\x01" * width
++    return single, quoted
++
++
++def _escaped(source: bytes, i: int) -> bool:
++    count = 0
++    while i - count - 1 >= 0 and source[i - count - 1] == 0x5C:
++        count += 1
++    return count % 2 == 1
++
++
++def _heredoc_runs(source: bytes) -> list[tuple[int, int]]:
++    """Every run of exactly two ``<`` in the text: what bash reads as a here-doc
++    operator wherever ``<<`` is an operator at all."""
++    runs, i, n = [], 0, len(source)
++    while i < n:
++        if source[i] == 0x3C:
++            j = i
++            while j < n and source[j] == 0x3C:
++                j += 1
++            if j - i == 2:
++                runs.append((i, j))
++            i = j
++        else:
++            i += 1
++    return runs
++
++
++def untrusted_features(tree: tree_sitter.Tree, source: bytes) -> tuple[str, ...]:
++    """Rule 1. The features that make the tree untrusted (empty means trusted)."""
++    root = tree.root_node
++    found: list[str] = []
++
++    def note(feature: str) -> None:
++        if feature not in found:
++            found.append(feature)
++
++    heredocs = []
++    for node in _iter_nodes(root):
++        if node.is_error or node.type == ERROR_KIND:
++            note("syntax error")
++        if node.is_missing:
++            note("missing token")
++        if node.type == "heredoc_start":
++            text = node.text.decode("utf-8", "surrogatepass")
++            if not (_PLAIN_DELIMITER.fullmatch(text) or _QUOTED_DELIMITER.fullmatch(text)):
++                note("here-doc delimiter is not a plain or fully quoted word")
++        if node.type == "heredoc_redirect":
++            heredocs.append(node)
++        if not node.is_named and node.type == "<<-":
++            note("here-doc with <<-")
++    single, quoted = _masks(root, len(source))
++    lines: dict[int, int] = {}
++    for start, _ in _heredoc_runs(source):
++        if quoted[start] or _escaped(source, start):
++            continue
++        if source[start + 2 : start + 3] == b"-":
++            note("here-doc with <<-")
++        line = source.count(b"\n", 0, start)
++        lines[line] = lines.get(line, 0) + 1
++    if any(count > 1 for count in lines.values()):
++        note("more than one here-doc on one line")
++    if sum(lines.values()) != len(heredocs):
++        note("here-doc the parser did not place")
++    for i in range(len(source) - 1):
++        pair = source[i : i + 2]
++        if pair == b"\\\n" and not single[i]:
++            note("backslash-newline")
++        elif pair[1:] == b"(" and pair[:1] in (b"?", b"*", b"+", b"@", b"!"):
++            if not quoted[i] and not _escaped(source, i):
++                note("extglob pattern")
++        elif pair == b"${" and not single[i]:
++            if source[i + 2 : i + 3] in (b" ", b"\t", b"\n", b"|"):
++                note("bash 5.3 ${ } substitution")
++    return tuple(found)
++
++
++# --- Rule 2: the walk ----------------------------------------------------------------
++
++
++@dataclass(frozen=True)
++class Ctx:
++    stdin: Stdin
++    in_function: bool = False
++    role: str | None = None  # how a variable_assignment child is used
++
++
++Handler = Callable[["Walker", tree_sitter.Node, Ctx, int, tuple], object]
++
++
++class Walker:
++    def __init__(self, source: bytes, layer: ShellLayer) -> None:
++        self.source = source
++        self.layer = layer
++        self.visits: dict[tuple[int, int, int], int] = {}
++        self.work = 0
++        self.heredoc_runs = _heredoc_runs(source)
++
++    def text(self, node: tree_sitter.Node) -> str:
++        return self.source[node.start_byte : node.end_byte].decode("utf-8", "surrogatepass")
++
++    def span(self, start: int, end: int) -> str:
++        return self.source[start:end].decode("utf-8", "surrogatepass")
++
++    def visit(self, node: tree_sitter.Node, ctx: Ctx, depth: int, bound: tuple = ()):
++        self.work += 1
++        if self.work > MAX_WORK:
++            raise GateFailure("work budget exceeded")
++        if depth > MAX_DEPTH:
++            raise GateFailure("nesting too deep")
++        kind = ERROR_KIND if node.is_error else node.type
++        handler = HANDLERS.get(kind)
++        if handler is None:
++            raise GateFailure("unhandled node kind")
++        key = (node.id, node.start_byte, node.end_byte)
++        self.visits[key] = self.visits.get(key, 0) + 1
++        return handler(self, node, ctx, depth, bound)
++
++    # Descriptor written right before a redirect operator that the tree did not attach
++    # (`cat 0>&-` parses as the argument `0` and the redirect `>&-`).
++    def adjacent_token(self, start: int) -> tuple[int, str] | None:
++        i = start
++        while i > 0 and self.source[i - 1] not in b" \t\n;&|()<>":
++            i -= 1
++        if i == start:
++            return None
++        return i, self.span(i, start)
++
++    def in_heredoc_run(self, start: int) -> bool:
++        """True when ``start`` is inside a ``<<`` run with no descriptor in
++        front of it, or a literal 0-2 (``3<<E`` and ``{x}<<E`` are never exempt)."""
++        for a, b in self.heredoc_runs:
++            if a <= start < b:
++                token = self.adjacent_token(a)
++                return token is None or token[1] in _LOW_FD
++        return False
++
++
++def _children(walker: Walker, node, ctx: Ctx, depth: int, bound: tuple = ()) -> None:
++    if bound:
++        ctx = _apply_compound(walker, bound, ctx, depth)
++    for child in node.named_children:
++        walker.visit(child, ctx, depth + 1)
++
++
++def _apply_compound(walker: Walker, bound: tuple, ctx: Ctx, depth: int) -> Ctx:
++    """Redirects on a compound command: judge them, and let them set the stdin the
++    commands inside inherit."""
++    stdin = ctx.stdin
++    for node in bound:
++        for record in walker.visit(node, ctx, depth + 1):
++            stdin = _stdin_after(record, stdin)
++    return replace(ctx, stdin=stdin)
++
++
++def _stdin_after(record: Redirect, stdin: Stdin) -> Stdin:
++    if record.kind in ("heredoc_redirect", "herestring_redirect"):
++        if record.descriptor in (None, "0"):
++            return record.feed or UNKNOWN
++        if record.descriptor in _LOW_FD:
++            return stdin
++        return UNKNOWN
++    if record.descriptor is not None and not record.descriptor.isdigit():
++        return UNKNOWN
++    if record.descriptor is None:
++        fd = "0" if record.operator in _INPUT_OPERATORS or record.operator == "<>" else "1"
++    else:
++        fd = record.descriptor.lstrip("0") or "0"
++    if fd != "0":
++        return stdin
++    if (
++        record.operator == "<"
++        and record.accepted
++        and record.target is not None
++        and record.target.literal
++    ):
++        return Stdin("file", record.target.text)
++    return UNKNOWN
++
++
++def _error(walker: Walker, node, ctx: Ctx, depth: int, bound: tuple = ()) -> None:
++    for child in node.children:
++        loose = (not child.is_named and child.type in REDIRECT_OPERATORS) or (
++            child.child_count == 0 and child.is_error
++        )
++        if loose:
++            text = walker.text(child)
++            if child.is_named and not any(c in text for c in "<>"):
++                continue
++            walker.layer.redirects.append(
++                Redirect(
++                    kind="loose",
++                    descriptor=None,
++                    operator=child.type,
++                    target=None,
++                    accepted=True,
++                    why="",
++                    output=False,
++                    exempt=False,
++                    device_socket=False,
++                    feed=None,
++                    display=text,
++                    heredoc_operator=walker.in_heredoc_run(child.start_byte),
++                    start=child.start_byte,
++                )
++            )
++    _children(walker, node, ctx, depth, bound)
++
++
++def _pipeline(walker: Walker, node, ctx: Ctx, depth: int, bound: tuple = ()) -> None:
++    stages, later = [], False
++    for child in node.children:
++        if not child.is_named:
++            if child.type in ("|", "|&"):
++                later = True
++            continue
++        stages.append((child, later))
++    # A trailing redirect on a pipeline belongs to its last stage, as in bash.
++    last = max((i for i, (c, _) in enumerate(stages) if c.type != "comment"), default=-1)
++    for i, (child, is_later) in enumerate(stages):
++        stage_ctx = replace(ctx, stdin=PIPE) if is_later else ctx
++        walker.visit(child, stage_ctx, depth + 1, bound if i == last else ())
++    if bound and last < 0:
++        _apply_compound(walker, bound, ctx, depth)
++
++
++def _negated(walker: Walker, node, ctx: Ctx, depth: int, bound: tuple = ()) -> None:
++    inner = node.named_children
++    if bound and len(inner) == 1:
++        walker.visit(inner[0], ctx, depth + 1, bound)
++        return
++    _children(walker, node, ctx, depth, bound)
++
++
++def _redirected(walker: Walker, node, ctx: Ctx, depth: int, bound: tuple = ()) -> None:
++    body = node.child_by_field_name("body")
++    mine = tuple(c for c in node.named_children if body is None or c.id != body.id)
++    redirects = tuple(c for c in mine if c.type in REDIRECT_KINDS)
++    others = tuple(c for c in mine if c.type not in REDIRECT_KINDS)
++    for other in others:
++        walker.visit(other, ctx, depth + 1)
++    if body is None:
++        _apply_compound(walker, redirects + bound, ctx, depth)
++        return
++    walker.visit(body, ctx, depth + 1, redirects + bound)
++
++
++def _simple(walker: Walker, node, ctx: Ctx, depth: int, bound: tuple = ()) -> None:
++    kind = {"command": "command", "declaration_command": "declaration"}.get(
++        node.type, "unset"
++    )
++    word_nodes: list = []  # name and argument children, named or not
++    prefix: list = []
++    redirect_nodes: list = list(bound)
++    others: list = []
++    unread: list = []  # walked, but not words (a zero-width MISSING command name)
++    keyword = None
++    seen_name = False
++    has_name = False
++    for i, child in enumerate(node.children):
++        fname = node.field_name_for_child(i)
++        if not child.is_named:
++            if fname == "argument":
++                word_nodes.append(child)
++            elif keyword is None and kind != "command" and not seen_name:
++                keyword = child
++                seen_name = True
++            continue
++        if child.type in REDIRECT_KINDS:
++            redirect_nodes.append(child)
++        elif fname == "name" and child.end_byte == child.start_byte:
++            # `PATH=x >/dev/null` parses with a MISSING command name: bash runs no
++            # command there, so this is no name.
++            unread.append(child)
++            seen_name = True
++        elif fname == "name":
++            word_nodes.append(child)
++            seen_name = True
++            has_name = True
++        elif child.type == "variable_assignment" and kind == "command" and not seen_name:
++            prefix.append(child)
++        elif fname == "argument" or kind != "command":
++            word_nodes.append(child)
++        else:
++            others.append(child)
++    redirect_nodes.sort(key=lambda n: n.start_byte)
++
++    # Descriptors the tree left as a separate word (`cat 0>&-`). Only a token that is a
++    # descriptor by the same test `_descriptor` uses is taken out of the words; any other
++    # word written against a redirect (`rm -rf />/dev/null`) stays an argument.
++    fd_tokens = set()
++    for r in redirect_nodes:
++        if r.child_by_field_name("descriptor") is None:
++            token = walker.adjacent_token(r.start_byte)
++            if token is not None and _is_descriptor_token(token[1]):
++                fd_tokens.add((token[0], r.start_byte))
++    fd_words = [w for w in word_nodes if (w.start_byte, w.end_byte) in fd_tokens]
++    word_nodes = [w for w in word_nodes if (w.start_byte, w.end_byte) not in fd_tokens]
++
++    # With no command word (`PATH=x >/dev/null`) the assignment is not a one-command
++    # prefix: bash keeps it in the shell, so it is standalone and §3 applies.
++    prefix_role = "prefix" if has_name or kind != "command" else "standalone"
++    assignments = []
++    for child in prefix:
++        assignments.append(walker.visit(child, replace(ctx, role=prefix_role), depth + 1))
++    role = "declaration" if kind == "declaration" else None
++    for child in word_nodes:
++        if child.is_named:
++            result = walker.visit(child, replace(ctx, role=role), depth + 1)
++            if isinstance(result, Assignment):
++                assignments.append(result)
++    for child in others + unread + [w for w in fd_words if w.is_named]:
++        walker.visit(child, ctx, depth + 1)
++    records: list[Redirect] = []
++    for child in redirect_nodes:
++        records.extend(walker.visit(child, ctx, depth + 1))
++
++    # Words: tree-sitter splits some bash words in two (`$"x"`); join pieces with no
++    # space between them, as bash does.
++    words: list[Word] = []
++    if keyword is not None:
++        words.append(make_word(walker.text(keyword)))
++    groups: list[list[int]] = []
++    for child in sorted(word_nodes + others, key=lambda n: n.start_byte):
++        if groups and groups[-1][1] == child.start_byte:
++            groups[-1][1] = child.end_byte
++        else:
++            groups.append([child.start_byte, child.end_byte])
++    for start, end in groups:
++        words.append(make_word(walker.span(start, end)))
++    if kind == "command" and not has_name:
++        words.insert(0, Word(text="", literal=False, source=""))
++    walker.layer.words.extend(words)
++
++    stdin = ctx.stdin
++    for record in records:
++        stdin = _stdin_after(record, stdin)
++    walker.layer.invocations.append(
++        Invocation(
++            kind=kind,
++            words=tuple(words),
++            assignments=tuple(a for a in assignments if a is not None),
++            redirects=tuple(records),
++            stdin=stdin,
++            in_function=ctx.in_function,
++        )
++    )
++
++
++def _assignment(walker: Walker, node, ctx: Ctx, depth: int, bound: tuple = ()):
++    name_node = node.child_by_field_name("name")
++    value_node = node.child_by_field_name("value")
++    if name_node is not None and name_node.type == "subscript":
++        inner = name_node.child_by_field_name("name")
++        name_node = inner if inner is not None else name_node
++    name = walker.text(name_node) if name_node is not None else walker.text(node)
++    value = make_word(walker.text(value_node)) if value_node is not None else None
++    record = Assignment(name=name, value=value, role=ctx.role or "standalone")
++    walker.layer.assignments.append(record)
++    if value is not None:
++        walker.layer.words.append(value)
++    _children(walker, node, replace(ctx, role=None), depth, bound)
++    return record
++
++
++def _function(walker: Walker, node, ctx: Ctx, depth: int, bound: tuple = ()) -> None:
++    name = node.child_by_field_name("name")
++    body = node.child_by_field_name("body")
++    start = name.start_byte if name is not None else node.start_byte
++    end = body.start_byte if body is not None else node.end_byte
++    shown = re.sub(r"\s*\(\s*\)\s*$", "", walker.span(start, end).strip())
++    walker.layer.functions.append(shown)
++    inner = replace(ctx, stdin=UNKNOWN, in_function=True, role=None)
++    redirects = [c for c in node.named_children if c.type in REDIRECT_KINDS]
++    for child in node.named_children:
++        if child.type in REDIRECT_KINDS:
++            continue
++        walker.visit(child, inner, depth + 1)
++    for child in list(bound) + redirects:
++        walker.visit(child, ctx, depth + 1)
++
++
++def _command_substitution(walker: Walker, node, ctx, depth, bound=()) -> None:
++    _children(walker, node, replace(ctx, role=None), depth, bound)
++
++
++def _process_substitution(walker: Walker, node, ctx, depth, bound=()) -> None:
++    walker.layer.process_substitutions += 1
++    opener = node.children[0].type if node.child_count else ""
++    inner = replace(ctx, role=None, stdin=PIPE if opener == ">(" else ctx.stdin)
++    _children(walker, node, inner, depth, bound)
++
++
++def _is_descriptor_token(text: str) -> bool:
++    """Whether a token written right before a redirect operator is its descriptor: all
++    digits (``0>&-``) or a ``{name}`` form (``{fd}>x``, ``{a[0]}>&-``). Anything else is an
++    ordinary word, as in bash (``echo secret>out`` keeps ``secret`` as an argument)."""
++    return text.isdigit() or (len(text) > 2 and text[0] == "{" and text[-1] == "}")
++
++
++def _descriptor(walker: Walker, node) -> str | None:
++    child = node.child_by_field_name("descriptor")
++    if child is not None:
++        return walker.text(child)
++    token = walker.adjacent_token(node.start_byte)
++    if token is None or not _is_descriptor_token(token[1]):
++        return None
++    return token[1]
++
++
++def _operator(node) -> str:
++    for child in node.children:
++        if not child.is_named and child.type in REDIRECT_OPERATORS:
++            return child.type
++    return ""
++
++
++def _file_redirect(walker: Walker, node, ctx, depth, bound=()) -> list[Redirect]:
++    _children(walker, node, replace(ctx, role=None), depth)
++    descriptor = _descriptor(walker, node)
++    operator = _operator(node)
++    targets = node.children_by_field_name("destination")
++    missing = any(t.is_missing or t.has_error for t in targets)
++    target = make_word(walker.text(targets[0])) if len(targets) == 1 else None
++    if missing or len(targets) > 1:
++        accepted, why = False, "target the parser could not read"
++        exempt = socket = False
++    else:
++        accepted, why, exempt, socket = judge_redirect(descriptor, operator, target)
++    op_node = next((c for c in node.children if c.type == operator), None)
++    op_start = op_node.start_byte if op_node is not None else node.start_byte
++    record = Redirect(
++        kind="file_redirect",
++        descriptor=descriptor,
++        operator=operator,
++        target=target,
++        accepted=accepted,
++        why=why,
++        output=_is_output(descriptor, operator, "file_redirect"),
++        exempt=exempt,
++        device_socket=socket or (target is not None and has_device_socket(target.text)),
++        feed=None,
++        display=(descriptor or "") + walker.span(op_start, node.end_byte),
++        heredoc_operator=walker.in_heredoc_run(op_start),
++        start=node.start_byte,
++    )
++    walker.layer.redirects.append(record)
++    return [record]
++
++
++def _heredoc_redirect(walker: Walker, node, ctx, depth, bound=()) -> list[Redirect]:
++    descriptor = _descriptor(walker, node)
++    operator = _operator(node)
++    delimiter = body = None
++    nested: list[Redirect] = []
++    piped = False
++    for i, child in enumerate(node.children):
++        fname = node.field_name_for_child(i)
++        if not child.is_named:
++            if child.type in ("|", "|&"):
++                piped = True
++            continue
++        if child.type == "heredoc_start":
++            delimiter = child
++            walker.visit(child, ctx, depth + 1)
++        elif child.type == "heredoc_body":
++            body = child
++            walker.visit(child, replace(ctx, role=None), depth + 1)
++        elif child.type in REDIRECT_KINDS or fname == "redirect":
++            result = walker.visit(child, ctx, depth + 1)
++            nested.extend(result if isinstance(result, list) else [])
++        elif child.type in ("heredoc_end", "file_descriptor"):
++            walker.visit(child, ctx, depth + 1)
++        else:
++            # The rest of the command line, which tree-sitter hangs under the here-doc.
++            if piped or child.type == "pipeline":
++                rest = PIPE
++            elif ctx.stdin.kind == "pipe":
++                rest = UNKNOWN
++            else:
++                rest = ctx.stdin
++            walker.visit(child, replace(ctx, stdin=rest, role=None), depth + 1)
++    feed = UNKNOWN
++    if delimiter is not None and body is not None and operator == "<<":
++        delim = walker.text(delimiter)
++        text = walker.text(body)
++        if delim[:1] in ("'", '"') and _QUOTED_DELIMITER.fullmatch(delim):
++            feed = Stdin("literal", text)
++        elif _PLAIN_DELIMITER.fullmatch(delim) and not any(c in text for c in "$`\\"):
++            feed = Stdin("literal", text)
++    accepted, why = True, ""
++    if descriptor is not None and descriptor not in _LOW_FD:
++        accepted, why = False, "descriptor other than 0, 1 or 2"
++    record = Redirect(
++        kind="heredoc_redirect",
++        descriptor=descriptor,
++        operator=operator,
++        target=None,
++        accepted=accepted,
++        why=why,
++        output=False,
++        exempt=False,
++        device_socket=False,
++        feed=feed,
++        display=(descriptor or "")
++        + operator
++        + (walker.text(delimiter) if delimiter else ""),
++        heredoc_operator=True,
++        start=node.start_byte,
++    )
++    walker.layer.redirects.append(record)
++    return [record, *nested]
++
++
++def _herestring_redirect(walker: Walker, node, ctx, depth, bound=()) -> list[Redirect]:
++    _children(walker, node, replace(ctx, role=None), depth)
++    descriptor = _descriptor(walker, node)
++    pieces = [c for c in node.named_children if c.type != "file_descriptor"]
++    word = None
++    if pieces:
++        word = make_word(walker.span(pieces[0].start_byte, pieces[-1].end_byte))
++    feed = Stdin("literal", word.text) if word is not None and word.literal else UNKNOWN
++    accepted, why = True, ""
++    if descriptor is not None and descriptor not in _LOW_FD:
++        accepted, why = False, "descriptor other than 0, 1 or 2"
++    if word is not None:
++        walker.layer.words.append(word)
++    record = Redirect(
++        kind="herestring_redirect",
++        descriptor=descriptor,
++        operator="<<<",
++        target=word,
++        accepted=accepted,
++        why=why,
++        output=False,
++        exempt=False,
++        device_socket=word is not None and has_device_socket(word.text),
++        feed=feed,
++        display=walker.text(node),
++        heredoc_operator=False,
++        start=node.start_byte,
++    )
++    walker.layer.redirects.append(record)
++    return [record]
++
++
++HANDLERS: dict[str, Handler] = {kind: _children for kind in named_kinds()}
++HANDLERS.update(
++    {
++        ERROR_KIND: _error,
++        "pipeline": _pipeline,
++        "negated_command": _negated,
++        "redirected_statement": _redirected,
++        "command": _simple,
++        "declaration_command": _simple,
++        "unset_command": _simple,
++        "variable_assignment": _assignment,
++        "function_definition": _function,
++        "command_substitution": _command_substitution,
++        "process_substitution": _process_substitution,
++        "file_redirect": _file_redirect,
++        "heredoc_redirect": _heredoc_redirect,
++        "herestring_redirect": _herestring_redirect,
++    }
++)
++
++
++def _check_walk(tree: tree_sitter.Tree, walker: Walker) -> None:
++    """Rule 2, on every classification: every named node visited exactly once, and one
++    invocation per simple command node."""
++    named = 0
++    simple = 0
++    for node in _iter_nodes(tree.root_node):
++        if not node.is_named:
++            continue
++        named += 1
++        if node.type in SIMPLE_KINDS:
++            simple += 1
++        if walker.visits.get((node.id, node.start_byte, node.end_byte)) != 1:
++            raise GateFailure("a node was not walked exactly once")
++    if named != len(walker.visits):
++        raise GateFailure("the walk and the tree disagree")
++    if simple != len(walker.layer.invocations):
++        raise GateFailure("a simple command gave no invocation")
++
++
++def shell_layer(source: str) -> ShellLayer:
++    """Parse and walk ``source``. Raises ``GateFailure`` for decision C."""
++    data = source.encode("utf-8", "surrogatepass")
++    if len(data) > MAX_INPUT_BYTES:
++        raise GateFailure("input over 8 KiB")
++    tree = parse_source(data)
++    layer = ShellLayer(untrusted=untrusted_features(tree, data))
++    walker = Walker(data, layer)
++    walker.visit(tree.root_node, Ctx(stdin=TERMINAL), 0)
++    _check_walk(tree, walker)
++    if layer.untrusted:
++        # No stdin fact from a tree the gate does not trust.
++        layer.invocations = [replace(i, stdin=UNKNOWN) for i in layer.invocations]
++    elif any(_may_rewire_stdin(i) for i in layer.invocations):
++        # A command that can change the shell's own stdin (`exec </x; sudo tee /y`) makes
++        # every other command's stdin unproven: it may run after it, in source order or on
++        # a later loop pass.
++        layer.invocations = [
++            i if _may_rewire_stdin(i) else replace(i, stdin=UNKNOWN)
++            for i in layer.invocations
++        ]
++    return layer
++
++
++_SHELL_RUNNERS = ("eval", "source", ".")
++_BUILTIN_PREFIXES = ("command", "builtin")
++
++
++def _may_rewire_stdin(invocation: Invocation) -> bool:
++    """Whether ``invocation`` can change the stdin of the shell itself: ``exec`` with
++    any redirect, ``eval`` / ``source`` / ``.`` (code the gate does not see), or a command
++    word the gate cannot read. ``command`` and ``builtin`` in front are looked through."""
++    words = list(invocation.words)
++    while words and words[0].literal and words[0].text in _BUILTIN_PREFIXES:
++        words.pop(0)
++        while words and words[0].literal and words[0].text.startswith("-"):
++            words.pop(0)
++    if not words or not words[0].source:
++        return False  # no command word: a redirect alone applies to nothing
++    head = words[0]
++    if not head.literal:
++        return True
++    if head.text in _SHELL_RUNNERS:
++        return True
++    return head.text == "exec" and bool(invocation.redirects)
+diff --git a/src/nl_shell/gate/rules.py b/src/nl_shell/gate/rules.py
+new file mode 100644
+index 0000000..27597dc
+--- /dev/null
++++ b/src/nl_shell/gate/rules.py
+@@ -0,0 +1,28 @@
++"""The policy gate's command layer: a stub (issue #196).
++
++Spec ``policy-gate/v1`` §1 step 4: the static, session-altering, destructive and
++privileged rules and the allowlist, per simple command. #197 (wrappers, sudo, destructive
++commands, builtins, decisions A and B) and #198 (the allowlist, the terminal-read rule,
++the here-doc exemption) replace this stub. Until then every simple command is
++``mutating``, "not allowlisted": decision A's floor, so nothing is ``read-only``.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++NOT_ALLOWLISTED = "not allowlisted"
++
++
++@dataclass(frozen=True)
++class Verdict:
++    """One step's answer for one simple command."""
++
++    cls: str
++    reasons: tuple[str, ...] = ()
++    rejected: bool = False
++
++
++def classify(invocation) -> Verdict:
++    """Class one ``nl_shell.gate.parse.Invocation``."""
++    return Verdict("mutating", (NOT_ALLOWLISTED,))
+diff --git a/src/nl_shell/gate/sensitive.py b/src/nl_shell/gate/sensitive.py
+new file mode 100644
+index 0000000..b0e230a
+--- /dev/null
++++ b/src/nl_shell/gate/sensitive.py
+@@ -0,0 +1,13 @@
++"""Sensitive locations (spec ``policy-gate/v1`` §8): a no-op stub (issue #196).
++
++#190 replaces it (``targets/<id>/sensitive.toml``, ADR-0025). The pipeline already calls
++``check`` for every simple command; ``None`` means "no change".
++"""
++
++from __future__ import annotations
++
++from nl_shell.gate.rules import Verdict
++
++
++def check(invocation) -> Verdict | None:
++    return None
+diff --git a/src/nl_shell/gate/vectors.py b/src/nl_shell/gate/vectors.py
+new file mode 100644
+index 0000000..9a003cf
+--- /dev/null
++++ b/src/nl_shell/gate/vectors.py
+@@ -0,0 +1,123 @@
++"""Loading a target's gate conformance vectors, ``targets/<id>/gate-vectors.toml``.
++
++Spec ``policy-gate/v1`` Conformance: each target has its own vectors. The file is a list
++of ``[[vector]]`` tables with these keys, and only these:
++
++- ``command`` (string, required);
++- ``origin`` (``"proposal"`` or ``"typed"``, required);
++- ``rejected`` (bool, required);
++- ``class`` (one of the five classes): required when ``rejected = false``, absent when
++  ``rejected = true`` (a rejected row asserts the rejection only);
++- ``reason`` (string, optional): a substring some reason must contain;
++- ``label`` (one of the five classes, optional): the model's label;
++- ``row`` (int, optional): the spec's conformance row number.
++
++The loader follows ``nl_shell.targets.load``: it validates everything and raises
++``VectorError`` naming the file and the entry.
++"""
++
++from __future__ import annotations
++
++import tomllib
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any
++
++from nl_shell import targets
++from nl_shell.gate.parse import CLASSES
++
++VECTORS_FILE = "gate-vectors.toml"
++ORIGINS = ("proposal", "typed")
++_KEYS = frozenset(("command", "origin", "rejected", "class", "reason", "label", "row"))
++
++
++class VectorError(Exception):
++    """The vectors file could not be loaded; the message names the entry."""
++
++
++@dataclass(frozen=True)
++class Vector:
++    command: str
++    origin: str
++    rejected: bool
++    cls: str | None
++    reason: str | None
++    label: str | None
++    row: int | None
++
++
++def load_target(target_id: str, root: Path = targets.TARGETS_ROOT) -> tuple[Vector, ...]:
++    """Load ``root/<target_id>/gate-vectors.toml``."""
++    if not targets.is_plain_id(target_id):
++        raise VectorError(f"invalid target id {target_id!r}")
++    return load(root / target_id / VECTORS_FILE)
++
++
++def load(path: Path) -> tuple[Vector, ...]:
++    """Load and validate one vectors file."""
++    try:
++        data = path.read_bytes()
++    except FileNotFoundError:
++        raise VectorError(f"{path}: missing") from None
++    except OSError as exc:
++        raise VectorError(f"{path}: cannot read: {exc.strerror or exc}") from None
++    try:
++        doc = tomllib.loads(data.decode("utf-8"))
++    except UnicodeDecodeError:
++        raise VectorError(f"{path}: not valid TOML: not valid UTF-8") from None
++    except tomllib.TOMLDecodeError as exc:
++        raise VectorError(f"{path}: not valid TOML: {exc}") from None
++    extra = sorted(set(doc) - {"vector"})
++    if extra:
++        raise VectorError(f"{path}: unknown top-level key `{extra[0]}`")
++    entries = doc.get("vector", [])
++    if not isinstance(entries, list) or not all(isinstance(e, dict) for e in entries):
++        raise VectorError(f"{path}: `vector` must be a list of [[vector]] tables")
++    return tuple(
++        _validate(entry, f"{path}: vector {n}") for n, entry in enumerate(entries, 1)
++    )
++
++
++def _validate(entry: dict[str, Any], where: str) -> Vector:
++    if "row" in entry and isinstance(entry["row"], int):
++        where = f"{where} (row {entry['row']})"
++    unknown = sorted(set(entry) - _KEYS)
++    if unknown:
++        raise VectorError(f"{where}: unknown key `{unknown[0]}`")
++    for key in ("command", "origin", "rejected"):
++        if key not in entry:
++            raise VectorError(f"{where}: missing required key `{key}`")
++    command = entry["command"]
++    if not isinstance(command, str) or not command:
++        raise VectorError(f"{where}: `command` must be a non-empty string")
++    origin = entry["origin"]
++    if origin not in ORIGINS:
++        raise VectorError(f"{where}: `origin` must be one of {', '.join(ORIGINS)}")
++    rejected = entry["rejected"]
++    if not isinstance(rejected, bool):
++        raise VectorError(f"{where}: `rejected` must be a boolean")
++    cls = entry.get("class")
++    if rejected and cls is not None:
++        raise VectorError(f"{where}: `class` must be absent on a rejected vector")
++    if not rejected and cls is None:
++        raise VectorError(f"{where}: missing `class` (required when not rejected)")
++    if cls is not None and cls not in CLASSES:
++        raise VectorError(f"{where}: `class` must be one of {', '.join(CLASSES)}")
++    label = entry.get("label")
++    if label is not None and label not in CLASSES:
++        raise VectorError(f"{where}: `label` must be one of {', '.join(CLASSES)}")
++    reason = entry.get("reason")
++    if reason is not None and (not isinstance(reason, str) or not reason):
++        raise VectorError(f"{where}: `reason` must be a non-empty string")
++    row = entry.get("row")
++    if row is not None and (not isinstance(row, int) or isinstance(row, bool) or row < 1):
++        raise VectorError(f"{where}: `row` must be a positive integer")
++    return Vector(
++        command=command,
++        origin=origin,
++        rejected=rejected,
++        cls=cls,
++        reason=reason,
++        label=label,
++        row=row,
++    )
+diff --git a/src/nl_shell/gate/words.py b/src/nl_shell/gate/words.py
+new file mode 100644
+index 0000000..608284a
+--- /dev/null
++++ b/src/nl_shell/gate/words.py
+@@ -0,0 +1,13 @@
++"""Word-level character checks (mixed-script words): a no-op stub (issue #196).
++
++#191 replaces it. The pipeline already calls ``check`` for every simple command; ``None``
++means "no change".
++"""
++
++from __future__ import annotations
++
++from nl_shell.gate.rules import Verdict
++
++
++def check(invocation) -> Verdict | None:
++    return None
+diff --git a/targets/ubuntu-26.04/gate-vectors.toml b/targets/ubuntu-26.04/gate-vectors.toml
+new file mode 100644
+index 0000000..722ae35
+--- /dev/null
++++ b/targets/ubuntu-26.04/gate-vectors.toml
+@@ -0,0 +1,79 @@
++# Policy-gate conformance vectors for the ubuntu-26.04 target
++# (docs/design/specs/policy-gate/v1.md, Conformance). Loaded by nl_shell.gate.vectors.
++#
++# This file holds the rows landed so far: the shell-layer rows of #196. It is not the
++# complete set the spec's Conformance section asks for; it becomes complete only when
++# #192 (live-session resolution) lands. #197 and #198 add their rows here.
++#
++# Keys: command, origin ("proposal" | "typed"), rejected; class (required unless
++# rejected, absent when rejected); optional reason (a substring some reason must
++# contain), label (the model's label) and row (the spec's row number).
++
++[[vector]]
++row = 7
++command = "PAGER=sh git log"
++origin = "typed"
++rejected = false
++class = "mutating"
++reason = "prefix assignment"
++
++[[vector]]
++row = 13
++command = "LD_PRELOAD=./x.so ls"
++origin = "typed"
++rejected = false
++class = "mutating"
++reason = "prefix assignment"
++
++[[vector]]
++row = 14
++command = "cat </dev/tcp/example.org/80"
++origin = "typed"
++rejected = false
++class = "mutating"
++reason = "/dev/tcp"
++
++[[vector]]
++row = 15
++command = "ls > ~/.bashrc"
++origin = "typed"
++rejected = false
++class = "mutating"
++reason = "output redirection"
++
++[[vector]]
++row = 16
++command = "$'\\x72m' -rf ~"
++origin = "typed"
++rejected = false
++class = "mutating"
++reason = "command word is not a literal"
++
++[[vector]]
++row = 23
++command = "SUDO_PROMPT=x sudo true"
++origin = "typed"
++rejected = true
++reason = "SUDO_"
++
++[[vector]]
++row = 25
++command = "echo hi >&3"
++origin = "typed"
++rejected = true
++reason = "redirection rejected"
++
++[[vector]]
++row = 30
++command = "ls ‮txt.exe"
++origin = "proposal"
++rejected = true
++reason = "hidden character"
++
++[[vector]]
++row = 31
++command = "if true; then"
++origin = "typed"
++rejected = false
++class = "mutating"
++reason = "unparseable"
+diff --git a/tests/test_policy_gate.py b/tests/test_policy_gate.py
+new file mode 100644
+index 0000000..2aa0279
+--- /dev/null
++++ b/tests/test_policy_gate.py
+@@ -0,0 +1,856 @@
++"""The policy gate's shell layer (issue #196, spec ``docs/design/specs/policy-gate/v1.md``).
++
++One general test per rule of the shell layer (Rules 1-6), one regression table, and the
++other spec rules this layer owns. ``nl_shell.gate`` is imported inside each test, never
++at module top, so a missing package is a failing test, not a collection error.
++
++Rule 6 runs on every result: ``classify`` below checks every reason it returns.
++"""
++
++from __future__ import annotations
++
++import re
++import time
++from dataclasses import dataclass
++from pathlib import Path
++
++import pytest
++
++REPO_ROOT = Path(__file__).resolve().parents[1]
++VECTORS = REPO_ROOT / "targets" / "ubuntu-26.04" / "gate-vectors.toml"
++CLASSES = ("read-only", "mutating", "session-altering", "destructive", "privileged")
++RANK = {
++    "read-only": 0,
++    "mutating": 1,
++    "session-altering": 1,
++    "destructive": 2,
++    "privileged": 3,
++}
++COULD_NOT = "could not class"
++ESC = "\x1b"
++
++
++def gate():
++    import nl_shell.gate
++
++    return nl_shell.gate
++
++
++def shell():
++    from nl_shell.gate import parse
++
++    return parse
++
++
++def assert_clean(reasons) -> None:
++    """Rule 6: no reason holds a C0/C1 control or a hidden character."""
++    from nl_shell import render
++
++    for reason in reasons:
++        for char in reason:
++            code = ord(char)
++            assert not (code < 0x20 or 0x7F <= code <= 0x9F), (reason, hex(code))
++            assert not render.is_hidden(char), (reason, hex(code))
++
++
++def classify(command, origin="typed", label=None):
++    result = gate().classify(command, origin=origin, label=label)
++    assert_clean(result.reasons)
++    return result
++
++
++def has_reason(result, needle: str) -> bool:
++    return any(needle in reason for reason in result.reasons)
++
++
++@dataclass(frozen=True)
++class Case:
++    command: str
++    cls: str | None  # None: a rejected case that asserts the rejection only
++    rejected: bool
++    reason: str
++    origin: str = "typed"
++    label: str | None = None
++    decision_c: bool = False
++
++
++def check(case: Case):
++    result = classify(case.command, case.origin, case.label)
++    assert result.rejected is case.rejected, (case, result)
++    if case.cls is not None:
++        assert result.cls == case.cls, (case, result)
++    assert has_reason(result, case.reason), (case, result)
++    if not case.decision_c:
++        assert not has_reason(result, COULD_NOT), (case, result)
++    return result
++
++
++# --- inputs --------------------------------------------------------------------------
++
++# Rule 1: one input per feature tree-sitter-bash reads differently from bash.
++UNTRUSTED = {
++    "U1": "if true; then",
++    "U2": "case x in",
++    "U3": "echo a\\\nb",
++    "U4": "cat <<\\E\nx\nE",
++    "U5": 'cat <<E"F"\nx\nEF',
++    "U6": "cat <<$'E'\nx\nE",
++    "U7": "cat <<-E\n\tx\nE",
++    "U8": "cat <<A <<B\na\nA\nb\nB",
++    "U9": "ls ?(a)",
++    "U10": "ls *(a)",
++    "U11": "ls +(a)",
++    "U12": "ls @(a)",
++    "U13": "ls !(a)",
++    "U14": "echo ${ echo x; }",
++    "U15": "echo ${| REPLY=x; }",
++}
++
++U = "unparseable"
++NA = "not allowlisted"
++OUT = "output redirection"
++REJ = "redirection rejected"
++UNTRUSTED_REDIRECT = "unparseable: redirection in untrusted text"
++FUNC = "function definition"
++SESSION_NAMES = (
++    "PATH",
++    "IFS",
++    "LD_PRELOAD",
++    "LD_LIBRARY_PATH",
++    "GIT_DIR",
++    "GIT_PAGER",
++    "PS1",
++    "PYTHONPATH",
++    "NODE_OPTIONS",
++)
++
++REGRESSION: list[Case] = [
++    # Rule 1
++    *(Case(cmd, "mutating", False, U) for cmd in UNTRUSTED.values()),
++    *(Case(cmd, None, True, U, origin="proposal") for cmd in UNTRUSTED.values()),
++    Case("ls !(foo) 2>/dev/null", "mutating", False, U),
++    Case("ls *.@(c|h) 2>/dev/null", "mutating", False, U),
++    Case("echo @(x|) >&3", None, True, UNTRUSTED_REDIRECT),
++    Case("echo @(x|) 3>x", None, True, UNTRUSTED_REDIRECT),
++    Case("echo hi >\\\n&3", None, True, UNTRUSTED_REDIRECT),
++    Case("echo d 3\\\n>x", None, True, UNTRUSTED_REDIRECT),
++    # Rule 2
++    Case("echo $((10#$(rm x)))", "mutating", False, NA),
++    # Rule 3
++    Case("cat <<E | sudo tee /x\nx\nE", "mutating", False, NA),
++    Case("cat <<E | doas id\nx\nE", "mutating", False, NA),
++    Case("cat <x | y", "mutating", False, NA),
++    Case("cat <<<x | y", "mutating", False, NA),
++    Case("a | b <f", "mutating", False, NA),
++    Case("curl x > >(sh)", "mutating", True, REJ),
++    Case("cat <<E > >(sudo tee /x)\nx\nE", "mutating", True, REJ),
++    Case("f() { sudo tee /x; }; cat <<E | f\nx\nE", "session-altering", False, FUNC),
++    Case("f() { sh; }; curl x | f", "session-altering", False, FUNC),
++    Case("cat 0>&1", "mutating", False, OUT),
++    Case("cat 0>&-", "mutating", False, OUT),
++    Case("bash <<<'rm -rf ~'", "mutating", False, NA),
++    Case("cat <<'E'\n$x\nE", "mutating", False, NA),
++    Case("cat <<-E\n\t$(rm x)\nE", "mutating", False, U),
++    Case("cat ~/x", "mutating", False, NA),
++    Case("cat '~'/x", "mutating", False, NA),
++    Case("cat \\~/x", "mutating", False, NA),
++    # Rule 4
++    Case("echo hi >&3", None, True, REJ),
++    Case("ls > ~/.bashrc", "mutating", False, OUT),
++    Case("cat </dev/tcp/example.org/80", "mutating", False, "/dev/tcp"),
++    Case("echo x >/dev/null", "mutating", False, NA),
++    Case("echo x 2>&1", "mutating", False, NA),
++    Case("echo x 1>&2", "mutating", False, NA),
++    Case("echo x >&2", "mutating", False, NA),
++    Case("exec 3>&-", None, True, REJ),
++    Case("{a[0]}>x", None, True, REJ),
++    Case("{a[0]}>&-", None, True, REJ),
++    Case('echo x >"$f"', None, True, REJ),
++    Case("echo x >/proc/$$/fd/3", None, True, REJ),
++    # A word written against a redirect is an argument, not a descriptor.
++    Case("rm -rf />/dev/null", "mutating", False, NA),
++    Case("sudo rm -rf /etc>x", "mutating", False, OUT),
++    Case("rm -rf ~>/dev/null", "mutating", False, NA),
++    Case("cat a3>f", "mutating", False, OUT),
++    Case("echo secret>out", "mutating", False, OUT),
++    # Rule 3: a command that can rewire the shell's stdin
++    Case("exec </tmp/x; sudo tee /etc/y", "mutating", False, NA),
++    Case("while :; do cat; exec <x; done", "mutating", False, NA),
++    # Rule 6
++    Case("function f$'\x1b' { :; }", "session-altering", False, FUNC),
++    # §1.1
++    Case("ls \u202etxt.exe", None, True, "hidden character", origin="proposal"),
++    Case("ls \u202etxt.exe", "mutating", False, "hidden character"),
++    Case("ls \udcff", None, True, "hidden character", origin="proposal"),
++    # §1.7
++    Case("true", "destructive", False, "model labelled", label="destructive"),
++    Case("true", "mutating", False, NA, label="read-only"),
++    # §2
++    Case("PAGER=sh git log", "mutating", False, "prefix assignment"),
++    Case("LD_PRELOAD=./x.so ls", "mutating", False, "prefix assignment"),
++    Case("LESSOPEN='|sh %s' less f", "mutating", False, "prefix assignment"),
++    Case("$'\\x72m' -rf ~", "mutating", False, "command word is not a literal"),
++    Case("$(echo rm) -rf ~", "mutating", False, "command word is not a literal"),
++    Case("diff <(ls) <(ls)", "mutating", False, "process substitution"),
++    Case("/tmp/rm x", "mutating", False, "path outside the system directories"),
++    Case("./rm x", "mutating", False, "path outside the system directories"),
++    Case("/usr/bin/rm x", "mutating", False, NA),
++    Case("//usr/bin/rm x", "mutating", False, NA),
++    # §3
++    Case("f() { :; }", "session-altering", False, FUNC),
++    *(
++        Case(f"{name}=x", "session-altering", False, f"assignment to {name}")
++        for name in SESSION_NAMES
++    ),
++    Case("export PATH=./bin", "session-altering", False, "assignment to PATH"),
++    # With only a redirect and no command word, the assignment stays in the shell.
++    Case("PATH=/tmp/evil >/dev/null", "session-altering", False, "assignment to PATH"),
++    Case("LD_PRELOAD=/tmp/x.so 2>/dev/null", "session-altering", False, "LD_PRELOAD"),
++    Case("IFS=x 2>&1", "session-altering", False, "assignment to IFS"),
++    Case("PATH=x >/dev/null; cat", "session-altering", False, "assignment to PATH"),
++    # §5
++    Case("SUDO_PROMPT=x sudo true", None, True, "SUDO_"),
++    Case("SUDO_ASKPASS=/x sudo true", None, True, "SUDO_"),
++    Case("export SUDO_PROMPT=x", None, True, "SUDO_"),
++    # walk coverage
++    Case("ls | wc; (pwd) && { id; }", "mutating", False, NA),
++    Case("if a; then b; elif c; then d; else e; fi", "mutating", False, NA),
++    Case("while a; do b; done; for i in 1; do c; done", "mutating", False, NA),
++    Case("case x in a) b;; esac", "mutating", False, NA),
++    Case("echo $(id) `pwd`", "mutating", False, NA),
++    Case("declare -x A=1; unset A", "mutating", False, NA),
++]
++
++
++def vector_cases() -> list[Case]:
++    from nl_shell.gate import vectors
++
++    return [
++        Case(v.command, v.cls, v.rejected, v.reason or "", origin=v.origin, label=v.label)
++        for v in vectors.load(VECTORS)
++    ]
++
++
++# Inputs that, together, hold every named node kind of the pinned grammar.
++KIND_COVERAGE = [
++    "for ((i=0; i<3; i++)); do echo $i; done",
++    "echo $(( a ? b : c )) $(( (1+2) )) $(( -x )) $(( x++ ))",
++    "[[ $x =~ ^a ]] && [[ -n x ]] && [ -f x ]",
++    'echo $"x" ${a[0]} ${x:-y} $? {a,b}',
++    "case x in @(a|b)) :;; esac",
++    "a=(1 2); b=1 c=2; ! true",
++    "echo x 2>&1 # comment",
++    "cat <<E\n$x y\nE",
++    "cat <<<x",
++    "echo 'a' \"b $c\"",
++    "unset a; export b=1",
++    "echo {1..3}; a=$\"x\"",
++]
++
++
++# --- Rule 1 --------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("name", list(UNTRUSTED))
++def test_rule1_untrusted_tree(name):
++    command = UNTRUSTED[name]
++    proposal = classify(command, "proposal")
++    assert proposal.rejected, proposal
++    assert has_reason(proposal, U), proposal
++    typed = classify(command)
++    assert not typed.rejected, typed
++    assert RANK[typed.cls] >= RANK["mutating"], typed
++    assert has_reason(typed, U), typed
++    assert not has_reason(typed, COULD_NOT), typed
++
++
++def test_rule1_names_each_feature():
++    parse = shell()
++    expected = {
++        "U1": "missing token",
++        "U2": "syntax error",
++        "U3": "backslash-newline",
++        "U4": "here-doc delimiter",
++        "U5": "here-doc delimiter",
++        "U6": "here-doc delimiter",
++        "U7": "<<-",
++        "U8": "more than one here-doc",
++        "U9": "extglob",
++        "U10": "extglob",
++        "U11": "extglob",
++        "U12": "extglob",
++        "U13": "extglob",
++        "U14": "${ }",
++        "U15": "${ }",
++    }
++    for name, feature in expected.items():
++        data = UNTRUSTED[name].encode()
++        found = parse.untrusted_features(parse.parse_source(data), data)
++        assert any(feature in f for f in found), (name, found)
++        assert has_reason(classify(UNTRUSTED[name]), feature), name
++    # Quoted, the same characters are trusted.
++    for command in ("echo '?(a)' \"*(b)\" \\@\\(c\\)", "echo 'a\\\nb'", "cat <<'E'\nx\nE"):
++        data = command.encode()
++        assert parse.untrusted_features(parse.parse_source(data), data) == (), command
++
++
++def test_rule1_untrusted_redirects():
++    for command in ("ls !(foo) 2>/dev/null", "ls *.@(c|h) 2>/dev/null"):
++        result = check(Case(command, "mutating", False, U))
++        assert not has_reason(result, UNTRUSTED_REDIRECT), result
++    for command in (
++        "echo @(x|) >&3",
++        "echo @(x|) 3>x",
++        "echo hi >\\\n&3",
++        "echo d 3\\\n>x",
++    ):
++        check(Case(command, None, True, UNTRUSTED_REDIRECT))
++    # A here-doc the parser misread is exempt only with no descriptor or a literal 0-2.
++    for command in ("cat <<A {x}<<B\na\nA\nb\nB", "cat 3<<E\"F\"\nx\nEF"):
++        check(Case(command, None, True, UNTRUSTED_REDIRECT))
++    assert not classify("cat <<A 2<<B\na\nA\nb\nB").rejected
++    # A redirect Rule 4 alone accepts is rejected in untrusted text.
++    assert classify("ls @(a) >out").rejected
++    assert classify("ls >out").rejected is False
++    # Untrusted text proves no stdin fact.
++    parse = shell()
++    layer = parse.shell_layer("cat <x; ls @(a)")
++    assert {i.stdin.kind for i in layer.invocations} == {"unknown"}
++
++
++# --- Rule 2 --------------------------------------------------------------------------
++
++
++def _tree_counts(command: str) -> tuple[int, set[str]]:
++    parse = shell()
++    tree = parse.parse_source(command.encode("utf-8", "surrogatepass"))
++    count, kinds, stack = 0, set(), [tree.root_node]
++    while stack:
++        node = stack.pop()
++        if node.is_named:
++            kinds.add("ERROR" if node.is_error else node.type)
++            if node.type in ("command", "declaration_command", "unset_command"):
++                count += 1
++        stack.extend(node.children)
++    return count, kinds
++
++
++def _grammar_kinds() -> set[str]:
++    import tree_sitter
++    import tree_sitter_bash
++
++    language = tree_sitter.Language(tree_sitter_bash.language())
++    return {
++        language.node_kind_for_id(i)
++        for i in range(language.node_kind_count)
++        if language.node_kind_is_named(i) and language.node_kind_is_visible(i)
++    }
++
++
++def all_inputs() -> list[str]:
++    seen, out = set(), []
++    cases = REGRESSION + vector_cases()
++    for command in [c.command for c in cases if not c.decision_c] + KIND_COVERAGE + [
++        t[0] for t in rule4_table()
++    ]:
++        if command not in seen:
++            seen.add(command)
++            out.append(command)
++    return out
++
++
++def test_rule2_one_invocation_per_simple_command():
++    parse = shell()
++    for command in all_inputs():
++        expected, _ = _tree_counts(command)
++        layer = parse.shell_layer(command)
++        assert len(layer.invocations) == expected, command
++    layer = parse.shell_layer("echo $((10#$(rm x)))")
++    assert [i.words[0].text for i in layer.invocations] == ["rm", "echo"]
++
++
++def test_rule2_every_kind_has_a_handler():
++    parse = shell()
++    kinds = _grammar_kinds()
++    assert len(kinds) > 50
++    missing = sorted(k for k in kinds | {"ERROR"} if k not in parse.HANDLERS)
++    assert missing == []
++
++
++def test_rule2_removed_handler_is_decision_c(monkeypatch):
++    parse = shell()
++    seen: dict[str, str] = {}
++    for command in all_inputs():
++        for kind in _tree_counts(command)[1]:
++            seen.setdefault(kind, command)
++    uncovered = sorted(_grammar_kinds() - set(seen))
++    assert uncovered == [], uncovered
++    for kind, command in sorted(seen.items()):
++        with monkeypatch.context() as m:
++            m.delitem(parse.HANDLERS, kind)
++            result = classify(command)
++        assert result.cls == "privileged" and result.rejected, (kind, result)
++        assert has_reason(result, COULD_NOT), (kind, result)
++
++
++@pytest.mark.parametrize(
++    "kind,command",
++    [
++        ("pipeline", "ls | wc"),
++        ("command_substitution", "echo $(id)"),
++        ("redirected_statement", "ls >x"),
++        ("compound_statement", "{ ls; }"),
++        ("heredoc_redirect", "cat <<E | sh\nx\nE"),
++        ("program", "ls"),
++    ],
++)
++def test_rule2_skipped_children_are_decision_c(monkeypatch, kind, command):
++    parse = shell()
++    assert not has_reason(classify(command), COULD_NOT)
++    monkeypatch.setitem(parse.HANDLERS, kind, lambda walker, node, ctx, depth, bound=(): [])
++    result = classify(command)
++    assert (result.cls, result.rejected) == ("privileged", True), result
++    assert has_reason(result, COULD_NOT), result
++
++
++# --- Rule 3 --------------------------------------------------------------------------
++
++
++def stdin_of(command: str) -> dict[str, tuple[str, str | None]]:
++    layer = shell().shell_layer(command)
++    out = {}
++    for invocation in layer.invocations:
++        out[invocation.words[0].text] = (invocation.stdin.kind, invocation.stdin.value)
++    return out
++
++
++def test_rule3_stdin_sources():
++    assert stdin_of("cat <<E | sudo tee /x\nx\nE")["sudo"][0] == "pipe"
++    assert stdin_of("cat <<E | doas id\nx\nE")["doas"][0] == "pipe"
++    assert stdin_of("cat <x | y")["y"][0] == "pipe"
++    assert stdin_of("cat <<<x | y")["y"][0] == "pipe"
++    assert stdin_of("a | b <f") == {"a": ("terminal", None), "b": ("file", "f")}
++    assert stdin_of("curl x > >(sh)")["sh"][0] == "pipe"
++    assert stdin_of("cat <<E > >(sudo tee /x)\nx\nE")["sudo"][0] == "pipe"
++    assert stdin_of("f() { sudo tee /x; }; cat <<E | f\nx\nE")["sudo"][0] == "unknown"
++    assert stdin_of("f() { sh; }; curl x | f")["sh"][0] == "unknown"
++    assert stdin_of("cat 0>&1")["cat"][0] == "unknown"
++    assert stdin_of("cat 0>&-")["cat"][0] == "unknown"
++    assert stdin_of("bash <<<'rm -rf ~'")["bash"] == ("literal", "rm -rf ~")
++    assert stdin_of("cat <<'E'\n$x\nE")["cat"] == ("literal", "$x\n")
++    assert stdin_of("cat <<E\nplain\nE")["cat"] == ("literal", "plain\n")
++    assert stdin_of("cat <<E\n$x\nE")["cat"][0] == "unknown"
++    assert stdin_of("cat <<-E\n\t$(rm x)\nE")["cat"][0] != "literal"
++    assert stdin_of("cat")["cat"] == ("terminal", None)
++    assert stdin_of("cat <$f")["cat"][0] == "unknown"
++    assert stdin_of("cat <&3")["cat"][0] == "unknown"
++    assert stdin_of("cat <>f")["cat"][0] == "unknown"
++    assert stdin_of("{ cat; } <f")["cat"] == ("file", "f")
++    # A command that can change the shell's own stdin leaves every other command's
++    # stdin unproven, whether it runs after it in the text or on a later loop pass.
++    assert stdin_of("{ sudo tee /etc/y; } </tmp/x")["sudo"] == ("file", "/tmp/x")
++    assert stdin_of("exec </tmp/x; sudo tee /etc/y")["sudo"][0] == "unknown"
++    assert stdin_of("while :; do cat; exec <x; done")["cat"][0] == "unknown"
++    assert stdin_of("command exec <x; cat")["cat"][0] == "unknown"
++    assert stdin_of("eval x; cat")["cat"][0] == "unknown"
++    assert stdin_of("$x <f; cat")["cat"][0] == "unknown"
++    # `exec` with no redirect does not, and neither does a bare redirect.
++    assert stdin_of("exec; cat")["cat"] == ("terminal", None)
++    assert stdin_of("PATH=x >/dev/null")[""][0] == "unknown"  # untrusted (MISSING)
++
++
++def test_words_next_to_redirects_are_kept():
++    # The invocation carries every word bash passes, also one written right against a
++    # redirect operator (bash: `printf "<%s>" a /etc>out` writes `<a></etc>`).
++    parse = shell()
++
++    def words(command):
++        (invocation,) = parse.shell_layer(command).invocations
++        return [w.text for w in invocation.words], [
++            (r.descriptor, r.operator) for r in invocation.redirects
++        ]
++
++    assert words("rm -rf />/dev/null") == (["rm", "-rf", "/"], [(None, ">")])
++    assert words("sudo rm -rf /etc>x") == (["sudo", "rm", "-rf", "/etc"], [(None, ">")])
++    assert words("rm -rf ~>/dev/null") == (["rm", "-rf", "~"], [(None, ">")])
++    assert words("cat a3>f") == (["cat", "a3"], [(None, ">")])
++    assert words('echo "3">f') == (["echo", "3"], [(None, ">")])
++    assert words("echo x}>f") == (["echo", "x}"], [(None, ">")])
++    # A real descriptor the tree left as a word is still taken as the descriptor.
++    assert words("cat 0>&-") == (["cat"], [("0", ">&-")])
++    assert words("echo {x}>f") == (["echo"], [("{x}", ">")])
++    # No command word: the assignment is standalone, not a one-command prefix.
++    (invocation,) = parse.shell_layer("PATH=/tmp/evil >/dev/null").invocations
++    assert [(a.name, a.role) for a in invocation.assignments] == [("PATH", "standalone")]
++    assert [w.text for w in invocation.words] == [""]
++
++
++def test_rule3_literal_flag():
++    parse = shell()
++
++    def second_word(command):
++        return parse.shell_layer(command).invocations[-1].words[1]
++
++    assert not second_word("cat ~/x").literal
++    assert second_word("cat '~'/x").literal
++    assert second_word("cat \\~/x").literal
++    assert second_word("cat '~'/x").text == "~/x"
++    for command in (
++        "cat $x",
++        "cat `x`",
++        "cat *.c",
++        "cat a?",
++        "cat [ab]",
++        "cat {a,b}",
++        'cat "$x"',
++        "cat $'x'",
++        "cat x=~/y",
++        "cat a:~/y",
++    ):
++        assert not second_word(command).literal, command
++    for command in ("cat plain", "cat 'a b'", 'cat "a b"', "cat a\\*b", "cat a=b"):
++        assert second_word(command).literal, command
++    value = parse.shell_layer("A=x:~/b").assignments[0].value
++    assert not value.literal
++
++
++# --- Rule 4 --------------------------------------------------------------------------
++
++R4_OPERATORS = ("<", ">", ">>", ">|", "&>", "&>>", "<>", ">&", "<&")
++R4_DESCRIPTORS = ("", "0", "1", "2", "3", "1" * 40, "{fd}")
++R4_TARGETS = (
++    "0",
++    "1",
++    "2",
++    "-",
++    "1-",
++    "3",
++    "$x",
++    "3-",
++    "out.txt",
++    "~/f",
++    "/dev/null",
++    "/dev/fd/3",
++    "/dev/fd/03",
++    "//dev/fd/3",
++    "/proc/self/fd/3",
++    "/proc/self/root/dev/fd/3",
++    "/proc/self/cwd/x",
++    '"$f"',
++    "/dev/f?/3",
++    "/dev/@(fd)/3",
++    "/dev/fd/3@(x|)",
++    "../x",
++)
++R4_NON_LITERAL = {"$x", '"$f"', "/dev/f?/3", "/dev/@(fd)/3", "/dev/fd/3@(x|)"}
++
++
++def rule4_allows(fd: str, op: str, target: str) -> bool:
++    """Rule 4, written out from the brief."""
++    if fd not in ("", "0", "1", "2"):
++        return False
++    if op in (">&", "<&"):
++        if target in ("0", "1", "2", "-", "0-", "1-", "2-"):
++            return True
++        if op == "<&" or fd or re.fullmatch(r"[0-9]+-?", target):
++            return False
++    if target in R4_NON_LITERAL:
++        return False
++    path = target[1:] if target.startswith("~") else target
++    if ".." in path.split("/"):
++        return False
++    if target.startswith("/"):
++        norm = re.sub(r"/+", "/", target)
++        if norm in ("/dev/null", "/dev/stdin", "/dev/stdout", "/dev/stderr"):
++            return True
++        if norm.startswith(("/dev/tcp/", "/dev/udp/")):
++            return True
++        if norm.startswith(("/dev/", "/proc/", "/sys/")):
++            return False
++    return True
++
++
++def rule4_table() -> list[tuple[str, bool]]:
++    # tree-sitter-bash 0.25.1 has no `<>` after a command's arguments: every `<>` input
++    # here parses with an ERROR node, so Rule 1's untrusted-redirect clause rejects it
++    # whatever Rule 4 says (`test_rule4_judge_alone` checks Rule 4 on its own).
++    return [
++        (f"echo x {fd}{op}{target}", op != "<>" and rule4_allows(fd, op, target))
++        for op in R4_OPERATORS
++        for fd in R4_DESCRIPTORS
++        for target in R4_TARGETS
++    ]
++
++
++def test_rule4_redirect_table():
++    wrong = []
++    for command, allowed in rule4_table():
++        result = classify(command)
++        assert not has_reason(result, COULD_NOT), (command, result)
++        if result.rejected is allowed:
++            wrong.append((command, allowed, result.reasons))
++    assert wrong == []
++
++
++def test_rule4_judge_alone():
++    parse = shell()
++    wrong = []
++    for op in R4_OPERATORS:
++        for fd in R4_DESCRIPTORS:
++            for target in R4_TARGETS:
++                accepted = parse.judge_redirect(fd or None, op, parse.make_word(target))[0]
++                if accepted is not rule4_allows(fd, op, target):
++                    wrong.append((fd, op, target, accepted))
++    assert wrong == []
++    for op in (">&-", "<&-"):
++        for fd in R4_DESCRIPTORS:
++            accepted = parse.judge_redirect(fd or None, op, None)[0]
++            assert accepted is (fd in ("", "0", "1", "2")), (fd, op)
++
++
++def test_rule4_spec_rows_and_exempt_forms():
++    check(Case("echo hi >&3", None, True, REJ))
++    check(Case("ls > ~/.bashrc", "mutating", False, OUT))
++    check(Case("cat </dev/tcp/example.org/80", "mutating", False, "/dev/tcp"))
++    for redirect in (">/dev/null", "2>&1", "1>&2", ">&2", "2>/dev/null"):
++        result = classify(f"echo x {redirect}")
++        assert result.reasons == (NA,), (redirect, result)
++    for command in ("exec 3>&-", "{a[0]}>x", "{a[0]}>&-", "echo {fd}>x", "echo x 3>&1-"):
++        assert classify(command).rejected, command
++
++
++# --- Rule 5 --------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("unit", ["$[", "a=(", "${"])
++def test_rule5_size_cap_at_8_kib(unit):
++    command = (unit * 8192)[:8192]
++    assert len(command.encode()) == 8192
++    start = time.monotonic()
++    result = gate().classify(command)
++    assert time.monotonic() - start < 5.0
++    assert_clean(result.reasons)
++    assert not has_reason(result, "input over 8 KiB"), result
++
++
++def test_rule5_over_cap_is_never_parsed(monkeypatch):
++    parse = shell()
++    calls = []
++
++    def boom(data):
++        calls.append(len(data))
++        raise AssertionError("parser reached")
++
++    monkeypatch.setattr(parse, "parse_source", boom)
++    for command in ("a" * 8193, "é" * 4096 + "a"):
++        result = classify(command)
++        assert (result.cls, result.rejected) == ("privileged", True), result
++        assert result.reasons == (COULD_NOT, "input over 8 KiB")
++    assert calls == []
++
++
++def test_rule5_work_budget_and_failures(monkeypatch):
++    parse = shell()
++    deep = "echo " + "$(echo " * 150 + ")" * 150
++    chain = "echo " + "$(:)" * 1500
++    for command in (deep, chain):
++        assert len(command.encode()) <= 8192
++        result = classify(command)
++        assert (result.cls, result.rejected) == ("privileged", True), result
++        assert has_reason(result, COULD_NOT), result
++    assert has_reason(classify(deep), "nesting too deep")
++    assert has_reason(classify(chain), "work budget")
++    with monkeypatch.context() as m:
++        m.setattr(parse, "untrusted_features", lambda *a: 1 / 0)
++        result = classify("ls")
++        assert (result.cls, result.rejected) == ("privileged", True)
++        assert result.reasons == (COULD_NOT, "internal error (ZeroDivisionError)")
++    with monkeypatch.context() as m:
++        from nl_shell.gate import rules
++
++        m.setattr(rules, "classify", lambda inv: (_ for _ in ()).throw(RuntimeError("x")))
++        assert classify("ls").reasons[0] == COULD_NOT
++    for bad in (None, 3, b"ls"):
++        assert gate().classify(bad).reasons[0] == COULD_NOT
++    assert gate().classify("ls", origin="model").reasons[0] == COULD_NOT
++    assert gate().classify("ls", label="safe").reasons[0] == COULD_NOT
++
++
++# --- Rule 6 --------------------------------------------------------------------------
++
++
++def test_rule6_reasons_never_carry_raw_input():
++    result = classify("function f$'\x1b' { :; }")
++    joined = "".join(result.reasons)
++    assert ESC not in joined
++    assert has_reason(result, "\\x1b"), result
++    for command in (
++        "f\x1b() { :; }",
++        "echo x >'a\x1bb'",
++        "echo x >'\u202e'",
++        "echo x 3>'a\nb'",
++        "PAGER\u200b=x ls",
++        "ls \x9b",
++    ):
++        for origin in ("typed", "proposal"):
++            classify(command, origin)
++    for command in all_inputs():
++        for origin in ("typed", "proposal"):
++            classify(command, origin)
++
++
++# --- regression table ----------------------------------------------------------------
++
++
++@pytest.mark.parametrize("case", REGRESSION, ids=lambda c: repr(c.command)[:60])
++def test_regression_table(case):
++    check(case)
++
++
++def test_regression_table_from_vectors():
++    cases = vector_cases()
++    assert len(cases) >= 9
++    for case in cases:
++        check(case)
++
++
++def test_nothing_is_read_only():
++    for command in all_inputs():
++        for origin in ("typed", "proposal"):
++            assert classify(command, origin).cls != "read-only", command
++
++
++# --- other spec rules ----------------------------------------------------------------
++
++
++def read_only_for(word: str):
++    """A command layer that calls ``word`` read-only and everything else mutating."""
++    from nl_shell.gate import rules
++
++    def fake(invocation):
++        if invocation.words[0].text == word:
++            return rules.Verdict("read-only")
++        return rules.Verdict("mutating", (NA,))
++
++    return fake
++
++
++def test_model_label(monkeypatch):
++    from nl_shell.gate import live, rules
++
++    assert classify("true", label="destructive").cls == "destructive"
++    assert classify("true", label="read-only").cls == "mutating"
++    monkeypatch.setattr(rules, "classify", read_only_for("true"))
++    assert classify("true", label="destructive").cls == "destructive"
++    result = classify("true", label="read-only")
++    assert result.cls == "mutating"
++    assert has_reason(result, live.NOT_IMPLEMENTED)
++
++
++def test_live_stub(monkeypatch):
++    from nl_shell.gate import live, rules
++
++    assert live.NOT_IMPLEMENTED == "live-session resolution not implemented"
++    monkeypatch.setattr(rules, "classify", read_only_for("ls"))
++    result = classify("ls")
++    assert (result.cls, result.rejected) == ("mutating", False)
++    assert result.reasons == (live.NOT_IMPLEMENTED,)
++    invocation = shell().shell_layer("ls").invocations[0]
++    direct = live.resolve(invocation, rules.Verdict("read-only"))
++    assert (direct.cls, direct.reasons) == ("mutating", (live.NOT_IMPLEMENTED,))
++    kept = rules.Verdict("destructive", ("y",))
++    assert live.resolve(invocation, kept) == kept
++
++
++def test_walk_reaches_every_simple_command(monkeypatch):
++    from nl_shell.gate import rules
++
++    seen = []
++
++    def record(invocation):
++        seen.append((invocation.kind, invocation.words[0].text))
++        return rules.Verdict("mutating", (NA,))
++
++    monkeypatch.setattr(rules, "classify", record)
++    command = (
++        "a | b; c && (d) || { e; }; if f; then g; elif h; then i; else j; fi; "
++        "while k; do l; done; for x in 1; do m; done; case x in y) n;; esac; "
++        "fn() { o; }; echo $(p) `q`; export R=1; unset S"
++    )
++    classify(command)
++    words = {w for _, w in seen}
++    assert set("abcdefghijklmnopq") <= words
++    assert ("declaration", "export") in seen
++    assert ("unset", "unset") in seen
++
++
++def test_shell_layer_reasons():
++    assert has_reason(classify("ls >out"), OUT)
++    assert not has_reason(classify("/usr/bin/rm x"), "path outside")
++    assert not has_reason(classify("//usr/bin/rm x"), "path outside")
++    assert has_reason(classify("/usr/bin/../../tmp/rm x"), "path outside")
++    assert has_reason(classify("PATH=x"), "assignment to PATH")
++    assert has_reason(classify("declare PS4=x"), "assignment to PS4")
++    assert has_reason(classify("PERL5LIB=x"), "assignment to PERL5LIB")
++    assert classify("PAGER=sh git log").cls == "mutating"  # a prefix only lasts one command
++    assert classify("A=1 SUDO_PROMPT=x").rejected
++
++
++def test_result_has_session_log_shape():
++    result = classify("ls >out")
++    assert result.as_log() == {
++        "class": "mutating",
++        "reasons": [OUT + ": >out", NA],
++        "rejected": False,
++    }
++
++
++# --- vectors loader ------------------------------------------------------------------
++
++
++def test_vectors_file_loads():
++    from nl_shell.gate import vectors
++
++    loaded = vectors.load_target("ubuntu-26.04")
++    assert loaded == vectors.load(VECTORS)
++    assert {v.row for v in loaded} >= {7, 13, 14, 15, 16, 23, 25, 30, 31}
++    text = VECTORS.read_text(encoding="utf-8")
++    assert "#192" in text and "landed so far" in text
++
++
++GOOD = 'command = "ls"\norigin = "typed"\nrejected = false\nclass = "mutating"\n'
++
++
++@pytest.mark.parametrize(
++    "body,needle",
++    [
++        (GOOD.replace('command = "ls"\n', ""), "missing required key `command`"),
++        (GOOD.replace('origin = "typed"\n', ""), "missing required key `origin`"),
++        (GOOD.replace("rejected = false\n", ""), "missing required key `rejected`"),
++        (GOOD.replace("rejected = false", "rejected = true"), "`class` must be absent"),
++        (GOOD.replace('class = "mutating"\n', ""), "missing `class`"),
++        (GOOD.replace('"mutating"', '"harmless"'), "`class` must be one of"),
++        (GOOD + 'label = "harmless"\n', "`label` must be one of"),
++        (GOOD.replace('"typed"', '"model"'), "`origin` must be one of"),
++        (GOOD + 'colour = "red"\n', "unknown key `colour`"),
++    ],
++)
++def test_vectors_loader_rejects(tmp_path, body, needle):
++    from nl_shell.gate import vectors
++
++    path = tmp_path / "gate-vectors.toml"
++    path.write_text(f"[[vector]]\n{GOOD}\n[[vector]]\nrow = 4\n{body}", encoding="utf-8")
++    with pytest.raises(vectors.VectorError) as info:
++        vectors.load(path)
++    message = str(info.value)
++    assert needle in message
++    assert "vector 2" in message and "row 4" in message
++
++
++def test_vectors_loader_rejects_invalid_toml(tmp_path):
++    from nl_shell.gate import vectors
++
++    path = tmp_path / "gate-vectors.toml"
++    path.write_text("[[vector]\ncommand = ", encoding="utf-8")
++    with pytest.raises(vectors.VectorError, match="not valid TOML"):
++        vectors.load(path)

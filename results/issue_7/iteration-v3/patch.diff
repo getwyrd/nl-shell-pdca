@@ -1,0 +1,1298 @@
+diff --git a/.github/workflows/docs-checks.yml b/.github/workflows/docs-checks.yml
+new file mode 100644
+index 0000000..0ca81a6
+--- /dev/null
++++ b/.github/workflows/docs-checks.yml
+@@ -0,0 +1,31 @@
++name: Docs checks
++
++# Enforces ADR-0001 (docs/design/adr/0001-record-architecture-decisions.md:22-23, :30-31):
++# frozen design records (Accepted/Superseded ADRs, non-draft proposals and specs) are never
++# edited, except for a listed status-line change; and relative Markdown links resolve.
++# No path filter, so the job always reports and can be made a required check.
++# `pull_request` only, never `pull_request_target`: this runs PR-supplied code.
++on:
++  pull_request:
++
++permissions:
++  contents: read
++
++jobs:
++  docs:
++    name: docs
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++        with:
++          fetch-depth: 0
++      - uses: actions/setup-python@v5
++        with:
++          python-version: "3.14"
++      - name: Frozen design records are unchanged
++        run: >-
++          python scripts/docs_checks.py immutability
++          "${{ github.event.pull_request.base.sha }}"
++          "${{ github.event.pull_request.head.sha }}"
++      - name: Relative Markdown links resolve
++        run: python scripts/docs_checks.py links
+diff --git a/docs/design/adr/README.md b/docs/design/adr/README.md
+index a2ed5f1..c6dae39 100644
+--- a/docs/design/adr/README.md
++++ b/docs/design/adr/README.md
+@@ -8,7 +8,11 @@ tags:
+ 
+ Numbered, immutable records of significant decisions and *why* they were made. An ADR is
+ never edited after acceptance; a later ADR supersedes it, and this index records the
+-supersession. Format follows the lightweight Nygard template (see ADR-0001).
++supersession. The only change ever allowed to an Accepted ADR is setting its status line to
++`Superseded by ADR-NNNN`; a Superseded ADR is never edited at all, including the ones
++superseded while still Proposed (0005–0007, 0011), while an ADR that is only partly
++superseded and still Proposed (0008) stays editable like any Proposed ADR. Format follows
++the lightweight Nygard template (see ADR-0001).
+ 
+ ADRs 0002–0012 record the decisions `docs/plan.md` already makes. ADRs 0013–0021 come from
+ the 2026-10-14 design review (#63) and supersede 0005–0007, 0011 and part of 0008, which were still Proposed. All
+diff --git a/docs/design/proposals/README.md b/docs/design/proposals/README.md
+index 0b7301f..89d0b0e 100644
+--- a/docs/design/proposals/README.md
++++ b/docs/design/proposals/README.md
+@@ -9,6 +9,8 @@ tags:
+ KEP/RFC-style proposals for larger changes and milestone plans. Start one by copying
+ `../templates/proposal.md` into `draft/`. Accepted proposals move to `accepted/` and are never
+ edited; a later supersession is recorded **here**, not on the frozen file.
++The only change allowed to an accepted proposal is setting its status line to `implemented`
++or `withdrawn`.
+ 
+ ## Index
+ 
+diff --git a/scripts/docs_checks.py b/scripts/docs_checks.py
+new file mode 100644
+index 0000000..c98782c
+--- /dev/null
++++ b/scripts/docs_checks.py
+@@ -0,0 +1,597 @@
++#!/usr/bin/env python3
++"""Docs checks for nl-shell's design records. Standard library only.
++
++Run from the root of any git checkout (a worktree is fine; only `git` is used):
++
++    python scripts/docs_checks.py immutability BASE HEAD
++    python scripts/docs_checks.py links
++
++immutability -- a design record that is frozen at the PR's base stays byte-identical at
++    its head, except that its frontmatter `status:` line may move to a listed next state.
++    Sources: ADR-0001 (docs/design/adr/0001-record-architecture-decisions.md:18-23),
++    the class table in docs/design/README.md:18-21, docs/design/proposals/README.md:10-11,
++    and the status vocabularies in docs/design/templates/{adr,proposal,spec}.md:4.
++
++links -- every relative link in a tracked Markdown file points at a tracked file or
++    directory. External (`scheme:`) links, pure `#fragment` links and anything inside
++    code (fenced, indented, inline) or an HTML comment are ignored; fragments are not
++    checked against headings.
++
++Exit status: 0 = clean, 1 = violations found (listed on stdout), 2 = usage or git error.
++"""
++
++from __future__ import annotations
++
++import bisect
++import os
++import posixpath
++import re
++import subprocess
++import sys
++from dataclasses import dataclass
++from urllib.parse import unquote
++
++# --- immutability ---------------------------------------------------------------------
++
++ADR_RE = re.compile(r"^docs/design/adr/\d{4}-[^/]*\.md$")
++PROPOSAL_RE = re.compile(r"^docs/design/proposals/(?:draft|accepted)/\d{4}-[^/]*\.md$")
++SPEC_RE = re.compile(r"^docs/design/specs/(?:.+/)?[^/]+\.md$")
++
++SUPERSEDED_BY_ADR_RE = re.compile(r"^superseded by adr-\d{4}")
++
++
++@dataclass(frozen=True)
++class RecordClass:
++    name: str
++    how_to_change: str
++
++    def frozen(self, status: str) -> bool:
++        raise NotImplementedError
++
++    def allowed_next(self, base: str, head: str) -> bool:
++        raise NotImplementedError
++
++
++class AdrClass(RecordClass):
++    # templates/adr.md:4 -- Proposed | Accepted | Superseded by ADR-NNNN. ADR-0001:22-23:
++    # "An ADR starts as Proposed. Once Accepted it MUST NOT be edited". There is no
++    # implemented state for an ADR.
++    def frozen(self, status: str) -> bool:
++        return not status.startswith("proposed")
++
++    def allowed_next(self, base: str, head: str) -> bool:
++        return base.startswith("accepted") and bool(SUPERSEDED_BY_ADR_RE.match(head))
++
++
++class ProposalClass(RecordClass):
++    # templates/proposal.md:4 -- draft | accepted | implemented | withdrawn.
++    # proposals/README.md:10-11: accepted proposals are never edited; supersession is
++    # recorded in the index, not on the frozen file.
++    def frozen(self, status: str) -> bool:
++        return status != "draft"
++
++    def allowed_next(self, base: str, head: str) -> bool:
++        return base == "accepted" and head in ("implemented", "withdrawn")
++
++
++class SpecClass(RecordClass):
++    # templates/spec.md:4 -- draft | stable | superseded | withdrawn. docs/design/README.md:18:
++    # "a stable version is never edited, only replaced by a new version".
++    def frozen(self, status: str) -> bool:
++        return status != "draft"
++
++    def allowed_next(self, base: str, head: str) -> bool:
++        return base == "stable" and head in ("superseded", "withdrawn")
++
++
++ADR = AdrClass("ADR", "write a new ADR that supersedes it and record that in adr/README.md")
++PROPOSAL = ProposalClass(
++    "proposal", "write a new proposal and record the supersession in proposals/README.md"
++)
++SPEC = SpecClass(
++    "spec", "add a new spec version (e.g. vN+1.md) and record it in specs/README.md"
++)
++
++
++def record_class(path: str) -> RecordClass | None:
++    if ADR_RE.match(path):
++        return ADR
++    if PROPOSAL_RE.match(path):
++        return PROPOSAL
++    if SPEC_RE.match(path) and posixpath.basename(path) != "README.md":
++        return SPEC
++    return None
++
++
++def split_lines(data: bytes) -> list[bytes]:
++    """Lines of a blob, each keeping its exact terminator, so CRLF != LF."""
++    return data.splitlines(keepends=True)
++
++
++def terminator(line: bytes) -> bytes:
++    return line[len(line.rstrip(b"\r\n")) :]
++
++
++def line_text(line: bytes) -> str:
++    return line.decode("utf-8", errors="replace").rstrip("\r\n")
++
++
++def status_line_index(lines: list[bytes]) -> int | None:
++    """Index of the `status:` line inside the leading YAML frontmatter, if any."""
++    if not lines or line_text(lines[0]) != "---":
++        return None
++    for i in range(1, len(lines)):
++        text = line_text(lines[i])
++        if text in ("---", "..."):
++            return None
++        if re.match(r"^status\s*:", text, re.IGNORECASE):
++            return i
++    return None
++
++
++def status_value(line: bytes) -> str:
++    value = line_text(line).split(":", 1)[1]
++    value = re.sub(r"\s+#.*$", "", value).strip()
++    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
++        value = value[1:-1].strip()
++    return value.lower()
++
++
++class GitError(Exception):
++    pass
++
++
++def git(*args: str) -> str:
++    result = subprocess.run(["git", *args], capture_output=True, text=True)
++    if result.returncode != 0:
++        raise GitError(f"git {' '.join(args)}: {result.stderr.strip()}")
++    return result.stdout
++
++
++def git_blob(rev: str, path: str) -> bytes | None:
++    """The exact bytes of `path` at `rev` (no newline translation), or None if absent."""
++    spec = f"{rev}:{path}"
++    probe = subprocess.run(["git", "cat-file", "-e", spec], capture_output=True)
++    if probe.returncode != 0:
++        return None
++    result = subprocess.run(["git", "cat-file", "blob", spec], capture_output=True)
++    if result.returncode != 0:
++        raise GitError(f"git cat-file blob {spec}: {result.stderr.decode().strip()}")
++    return result.stdout
++
++
++def changed_paths(base: str, head: str) -> list[tuple[str, str, str | None]]:
++    """(status letter, old path, new path) for every change from base to head.
++
++    Renames are detected so that a renamed record is checked at its OLD path.
++    """
++    out = git("diff", "--name-status", "-z", "-M", base, head)
++    fields = out.split("\0")
++    changes = []
++    i = 0
++    while i < len(fields) and fields[i]:
++        letter = fields[i][0]
++        if letter in "RC":
++            changes.append((letter, fields[i + 1], fields[i + 2]))
++            i += 3
++        else:
++            changes.append((letter, fields[i + 1], None))
++            i += 2
++    return changes
++
++
++def frozen_status(cls: RecordClass, blob: bytes | None) -> tuple[list[bytes], int, str] | None:
++    """(lines, status-line index, status) if `blob` is a frozen record, else None."""
++    if blob is None:
++        return None
++    lines = split_lines(blob)
++    idx = status_line_index(lines)
++    if idx is None:
++        return None  # no frontmatter status: not frozen (r2)
++    status = status_value(lines[idx])
++    if not cls.frozen(status):
++        return None
++    return lines, idx, status
++
++
++def compare(
++    cls: RecordClass, where: str, frozen: tuple[list[bytes], int, str],
++    frozen_path: str, head_path: str | None, head_blob: bytes | None,
++) -> str | None:
++    """A violation message if the head breaks a record frozen at one base, or None.
++
++    `frozen_path` is where the frozen copy lives at that base; `head_path` is where the
++    PR's head keeps the file (None if the PR deleted it).
++    """
++    base_lines, idx, base_status = frozen
++    advice = f"Do not edit it; {cls.how_to_change}."
++    where = f"{where} ({cls.name}, status '{base_status}')"
++    if head_path is None:
++        return f"{where} is frozen and was deleted. {advice}"
++    if head_path != frozen_path:
++        return f"{where} is frozen and the PR has it at {head_path} instead. {advice}"
++    if head_blob is None:
++        return f"{where} is frozen and is missing at the head. {advice}"
++
++    head_lines = split_lines(head_blob)
++    if head_lines == base_lines:
++        return None  # e.g. a mode-only change
++    differing = [
++        i
++        for i in range(max(len(base_lines), len(head_lines)))
++        if i >= len(base_lines)
++        or i >= len(head_lines)
++        or base_lines[i] != head_lines[i]
++    ]
++    status_only = (
++        differing == [idx]
++        and status_line_index(head_lines) == idx
++        and terminator(base_lines[idx]) == terminator(head_lines[idx])
++    )
++    if not status_only:
++        return f"{where} is frozen and bytes other than its status changed. {advice}"
++    head_status = status_value(head_lines[idx])
++    if cls.allowed_next(base_status, head_status):
++        return None
++    return (
++        f"{where} is frozen; its status may not change to '{head_status}'. "
++        f"{advice}"
++    )
++
++
++@dataclass(frozen=True)
++class Base:
++    """One commit a record can be frozen at.
++
++    `renames` maps a path at the merge-base to where that file lives at this commit, for
++    files the base branch renamed after the PR branched off (empty for the merge-base).
++    """
++
++    label: str
++    rev: str
++    renames: dict[str, str]
++
++
++def check_record(
++    bases: list[Base], rev_head: str, letter: str, path: str, new: str | None
++) -> str | None:
++    """A violation message for one changed path (merge-base -> head), or None.
++
++    `bases` holds the merge-base and, if different, the base tip. The path is frozen if
++    it is frozen at ANY of them -- at the base tip, following any rename the base branch
++    made since the merge-base. The head must then keep that frozen copy, at the same path,
++    byte-identical except for an allowed status-line change.
++    """
++    if letter in "AC":  # a new file (or a copy, which leaves the source untouched)
++        return None
++    head_path = None if letter == "D" else (new if letter == "R" else path)
++    head_blob = None if head_path is None else git_blob(rev_head, head_path)
++    for base in bases:
++        frozen_path = base.renames.get(path, path)
++        cls = record_class(frozen_path)
++        if cls is None:
++            continue
++        frozen = frozen_status(cls, git_blob(base.rev, frozen_path))
++        if frozen is None:
++            continue
++        where = f"{path} (frozen at the {base.label}"
++        if frozen_path != path:
++            where += f", where the base branch moved it to {frozen_path}"
++        msg = compare(cls, where + ")", frozen, frozen_path, head_path, head_blob)
++        if msg:
++            return msg
++    return None
++
++
++def renames_between(old: str, new: str) -> dict[str, str]:
++    """{old path: new path} for every file renamed from commit `old` to commit `new`."""
++    return {src: dst for letter, src, dst in changed_paths(old, new) if letter == "R"}
++
++
++def cmd_immutability(base: str, head: str) -> int:
++    base_tip = git("rev-parse", "--verify", f"{base}^{{commit}}").strip()
++    head_rev = git("rev-parse", "--verify", f"{head}^{{commit}}").strip()
++    # Diff from the merge-base (what the PR itself changes, as a PR view shows it), but a
++    # record frozen on the base branch after the PR branched off is frozen too -- also when
++    # the base branch moved it (e.g. ratified a proposal from draft/ to accepted/).
++    merge_base = git("merge-base", base_tip, head_rev).strip()
++    bases = [Base("merge-base", merge_base, {})]
++    if base_tip != merge_base:
++        bases.append(Base("base tip", base_tip, renames_between(merge_base, base_tip)))
++    problems = []
++    for letter, path, new in changed_paths(merge_base, head_rev):
++        msg = check_record(bases, head_rev, letter, path, new)
++        if msg:
++            problems.append(msg)
++    for msg in problems:
++        print(f"docs-immutability: {msg}")
++    if problems:
++        print(
++            f"docs-immutability: {len(problems)} frozen design record(s) changed. "
++            "Accepted ADRs, non-draft proposals and non-draft specs are append-only: "
++            "supersede them with a new record plus an index entry instead of editing."
++        )
++        return 1
++    print("docs-immutability: OK")
++    return 0
++
++
++# --- links ----------------------------------------------------------------------------
++
++# Matched against a line with its leading indent already removed.
++FENCE_RE = re.compile(r"^(`{3,}|~{3,})")
++FENCE_CLOSE_RE = re.compile(r"^(`{3,}|~{3,})[ \t]*$")
++LIST_MARKER_RE = re.compile(r"^(?:[-*+]|\d{1,9}[.)])(?=[ \t]|$)")
++REFDEF_RE = re.compile(r"^ {0,3}\[(?!\^)(?:[^\]\\]|\\.)+\]:[ \t]*(<[^>\n]*>|\S+)")
++SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
++BACKTICKS_RE = re.compile(r"`+")
++BLANK_LINE_RE = re.compile(r"\n[ \t]*\n")
++ESCAPABLE = set("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
++ESCAPE_RE = re.compile(r"\\([!-/:-@\[-`{-~])")
++
++
++def blank(text: str) -> str:
++    """Same length, newlines kept, everything else a space."""
++    return re.sub(r"[^\n]", " ", text)
++
++
++def unescape(text: str) -> str:
++    """Drop the backslash from backslash-escaped ASCII punctuation (CommonMark 2.4)."""
++    return ESCAPE_RE.sub(r"\1", text)
++
++
++def indent_of(line: str) -> int:
++    """Width of the leading whitespace, tabs to 4-column stops."""
++    expanded = line.expandtabs(4)
++    return len(expanded) - len(expanded.lstrip(" "))
++
++
++def list_content_column(indent: int, rest: str) -> int | None:
++    """Column where a list item's content starts, if `rest` (line after its indent) opens
++    one: marker width plus 1-4 spaces after it (one if the item is empty or the content
++    itself is indented code)."""
++    m = LIST_MARKER_RE.match(rest)
++    if not m:
++        return None
++    marker_end = indent + m.end()
++    after = rest[m.end() :].expandtabs(4)
++    gap = len(after) - len(after.lstrip(" "))
++    if not after.strip() or gap > 4:
++        gap = 1
++    return marker_end + gap
++
++
++def mask_code_blocks(text: str) -> list[str]:
++    """Lines with fenced and indented code blocks blanked out.
++
++    List items are tracked as a stack of content columns. Inside an item, indentation is
++    measured from the item's content column, so a fence or an indented block nested under
++    an item is code, while text indented to the item's content is still item text.
++    """
++    out = []
++    items: list[int] = []  # content columns of the open list items, innermost last
++    fence: tuple[str, int] | None = None  # (opening run, container column)
++    prev_blank = True
++    in_indented = False
++    for line in text.split("\n"):
++        indent = indent_of(line)
++        rest = line.expandtabs(4)[indent:]
++        if fence is not None:
++            run, column = fence
++            if rest and indent < column:
++                fence = None  # the list item holding the fence ended; reread this line
++            else:
++                close = FENCE_CLOSE_RE.match(rest)
++                if (
++                    close and indent - column <= 3
++                    and close.group(1)[0] == run[0] and len(close.group(1)) >= len(run)
++                ):
++                    fence = None
++                out.append("")
++                continue
++        if not rest:
++            out.append(line)
++            prev_blank = True
++            continue
++        # Close list items this line is not part of. After a blank line any line indented
++        # less than an item's content ends it; without one a less-indented line is only a
++        # lazy paragraph continuation unless it starts a fence or a new item.
++        starts_block = bool(FENCE_RE.match(rest) or LIST_MARKER_RE.match(rest))
++        if prev_blank or starts_block:
++            while items and indent < items[-1]:
++                items.pop()
++        column = items[-1] if items and indent >= items[-1] else 0
++        if indent - column >= 4 and (prev_blank or in_indented):
++            # An indented code block, relative to the enclosing item; it cannot interrupt
++            # a paragraph.
++            in_indented = True
++            prev_blank = False
++            out.append("")
++            continue
++        in_indented = False
++        prev_blank = False
++        if indent - column <= 3:
++            m = FENCE_RE.match(rest)
++            if m:
++                fence = (m.group(1), column)
++                out.append("")
++                continue
++            content = list_content_column(indent, rest)
++            if content is not None:
++                items.append(content)
++        out.append(line)
++    return out
++
++
++def mask_inline(text: str) -> str:
++    """`text` with code spans and HTML comments blanked, left to right.
++
++    A backslash-escaped backtick does not open a code span. A span closes on the next
++    backtick run of the same length and may cross line breaks but not a blank line.
++    """
++    out = []
++    i = 0
++    n = len(text)
++    while i < n:
++        c = text[i]
++        if c == "\\" and i + 1 < n and text[i + 1] in ESCAPABLE:
++            out.append(text[i : i + 2])
++            i += 2
++            continue
++        if text.startswith("<!--", i):
++            end = text.find("-->", i + 4)
++            end = n if end == -1 else end + 3
++            out.append(blank(text[i:end]))
++            i = end
++            continue
++        if c == "`":
++            run = BACKTICKS_RE.match(text, i).group(0)
++            start = i + len(run)
++            close = next(
++                (m for m in BACKTICKS_RE.finditer(text, start) if len(m.group(0)) == len(run)),
++                None,
++            )
++            if close is None or BLANK_LINE_RE.search(text, start, close.start()):
++                out.append(run)  # no closing run: literal backticks
++                i = start
++            else:
++                out.append(blank(text[i : close.end()]))
++                i = close.end()
++            continue
++        out.append(c)
++        i += 1
++    return "".join(out)
++
++
++def inline_destination(text: str, start: int) -> str | None:
++    """The link destination that starts at `text[start]` (just after `](`), or None."""
++    i = start
++    n = len(text)
++    while i < n and text[i] in " \t":
++        i += 1
++    if i < n and text[i] == "\n":
++        i += 1
++        while i < n and text[i] in " \t":
++            i += 1
++    if i < n and text[i] == "<":
++        end = text.find(">", i + 1)
++        if end == -1 or "\n" in text[i + 1 : end]:
++            return None
++        return unescape(text[i + 1 : end])
++    out = []
++    depth = 0
++    while i < n:
++        c = text[i]
++        if c == "\\" and i + 1 < n and text[i + 1] in ESCAPABLE:
++            out.append(text[i + 1])
++            i += 2
++            continue
++        if c.isspace() or ord(c) < 0x20:
++            break
++        if c == "(":
++            depth += 1
++        elif c == ")":
++            if depth == 0:
++                break
++            depth -= 1
++        out.append(c)
++        i += 1
++    return "".join(out) or None
++
++
++def link_targets(text: str):
++    """(line number, target) for every link outside code and HTML comments."""
++    masked = mask_inline("\n".join(mask_code_blocks(text)))
++    line_starts = [0] + [m.end() for m in re.finditer("\n", masked)]
++
++    def line_of(offset: int) -> int:
++        return bisect.bisect_right(line_starts, offset)
++
++    # `](` not preceded by an odd number of backslashes (`\]` is a literal bracket).
++    for m in re.finditer(r"(?<!\\)(?:\\\\)*\]\(", masked):
++        target = inline_destination(masked, m.end())
++        if target is not None:
++            yield line_of(m.start()), target
++    for number, line in enumerate(masked.split("\n"), start=1):
++        m = REFDEF_RE.match(line)
++        if m:
++            dest = m.group(1)
++            if dest.startswith("<") and dest.endswith(">"):
++                dest = dest[1:-1]
++            yield number, unescape(dest)
++
++
++def resolve(md_path: str, target: str) -> str | None:
++    """The repo-relative path a relative link points at, or None if not relative."""
++    if target.startswith("<") and target.endswith(">"):
++        target = target[1:-1]
++    if not target or target.startswith("#") or target.startswith("//"):
++        return None
++    if SCHEME_RE.match(target):
++        return None
++    target = unquote(re.split(r"[#?]", target, maxsplit=1)[0])
++    if not target:
++        return None
++    if target.startswith("/"):
++        joined = target.lstrip("/")
++    else:
++        joined = posixpath.join(posixpath.dirname(md_path), target)
++    return posixpath.normpath(joined)
++
++
++def cmd_links() -> int:
++    tracked = [p for p in git("ls-files", "-z").split("\0") if p]
++    files = set(tracked)
++    dirs = {"."}
++    for p in tracked:
++        d = posixpath.dirname(p)
++        while d and d not in dirs:
++            dirs.add(d)
++            d = posixpath.dirname(d)
++    problems = []
++    checked = 0
++    for md in sorted(p for p in tracked if p.endswith(".md")):
++        try:
++            with open(md, encoding="utf-8") as fh:
++                text = fh.read()
++        except FileNotFoundError:
++            continue  # tracked but deleted in the working tree
++        for number, target in link_targets(text):
++            resolved = resolve(md, target)
++            if resolved is None:
++                continue
++            checked += 1
++            if resolved.startswith("../") or resolved == "..":
++                problems.append(f"{md}:{number}: link '{target}' points outside the repo")
++            elif resolved not in files and resolved not in dirs:
++                problems.append(
++                    f"{md}:{number}: broken link '{target}' (no tracked file or "
++                    f"directory {resolved})"
++                )
++    for msg in problems:
++        print(f"docs-links: {msg}")
++    if problems:
++        print(f"docs-links: {len(problems)} broken relative link(s) of {checked} checked")
++        return 1
++    print(f"docs-links: OK ({checked} relative links checked)")
++    return 0
++
++
++def main(argv: list[str]) -> int:
++    usage = "usage: docs_checks.py immutability BASE HEAD | docs_checks.py links"
++    try:
++        # Every path below is relative to the repository root, wherever we were started.
++        os.chdir(git("rev-parse", "--show-toplevel").strip())
++        if len(argv) == 3 and argv[0] == "immutability":
++            return cmd_immutability(argv[1], argv[2])
++        if len(argv) == 1 and argv[0] == "links":
++            return cmd_links()
++    except GitError as exc:
++        print(f"docs_checks: {exc}", file=sys.stderr)
++        return 2
++    print(usage, file=sys.stderr)
++    return 2
++
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv[1:]))
+diff --git a/tests/test_docs_checks.py b/tests/test_docs_checks.py
+new file mode 100644
+index 0000000..bd32eb6
+--- /dev/null
++++ b/tests/test_docs_checks.py
+@@ -0,0 +1,622 @@
++"""The docs checks (scripts/docs_checks.py) that enforce ADR-0001's immutability rule.
++
++ADR-0001 (docs/design/adr/0001-record-architecture-decisions.md:22-23, :30-31) says an
++Accepted ADR is never edited and that a docs CI check enforces it; docs/design/README.md:18-21
++and docs/design/proposals/README.md:10-11 say the same for stable specs and accepted
++proposals. Each test builds a throwaway git repo, makes a base and a head commit, and runs
++the check as a subprocess. The script is never imported, so a missing script fails each
++test instead of breaking collection.
++"""
++
++from __future__ import annotations
++
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++SCRIPT = REPO_ROOT / "scripts" / "docs_checks.py"
++
++GIT_ENV = {
++    "GIT_AUTHOR_NAME": "docs-check test",
++    "GIT_AUTHOR_EMAIL": "docs-check@example.invalid",
++    "GIT_COMMITTER_NAME": "docs-check test",
++    "GIT_COMMITTER_EMAIL": "docs-check@example.invalid",
++    "GIT_CONFIG_NOSYSTEM": "1",
++}
++
++ADR = "docs/design/adr"
++PROP = "docs/design/proposals"
++SPEC = "docs/design/specs"
++
++
++def adr(status: str, body: str = "We decide X.") -> str:
++    return (
++        f"---\ncreated: 14.10.2026 19:22\ntype: adr\nstatus: {status}\ntags:\n  - adr\n---\n"
++        f"# 0042. A decision\n\n## Context\n\nSome context.\n\n## Decision\n\n{body}\n"
++    )
++
++
++def proposal(status: str, body: str = "The plan.") -> str:
++    return (
++        f"---\ncreated: 14.10.2026 19:22\ntype: proposal\nstatus: {status}\nauthor:\n---\n"
++        f"# 0001. A proposal\n\n{body}\n"
++    )
++
++
++def spec(status: str, body: str = "The format MUST be JSON.") -> str:
++    return (
++        f"---\ncreated: 14.10.2026 19:22\ntype: spec\nstatus: {status}\nversion: v1\n---\n"
++        f"# Policy gate v1\n\n{body}\n"
++    )
++
++
++class Repo:
++    def __init__(self, root: Path):
++        self.root = root
++        root.mkdir(parents=True, exist_ok=True)
++        self.git("init", "-q")
++
++    def git(self, *args: str) -> str:
++        env = {**os.environ, **GIT_ENV}
++        result = subprocess.run(
++            [
++                "git", "-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main",
++                "-c", "core.autocrlf=false", *args,
++            ],
++            cwd=self.root, env=env, capture_output=True, text=True, check=True,
++        )
++        return result.stdout.strip()
++
++    def write(self, files: dict[str, str | bytes | None]) -> None:
++        for rel, text in files.items():
++            path = self.root / rel
++            if text is None:
++                path.unlink()
++                continue
++            path.parent.mkdir(parents=True, exist_ok=True)
++            if isinstance(text, bytes):
++                path.write_bytes(text)
++            else:
++                path.write_text(text, encoding="utf-8")
++
++    def commit(self, files: dict[str, str | bytes | None] | None = None) -> str:
++        if files:
++            self.write(files)
++        self.git("add", "-A")
++        self.git("commit", "-q", "--allow-empty", "-m", "change")
++        return self.git("rev-parse", "HEAD")
++
++    def move(self, old: str, new: str) -> None:
++        (self.root / new).parent.mkdir(parents=True, exist_ok=True)
++        self.git("mv", old, new)
++
++
++def run_check(cwd: Path, *args: str) -> subprocess.CompletedProcess:
++    return subprocess.run(
++        [sys.executable, str(SCRIPT), *args],
++        cwd=cwd, env={**os.environ, **GIT_ENV}, capture_output=True, text=True,
++    )
++
++
++def immutability(repo: Repo, base: str, head: str) -> subprocess.CompletedProcess:
++    return run_check(repo.root, "immutability", base, head)
++
++
++def scenario(tmp_path, base_files, head_files, moves=()):
++    repo = Repo(tmp_path / "repo")
++    base = repo.commit(base_files)
++    for old, new in moves:
++        repo.move(old, new)
++    head = repo.commit(head_files)
++    return immutability(repo, base, head)
++
++
++ADR_PATH = f"{ADR}/0042-a-decision.md"
++PROP_ACCEPTED = f"{PROP}/accepted/0001-implementation-arc.md"
++PROP_DRAFT = f"{PROP}/draft/0001-implementation-arc.md"
++SPEC_PATH = f"{SPEC}/policy-gate/v1.md"
++
++
++# --- (a) immutability: must fail ------------------------------------------------------
++
++MUST_FAIL = {
++    "accepted-adr-body": (
++        {ADR_PATH: adr("Accepted")}, {ADR_PATH: adr("Accepted", "We decide Y.")},
++    ),
++    "superseded-adr-body": (
++        {ADR_PATH: adr("Superseded by ADR-0013")},
++        {ADR_PATH: adr("Superseded by ADR-0013", "We decide Y.")},
++    ),
++    "superseded-adr-status": (
++        {ADR_PATH: adr("Superseded by ADR-0013")}, {ADR_PATH: adr("Superseded by ADR-0021")},
++    ),
++    "superseded-adr-back-to-proposed": (
++        {ADR_PATH: adr("Superseded by ADR-0013")}, {ADR_PATH: adr("Proposed")},
++    ),
++    "accepted-adr-to-implemented": (
++        {ADR_PATH: adr("Accepted")}, {ADR_PATH: adr("Implemented")},
++    ),
++    "accepted-adr-to-proposed": (
++        {ADR_PATH: adr("Accepted")}, {ADR_PATH: adr("Proposed")},
++    ),
++    "accepted-adr-status-and-body": (
++        {ADR_PATH: adr("Accepted")},
++        {ADR_PATH: adr("Superseded by ADR-0050", "We decide Y.")},
++    ),
++    "accepted-adr-deleted": ({ADR_PATH: adr("Accepted")}, {ADR_PATH: None}),
++    "accepted-proposal-body": (
++        {PROP_ACCEPTED: proposal("accepted")},
++        {PROP_ACCEPTED: proposal("accepted", "Another plan.")},
++    ),
++    "accepted-proposal-to-superseded": (
++        {PROP_ACCEPTED: proposal("accepted")}, {PROP_ACCEPTED: proposal("superseded")},
++    ),
++    "implemented-proposal-body": (
++        {PROP_ACCEPTED: proposal("implemented")},
++        {PROP_ACCEPTED: proposal("implemented", "Another plan.")},
++    ),
++    "implemented-proposal-status": (
++        {PROP_ACCEPTED: proposal("implemented")}, {PROP_ACCEPTED: proposal("withdrawn")},
++    ),
++    "withdrawn-proposal-body": (
++        {PROP_ACCEPTED: proposal("withdrawn")},
++        {PROP_ACCEPTED: proposal("withdrawn", "Another plan.")},
++    ),
++    "stable-spec-body": (
++        {SPEC_PATH: spec("stable")}, {SPEC_PATH: spec("stable", "The format MUST be YAML.")},
++    ),
++    "stable-spec-to-draft": ({SPEC_PATH: spec("stable")}, {SPEC_PATH: spec("draft")}),
++    "superseded-spec-body": (
++        {SPEC_PATH: spec("superseded")},
++        {SPEC_PATH: spec("superseded", "The format MUST be YAML.")},
++    ),
++    "withdrawn-spec-body": (
++        {SPEC_PATH: spec("withdrawn")},
++        {SPEC_PATH: spec("withdrawn", "The format MUST be YAML.")},
++    ),
++    "withdrawn-spec-status": (
++        {SPEC_PATH: spec("withdrawn")}, {SPEC_PATH: spec("stable")},
++    ),
++}
++
++
++@pytest.mark.parametrize("base_files,head_files", MUST_FAIL.values(), ids=MUST_FAIL.keys())
++def test_frozen_record_change_fails(tmp_path, base_files, head_files):
++    result = scenario(tmp_path, base_files, head_files)
++    out = result.stdout + result.stderr
++    assert result.returncode == 1, out
++    (path,) = base_files
++    assert path in result.stdout, out
++    assert "supersede" in result.stdout, out
++
++
++def test_renaming_an_accepted_adr_fails_at_its_old_path(tmp_path):
++    new = f"{ADR}/0042-renamed.md"
++    result = scenario(
++        tmp_path, {ADR_PATH: adr("Accepted")}, None, moves=[(ADR_PATH, new)]
++    )
++    assert result.returncode == 1, result.stdout + result.stderr
++    assert ADR_PATH in result.stdout
++
++
++def test_moving_an_accepted_proposal_fails(tmp_path):
++    other = f"{PROP}/draft/0001-implementation-arc.md"
++    result = scenario(
++        tmp_path, {PROP_ACCEPTED: proposal("accepted")}, None,
++        moves=[(PROP_ACCEPTED, other)],
++    )
++    assert result.returncode == 1, result.stdout + result.stderr
++    assert PROP_ACCEPTED in result.stdout
++
++
++def test_every_offending_path_is_reported(tmp_path):
++    other = f"{ADR}/0043-another.md"
++    result = scenario(
++        tmp_path,
++        {ADR_PATH: adr("Accepted"), other: adr("Accepted")},
++        {ADR_PATH: adr("Accepted", "Y."), other: adr("Accepted", "Z.")},
++    )
++    assert result.returncode == 1
++    assert ADR_PATH in result.stdout and other in result.stdout
++
++
++# --- (a) immutability: must pass ------------------------------------------------------
++
++MUST_PASS = {
++    "proposed-adr-body": (
++        {ADR_PATH: adr("Proposed")}, {ADR_PATH: adr("Proposed", "We decide Y.")},
++    ),
++    "partly-superseded-proposed-adr-body": (
++        {ADR_PATH: adr("Proposed (backend order and VRAM budget superseded by ADR-0019)")},
++        {ADR_PATH: adr(
++            "Proposed (backend order and VRAM budget superseded by ADR-0019)", "Y."
++        )},
++    ),
++    "adr-proposed-to-accepted": (
++        {ADR_PATH: adr("Proposed")}, {ADR_PATH: adr("Accepted")},
++    ),
++    "adr-proposed-to-accepted-with-edit": (
++        {ADR_PATH: adr("Proposed")}, {ADR_PATH: adr("Accepted", "We decide Y.")},
++    ),
++    "accepted-adr-to-superseded": (
++        {ADR_PATH: adr("Accepted")}, {ADR_PATH: adr("Superseded by ADR-0050")},
++    ),
++    "accepted-adr-to-superseded-with-suffix": (
++        {ADR_PATH: adr("Accepted")},
++        {ADR_PATH: adr("Superseded by ADR-0050 and ADR-0051 (2026-11-01)")},
++    ),
++    "accepted-adr-to-superseded-lowercase": (
++        {ADR_PATH: adr("accepted")}, {ADR_PATH: adr("superseded by adr-0050")},
++    ),
++    "accepted-proposal-to-implemented": (
++        {PROP_ACCEPTED: proposal("accepted")}, {PROP_ACCEPTED: proposal("implemented")},
++    ),
++    "accepted-proposal-to-withdrawn": (
++        {PROP_ACCEPTED: proposal("accepted")}, {PROP_ACCEPTED: proposal("withdrawn")},
++    ),
++    "draft-proposal-body": (
++        {PROP_DRAFT: proposal("draft")}, {PROP_DRAFT: proposal("draft", "Another plan.")},
++    ),
++    "draft-spec-body": (
++        {SPEC_PATH: spec("draft")}, {SPEC_PATH: spec("draft", "The format MUST be YAML.")},
++    ),
++    "spec-draft-to-stable": ({SPEC_PATH: spec("draft")}, {SPEC_PATH: spec("stable")}),
++    "stable-spec-to-superseded": (
++        {SPEC_PATH: spec("stable")}, {SPEC_PATH: spec("superseded")},
++    ),
++    "stable-spec-to-withdrawn": (
++        {SPEC_PATH: spec("stable")}, {SPEC_PATH: spec("withdrawn")},
++    ),
++    "new-spec-version": (
++        {SPEC_PATH: spec("stable")},
++        {f"{SPEC}/policy-gate/v2.md": spec("draft")},
++    ),
++    "new-adr-and-proposal": (
++        {ADR_PATH: adr("Accepted")},
++        {f"{ADR}/0043-new.md": adr("Proposed"), f"{PROP}/draft/0002-new.md": proposal("draft")},
++    ),
++    "indexes-edited": (
++        {
++            f"{ADR}/README.md": "# ADRs\n",
++            f"{PROP}/README.md": "# Proposals\n",
++            f"{SPEC}/README.md": "# Specs\n",
++            ADR_PATH: adr("Accepted"),
++        },
++        {
++            f"{ADR}/README.md": "# ADRs\n\nEdited.\n",
++            f"{PROP}/README.md": "# Proposals\n\nEdited.\n",
++            f"{SPEC}/README.md": "# Specs\n\nEdited.\n",
++        },
++    ),
++    "no-frontmatter-status": (
++        {ADR_PATH: "# 0042. No frontmatter\n\nBody.\n"},
++        {ADR_PATH: "# 0042. No frontmatter\n\nEdited.\n"},
++    ),
++    "other-docs-edited": (
++        {"docs/design/architecture/01-intro.md": "---\nstatus: living\n---\n# Intro\n"},
++        {"docs/design/architecture/01-intro.md": "---\nstatus: living\n---\n# Intro 2\n"},
++    ),
++}
++
++
++@pytest.mark.parametrize("base_files,head_files", MUST_PASS.values(), ids=MUST_PASS.keys())
++def test_allowed_change_passes(tmp_path, base_files, head_files):
++    result = scenario(tmp_path, base_files, head_files)
++    assert result.returncode == 0, result.stdout + result.stderr
++    assert "OK" in result.stdout
++
++
++def test_ratifying_proposal_moves_from_draft_to_accepted(tmp_path):
++    """The #6 ratification step: draft/ -> accepted/ while the status becomes accepted."""
++    repo = Repo(tmp_path / "repo")
++    base = repo.commit({PROP_DRAFT: proposal("draft")})
++    repo.move(PROP_DRAFT, PROP_ACCEPTED)
++    head = repo.commit({PROP_ACCEPTED: proposal("accepted")})
++    result = immutability(repo, base, head)
++    assert result.returncode == 0, result.stdout + result.stderr
++
++
++def test_frozen_state_comes_from_the_base_not_the_head(tmp_path):
++    """Accepting an ADR in a PR does not freeze it for that PR; accepting it on main does."""
++    repo = Repo(tmp_path / "repo")
++    base = repo.commit({ADR_PATH: adr("Proposed")})
++    accepted = repo.commit({ADR_PATH: adr("Accepted")})
++    edited = repo.commit({ADR_PATH: adr("Accepted", "We decide Y.")})
++    assert immutability(repo, base, edited).returncode == 0
++    result = immutability(repo, accepted, edited)
++    assert result.returncode == 1
++    assert ADR_PATH in result.stdout
++
++
++def diverged(tmp_path, main_files, pr_files, main_moves=(), pr_moves=()):
++    """Branch a PR off a Proposed ADR and a draft proposal, then commit `main_files` on
++    main and `pr_files` on the PR branch (after any `git mv`s). Returns
++    (repo, main tip, PR head)."""
++    repo = Repo(tmp_path / "repo")
++    repo.commit({
++        ADR_PATH: adr("Proposed"),
++        PROP_DRAFT: proposal("draft"),
++        "docs/other.md": "# Other\n",
++    })
++    repo.git("branch", "pr")
++    for old, new in main_moves:
++        repo.move(old, new)
++    main_tip = repo.commit(main_files)
++    repo.git("checkout", "-q", "pr")
++    for old, new in pr_moves:
++        repo.move(old, new)
++    pr_head = repo.commit(pr_files)
++    return repo, main_tip, pr_head
++
++
++def test_pr_editing_a_draft_proposal_that_main_ratified_and_moved_fails(tmp_path):
++    """Main ratifies proposal 0001 (git mv draft/ -> accepted/, status accepted) after the
++    PR branched; the PR edits the body at the old draft/ path. Frozen at the base tip under
++    its new path, so the edit fails."""
++    repo, main_tip, pr_head = diverged(
++        tmp_path,
++        {PROP_ACCEPTED: proposal("accepted")},
++        {PROP_DRAFT: proposal("draft", "Another plan.")},
++        main_moves=[(PROP_DRAFT, PROP_ACCEPTED)],
++    )
++    result = immutability(repo, main_tip, pr_head)
++    assert result.returncode == 1, result.stdout + result.stderr
++    assert PROP_DRAFT in result.stdout
++    assert PROP_ACCEPTED in result.stdout
++
++
++def test_pr_making_the_same_ratification_as_main_passes(tmp_path):
++    repo, main_tip, pr_head = diverged(
++        tmp_path,
++        {PROP_ACCEPTED: proposal("accepted")},
++        {PROP_ACCEPTED: proposal("accepted")},
++        main_moves=[(PROP_DRAFT, PROP_ACCEPTED)],
++        pr_moves=[(PROP_DRAFT, PROP_ACCEPTED)],
++    )
++    result = immutability(repo, main_tip, pr_head)
++    assert result.returncode == 0, result.stdout + result.stderr
++
++
++def test_pr_ratifying_with_a_different_body_than_main_fails(tmp_path):
++    repo, main_tip, pr_head = diverged(
++        tmp_path,
++        {PROP_ACCEPTED: proposal("accepted")},
++        {PROP_ACCEPTED: proposal("accepted", "Another plan.")},
++        main_moves=[(PROP_DRAFT, PROP_ACCEPTED)],
++        pr_moves=[(PROP_DRAFT, PROP_ACCEPTED)],
++    )
++    result = immutability(repo, main_tip, pr_head)
++    assert result.returncode == 1, result.stdout + result.stderr
++    assert PROP_DRAFT in result.stdout
++
++
++def test_pr_not_touching_a_proposal_main_moved_passes(tmp_path):
++    repo, main_tip, pr_head = diverged(
++        tmp_path,
++        {PROP_ACCEPTED: proposal("accepted")},
++        {"docs/other.md": "# Other, edited on the PR\n"},
++        main_moves=[(PROP_DRAFT, PROP_ACCEPTED)],
++    )
++    result = immutability(repo, main_tip, pr_head)
++    assert result.returncode == 0, result.stdout + result.stderr
++
++
++def test_adr_accepted_on_main_after_the_pr_branched_is_frozen(tmp_path):
++    """Merge-base still says Proposed, but the base tip has it Accepted: the edit fails."""
++    repo, main_tip, pr_head = diverged(
++        tmp_path,
++        {ADR_PATH: adr("Accepted")},
++        {ADR_PATH: adr("Proposed", "We decide Y.")},
++    )
++    result = immutability(repo, main_tip, pr_head)
++    assert result.returncode == 1, result.stdout + result.stderr
++    assert ADR_PATH in result.stdout
++    assert "base tip" in result.stdout
++
++
++def test_diverged_pr_editing_a_still_proposed_adr_passes(tmp_path):
++    repo, main_tip, pr_head = diverged(
++        tmp_path,
++        {"docs/other.md": "# Other, edited on main\n"},
++        {ADR_PATH: adr("Proposed", "We decide Y.")},
++    )
++    result = immutability(repo, main_tip, pr_head)
++    assert result.returncode == 0, result.stdout + result.stderr
++
++
++def test_diverged_pr_not_touching_the_accepted_adr_passes(tmp_path):
++    repo, main_tip, pr_head = diverged(
++        tmp_path,
++        {ADR_PATH: adr("Accepted")},
++        {"docs/other.md": "# Other, edited on the PR\n"},
++    )
++    result = immutability(repo, main_tip, pr_head)
++    assert result.returncode == 0, result.stdout + result.stderr
++
++
++def test_crlf_rewrite_of_an_accepted_adr_fails(tmp_path):
++    """Comparison is byte-exact: LF -> CRLF is an edit, even though the text is the same."""
++    lf = adr("Accepted").encode()
++    result = scenario(tmp_path, {ADR_PATH: lf}, {ADR_PATH: lf.replace(b"\n", b"\r\n")})
++    assert result.returncode == 1, result.stdout + result.stderr
++    assert ADR_PATH in result.stdout
++
++
++def test_crlf_on_an_allowed_status_line_change_fails(tmp_path):
++    base = adr("Accepted").encode()
++    head = adr("Superseded by ADR-0050").encode().replace(
++        b"status: Superseded by ADR-0050\n", b"status: Superseded by ADR-0050\r\n"
++    )
++    result = scenario(tmp_path, {ADR_PATH: base}, {ADR_PATH: head})
++    assert result.returncode == 1, result.stdout + result.stderr
++    assert ADR_PATH in result.stdout
++
++
++def test_crlf_accepted_adr_status_only_change_passes(tmp_path):
++    """A record stored with CRLF may still take its allowed status-line change."""
++    base = adr("Accepted").encode().replace(b"\n", b"\r\n")
++    head = adr("Superseded by ADR-0050").encode().replace(b"\n", b"\r\n")
++    result = scenario(tmp_path, {ADR_PATH: base}, {ADR_PATH: head})
++    assert result.returncode == 0, result.stdout + result.stderr
++
++
++# --- (b) links ------------------------------------------------------------------------
++
++
++def links_repo(tmp_path, files):
++    repo = Repo(tmp_path / "repo")
++    repo.commit({"docs/target.md": "# Target\n", "docs/sub/other.png": "png", **files})
++    return run_check(repo.root, "links")
++
++
++@pytest.mark.parametrize(
++    "line,link",
++    [
++        ("See [the target](missing.md).", "missing.md"),
++        ("See [the target](missing.md#section).", "missing.md#section"),
++        ("An image: ![alt](sub/missing.png)", "sub/missing.png"),
++        ("Up a level: [x](../nope/target.md)", "../nope/target.md"),
++        ("[ref]: missing-ref.md", "missing-ref.md"),
++        ("[ref]: missing-ref.md#frag", "missing-ref.md#frag"),
++        ("Two: [ok](target.md) and [bad](gone.md)", "gone.md"),
++        ("Out of the repo: [x](../../outside.md)", "../../outside.md"),
++    ],
++)
++def test_broken_relative_link_fails(tmp_path, line, link):
++    result = links_repo(tmp_path, {"docs/page.md": f"# Page\n\n{line}\n"})
++    assert result.returncode == 1, result.stdout + result.stderr
++    assert "docs/page.md" in result.stdout
++    assert link in result.stdout
++
++
++def test_link_to_an_untracked_file_fails(tmp_path):
++    repo = Repo(tmp_path / "repo")
++    repo.commit({"docs/page.md": "[x](untracked.md)\n"})
++    (repo.root / "docs" / "untracked.md").write_text("# not tracked\n")
++    result = run_check(repo.root, "links")
++    assert result.returncode == 1
++    assert "untracked.md" in result.stdout
++
++
++def test_valid_and_ignored_links_pass(tmp_path):
++    page = """# Page
++
++[file](target.md), [with fragment](target.md#target), [dir](sub/), [dir2](sub),
++![image](sub/other.png), [up](../README.md), [self](page.md), [angle](<target.md>)
++[web](https://example.com/missing.md), [mail](mailto:someone@example.com),
++[ftp](ftp://example.com/x.md), [anchor](#page), [proto](//example.com/x.md)
++Inline code `[x](missing-inline.md)` and ``[y](missing-double.md)`` are ignored.
++
++[ref]: target.md
++[web-ref]: https://example.com/gone.md
++[frag-ref]: #page
++
++```
++[fenced](missing-fenced.md)
++[fenced-ref]: missing-fenced-ref.md
++```
++
++~~~markdown
++[tilde](missing-tilde.md)
++~~~
++
++After the fences: [ok](target.md).
++"""
++    result = links_repo(tmp_path, {"docs/page.md": page, "README.md": "# Root\n"})
++    assert result.returncode == 0, result.stdout + result.stderr
++
++
++def test_link_after_a_closed_fence_is_checked(tmp_path):
++    page = "```\n[fenced](missing-a.md)\n```\n\n[after](missing-b.md)\n"
++    result = links_repo(tmp_path, {"docs/page.md": page})
++    assert result.returncode == 1
++    assert "missing-b.md" in result.stdout
++    assert "missing-a.md" not in result.stdout
++
++
++# Markdown that holds no broken relative link, though a naive scanner would find one.
++NOT_A_BROKEN_LINK = {
++    "footnote-definition": "A claim.[^1]\n\n[^1]: See the ADR index for details.\n",
++    "footnote-definition-with-path-like-text": "Hi.[^note]\n\n[^note]: missing.md\n",
++    "balanced-parens-in-destination": "See [v1](file(v1).md) and [v1 again](file(v1).md#x).\n",
++    "escaped-parens-in-destination": "See [v1](file\\(v1\\).md).\n",
++    "code-span-across-lines": "Use `[x](missing-a.md)\nand [y](missing-b.md)` here.\n",
++    "double-backtick-span-across-lines": "Use ``a ` [x](missing.md)\n`` here.\n",
++    "indented-code-block": "Example:\n\n    [x](missing.md)\n    [ref]: missing-ref.md\n\nDone.\n",
++    "tab-indented-code-block": "Example:\n\n\t[x](missing.md)\n",
++    "html-comment": "<!-- [x](missing.md) -->\nText.\n",
++    "html-comment-across-lines": "<!--\nTODO: [x](missing.md)\n[ref]: missing-ref.md\n-->\n",
++    "html-comment-inline": "Text <!-- [x](missing.md) --> more [ok](target.md).\n",
++    "tilde-fence-in-list-item": "1. Step\n\n    ~~~\n    see [x](missing.md)\n    ~~~\n",
++    "backtick-fence-in-list-item": "- Step\n\n  ```sh\n  see [x](missing.md)\n  ```\n",
++    "fence-in-nested-list-item": (
++        "- Outer\n\n  1. Inner\n\n     ```\n     [x](missing.md)\n     ```\n"
++    ),
++    "fence-in-list-item-without-blank-line": "1. Step\n   ~~~\n   [x](missing.md)\n   ~~~\n",
++    "indented-code-in-list-item": "1. Step\n\n       [x](missing.md)\n       [r]: missing-r.md\n",
++    "escaped-parens-in-reference-definition": "[ref]: file\\(v1\\).md\n",
++    "escaped-parens-in-angle-reference-definition": "[ref]: <file\\(v1\\).md>\n",
++    "escaped-backslash-then-code-span": "Use \\\\`[x](missing.md)` here.\n",
++    "escaped-closing-bracket": "Not a link: \\](missing.md).\n",
++}
++
++
++@pytest.mark.parametrize("page", NOT_A_BROKEN_LINK.values(), ids=NOT_A_BROKEN_LINK.keys())
++def test_markdown_that_is_not_a_broken_link_passes(tmp_path, page):
++    result = links_repo(
++        tmp_path, {"docs/page.md": f"# Page\n\n{page}", "docs/file(v1).md": "# v1\n"}
++    )
++    assert result.returncode == 0, result.stdout + result.stderr
++
++
++# The masking above must not hide real links next to it.
++STILL_A_BROKEN_LINK = {
++    "balanced-parens-missing": ("See [v2](file(v2).md).\n", "file(v2).md"),
++    "after-a-footnote": ("A.[^1]\n\n[^1]: Note.\n\n[ref]: gone.md\n", "gone.md"),
++    "after-a-code-span-closes": ("`a\nb` then [x](gone.md)\n", "gone.md"),
++    "after-an-html-comment": ("<!-- c -->\n[x](gone.md)\n", "gone.md"),
++    "after-an-indented-block": ("x\n\n    code\n\n[x](gone.md)\n", "gone.md"),
++    "indented-paragraph-continuation": ("Para\n    [x](gone.md)\n", "gone.md"),
++    "indented-list-item-content": ("1. Item\n\n    [x](gone.md)\n", "gone.md"),
++    "unclosed-backtick": ("A lone ` then [x](gone.md)\n", "gone.md"),
++    "escaped-backticks": ("Use \\` then [x](gone.md) and \\` end.\n", "gone.md"),
++    "escaped-parens-in-reference-definition-missing": (
++        "[ref]: file\\(v2\\).md\n", "file(v2).md",
++    ),
++    "after-a-fence-in-a-list-item-closes": (
++        "1. Step\n\n    ~~~\n    code\n    ~~~\n\n    [x](gone.md)\n", "gone.md",
++    ),
++    "after-the-list-ends-a-fence-left-open": (
++        "- Step\n\n  ```\n  code\n\n[x](gone.md)\n", "gone.md",
++    ),
++    "nested-list-item-content": ("- Outer\n\n  1. Inner\n\n     [x](gone.md)\n", "gone.md"),
++}
++
++
++@pytest.mark.parametrize(
++    "page,link", STILL_A_BROKEN_LINK.values(), ids=STILL_A_BROKEN_LINK.keys()
++)
++def test_broken_link_next_to_ignored_markdown_fails(tmp_path, page, link):
++    result = links_repo(
++        tmp_path, {"docs/page.md": f"# Page\n\n{page}", "docs/file(v1).md": "# v1\n"}
++    )
++    assert result.returncode == 1, result.stdout + result.stderr
++    assert "docs/page.md" in result.stdout
++    assert f"'{link}'" in result.stdout
++
++
++# --- (c) the live nl-shell tree -------------------------------------------------------
++
++
++def test_live_tree_has_no_broken_links():
++    """Runs against this checkout, so a broken link on main turns the suite red too.
++
++    Uses `git ls-files` from the repo root, which also works in a worktree (.git is a file).
++    """
++    result = run_check(REPO_ROOT, "links")
++    assert result.returncode == 0, result.stdout + result.stderr
++    assert "OK" in result.stdout

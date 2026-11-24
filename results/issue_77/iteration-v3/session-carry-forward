@@ -1,0 +1,7 @@
+Root cause is scheduling, not implementation: the brief says "Depends on: 16", but #16 was split and its backend interface, proposal/v1 parser + schema and "no backend configured" reply now live in #143, which is not accepted (sent back iterate-do this session). So #77 was scheduled onto a base without them: rounds 1-2 produced empty patches, round 3 used a stand-in schema (tests/test_teacher_client.py:28) and never wired TeacherClient into the REPL (cli.py:82 still builds Repl with no backend).
+Re-plan: change the dependency to #143 (keep #92, #14) so #77 is not scheduled until #143 is accepted and folded into the wave base; re-cite #143's names as they landed. Do not iterate Do on the current base.
+Carry forward into the brief for the next build:
+- strip or escape control characters in server-provided text that reaches TeacherError.reason (HTTP reason phrase at teacher_client.py:312-314, and `{exc}` text at :257, :278); add a fake-server test with ESC/OSC 52 in the reason phrase;
+- READ_TIMEOUT_S must be a total deadline for the whole response (time.monotonic), not per socket read; add a slow-drip body test;
+- criterion (f) must assert exactly one AF_UNIX connect to the default socket, so it goes red if choose_endpoint leaks the config URL;
+- the C4 red leg should not lean on :status text churn in test_cli.py / test_targets.py.

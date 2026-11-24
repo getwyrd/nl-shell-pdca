@@ -1,0 +1,27 @@
+Connect the REPL to the model, with --dev-teacher for other servers
+
+Until now the interactive shell never asked a model for anything: every
+natural-language request got the "no backend" reply, because the shell was
+started without a model client. This connects it.
+
+By default nl-shell talks only to the local model server on
+$XDG_RUNTIME_DIR/nl-shell/model.sock and opens no network connection
+(ADR-0003, ADR-0020 section 3). Any other server, a loopback TCP port
+included, needs the new --dev-teacher [URL] flag for that session:
+
+- --dev-teacher URL uses that URL; --dev-teacher alone uses teacher_url
+  from config.toml.
+- A teacher_url in config.toml without the flag is refused with a message
+  on stderr, and the shell keeps using the local socket.
+- A URL that is not http:// or https://, or that cannot be used as a
+  server address, is refused with the reason, and the shell uses the local
+  socket. The URL is shown escaped, so hidden characters cannot reach the
+  terminal.
+- Plain http:// to a host that is not loopback gets a warning to use an
+  SSH tunnel or https://.
+
+config.toml gains teacher_url, teacher_model (vLLM needs a model name) and
+[model] timeout_s, the request deadline in seconds (default 10, at most
+3600). :status now names the model endpoint in use and the backend kind.
+
+Fixes #152

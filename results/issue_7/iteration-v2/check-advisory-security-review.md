@@ -1,0 +1,17 @@
+# Security review — issue 7 / docs-checks-adr-immutability-links
+
+**Attacker-reachable inputs touched: none.** The patch adds a CI job (`.github/workflows/docs-checks.yml`), a standard-library script (`scripts/docs_checks.py`), its tests, and two README paragraphs. None of it ships in nl-shell or runs at runtime, so none of the threat model's untrusted inputs (command output, file names, env, session state, model output, history, reader output, model socket, install downloads, training data, dev teacher) reach it. The brief says the same ("Threat-model inputs affected: none"), and the T2 gate agrees ("no security-relevant path touched"). There are no severity ratings below, because the threat model's scale covers the runtime product, not CI.
+
+What I checked anyway, from the view of a PR author (the only party who controls this job's inputs):
+
+- **Workflow trigger and token** (`.github/workflows/docs-checks.yml:8-12`): it uses `pull_request`, not `pull_request_target`, with `permissions: contents: read`. Fork PRs get a read-only token and no secrets. This matches `tests.yml:3-9`. No finding.
+- **Expression injection** (`.github/workflows/docs-checks.yml:26-29`): the only `${{ }}` values put into the `run:` line are `pull_request.base.sha` and `pull_request.head.sha`. Both are 40-hex commit IDs set by GitHub, not text the PR author picks (unlike a title or branch name), and they are quoted. No finding.
+- **Subprocess use** (`scripts/docs_checks.py`, the `git()` / `git_blob()` helpers): every call passes an argv list with no `shell=True`. Paths from `git diff -z` and `git ls-files -z` are split on NUL, so a file name with a newline or quote can't change the command. No finding.
+- **Path handling in the links check** (`scripts/docs_checks.py:411`, `:429-442`): `resolve()` only compares strings against the tracked-file set, and links that resolve outside the repo are reported, not opened. `open(md)` reads only tracked `.md` files. A tracked symlink `x.md -> /etc/passwd` would be read on the runner, but only link targets from it get printed, and the runner is a throwaway. No finding.
+- **Regex cost** (`scripts/docs_checks.py:300`, `INLINE_MASK_RE`): a lazy, backreferenced pattern can go roughly quadratic on a file full of unmatched backticks. The worst case only slows the PR author's own CI job. No finding.
+
+- NEEDS-HUMAN [human] — Governance limit, not a vulnerability: `.github/workflows/docs-checks.yml:26-31` runs `scripts/docs_checks.py` from the PR's own checkout. So a PR can edit an Accepted ADR and, in the same PR, weaken the checker or the workflow, and the check still goes green. This is how any `pull_request` check works, and it is safe for secrets. But ADR-0001 `:30-31` treats this check as *the* control that enforces immutability. If that matters, the fix is a repo-settings decision, not code: add a CODEOWNERS entry for `scripts/docs_checks.py` and `.github/workflows/docs-checks.yml` with required review, or make the job a required check that runs the base branch's copy of the script. Test that shows it: a PR that edits an Accepted ADR's body and also changes `AdrClass.frozen` to `return False` passes the job.
+
+No other findings. Two optional hardening steps, below the bar for a finding: `actions/checkout@v4` / `setup-python@v5` are pinned by tag rather than SHA, and checkout keeps the read-only token in `.git/config` (`persist-credentials` defaults to true). Both match the existing `tests.yml`, so they are not new debt from this patch.
+
+<!-- pdca:leaf-complete -->

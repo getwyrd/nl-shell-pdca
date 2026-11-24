@@ -1,0 +1,39 @@
+Refuse a paste after a command changed bash or its terminal
+
+The persistent bash session from 7d657847d4a701d5f676429807ca2b3e40640024
+checks that nl-shell's own hooks were not changed, but a confirmed command
+could still change other bash or terminal state so that the NEXT confirmed
+command runs different bytes, or gets mangled, while the session stays
+healthy. Examples: a key binding that rewrites Enter, a DEBUG or signal
+trap that sets such a binding later, `set -o vi`, `stty intr '|'`, or a
+background job that turns terminal signals off.
+
+The session now degrades and refuses the next paste in those cases:
+
+- The snapshot taken at every prompt also compares every trap except
+  EXIT, extdebug/functrace/errtrace, xtrace and BASH_XTRACEFD, history
+  expansion, the enabled state of each builtin the hooks call
+  (HOOK_BUILTINS), readline on/off, its editing mode, its variables
+  (except history-size) and every key binding. A change degrades at that
+  command's own snapshot.
+- Just before every paste, nl-shell reads the whole terminal state and
+  bash's fds 0-2 from outside bash and compares them with the first
+  prompt's. A difference degrades and nothing is written. fds 0-2 are
+  also compared at each end-of-snapshot record, re-read once before a
+  mismatch counts.
+- A stopped bash degrades instead of hanging, and a kernel that allows
+  TIOCSTI makes the session start degraded.
+- Every degrade now carries a fixed code (Session.degraded_code,
+  SessionDegraded.code); reason texts are unchanged.
+
+User-visible change: PS4 and MAILCHECK are made readonly after ~/.bashrc,
+so a confirmed `PS4=...` fails with "readonly variable" and bash never
+checks mail. LC_ALL=C now degrades the session (fail safe).
+
+No check reads the shell's own value of the terminal fields readline sets
+itself while it reads a line; those cannot change paste bytes, and every
+way to read them without bash waiting raced the scheduler. That gap, and
+its effect on Session.interrupt(), is listed in the threat model (#149).
+The spec and the threat model's Known gaps are updated to match.
+
+Fixes #141

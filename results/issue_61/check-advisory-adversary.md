@@ -1,0 +1,20 @@
+# Adversarial review — issue 61 / quarantined-reader-error-diagnosis
+
+Target checked: `$PDCA_TARGET` (patched tree). I could not re-run pytest here (`No module named pytest`), so for C4/T3 I relied on the frozen logs. `gate-logs/C4-verify.log` shows 56/56 green with the fix and 56/56 red without it. Every red test fails on `ModuleNotFoundError` from the per-test `reader()` import, as the brief asked. `gate-logs/T3-suite.log` shows 1157 passed. I probed the production `nl_shell.reader` directly with `python3 -I` instead.
+
+## Findings
+
+- NEEDS-HUMAN [impl] — `src/nl_shell/reader.py:320`: the command half of the `missing` check keeps a name if `command_package` returns *any* name that passes the package-name pattern. It never checks that the providing package is in the index. Spec §2 (`docs/design/specs/reader-schema/v1.md:51-52`) and the brief both say "a command provided by an **indexed** package". Concrete case: with `package_exists=lambda n: False` and `command_package=lambda w: ("ghost-pkg",)`, `validate('{"category":"not-found","missing":["rg"]}', …)` returns `Diagnosis(missing=('rg',))`. `rg` is kept even though `ghost-pkg` is not indexed. The `is_package_name` call does nothing extra, because `provider_lookup` already filters on it (`src/nl_shell/command_provider.py:66`). The test fixture states the weaker reading: `COMMANDS = {"rg": ("ripgrep",)}` while `ripgrep` is not in `PACKAGES` (`tests/test_reader.py:38-39`), and `tests/test_reader.py:98-100` asserts `rg` is kept. So the suite would go red on a spec-faithful fix unless the fixture changes too. Fix: `any(lookups.package_exists(p) for p in lookups.command_package(name))`, add `ripgrep` to `PACKAGES`, and add a test where the provider is not indexed and the name is dropped. The risk is low (the name still comes from local target data, not from the attacker), but it is a spec-conformance gap the reviewer could have missed.
+- NEEDS-HUMAN [impl] — `src/nl_shell/reader.py:249-253,308-311`: `diagnose` maps only `BackendError` to `NoDiagnosis`. An exception from an injected lookup goes straight out to the caller. Concrete case: `package_exists` raising `OSError("db locked")` makes `diagnose(...)` raise `OSError`, not return "no diagnosis". The shipped `provider_lookup` catches its own errors, but the real `package_exists` / `unit_exists` (dpkg-query, systemctl) are not written yet (#14/#17), and this module's docstring promises a `Diagnosis` or a `NoDiagnosis`. Either catch errors around the lookups and drop the name (the safe default: "can't confirm" counts as "not found"), or write the "lookups must not raise" rule into the `Lookups` docstring so #14/#17 follows it. Small, builder-fixable.
+
+## Attempted refutations that did not land
+
+- Duplicate keys (`"missing"` twice), a leading BOM, `NaN`, nesting deep enough to hit `RecursionError`, a trailing newline inside a name, and a non-string `category` are all rejected (`reader.py:264-305`). Whitespace around the JSON object is accepted. That is still one JSON object, so not a defect.
+- Marker leak (criterion 5): `NoDiagnosis.why` only ever holds fixed strings (`reader.py:276`), and `message()` / `state_item()` are built only from the enum and the kept names. I found no path where answer or input text reaches the output.
+- `TeacherClient.complete` dropping `schema=` (the round-1 finding) is now covered end to end by a real HTTP round-trip that checks the posted bytes (`tests/test_reader.py:279-302`). Building the body moved into the worker's `try` (`teacher_client.py:530-531`), so a serialization error is still handed to the caller as before.
+- Default path: `request_body(messages)` without a schema still sends `SCHEMA_NAME` / `proposal.SCHEMA` (`teacher_client.py:500-501`). T3 is green, including `test_teacher_client.py`.
+- The threat-model text (`.oss-scanner/threat_model.md:37-40,159-165`) matches what the code does, apart from the "indexed package" wording in the first finding.
+
+No finding here argues the approach is wrong. Both are small conformance or robustness fixes inside this diff.
+
+<!-- pdca:leaf-complete -->

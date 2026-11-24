@@ -1,0 +1,24 @@
+# Security review (advisory) — teacher-client-transport
+
+**Attacker-reachable inputs this diff touches:** everything the model server sends back — the status line and reason phrase, headers (`Content-Length`, `Transfer-Encoding`, `Location`), the body and its pace, and `choices[0].message.content`. The threat model lists this source as the dev teacher endpoint (item 11, LAN peer) and the local model socket (item 8, same user only). The endpoint URL and socket path come from nl-shell's own config, which the threat model trusts. Nothing in this patch wires them up yet (that is child-2).
+
+## Findings
+
+No finding at Low or above on an attacker-reachable path. One optional note on a trusted input is at the end.
+
+## What I checked (all against `$PDCA_TARGET`)
+
+- **Server text reaching the terminal.** Every server-derived string goes through `_excerpt` (`src/nl_shell/teacher_client.py:137`). It folds whitespace, including LF and CR, cuts to `EXCERPT_CHARS` and then calls `render.escape`. That covers the reason phrase (`:447`), the error-body excerpt (`:453-454`) and exception text through `_describe` (`:140`), which closes the `BadStatusLine` long-line hole from iteration 1. `Repl.run` escapes the reply a second time (`src/nl_shell/repl.py:138`). The other error texts hold either fixed strings, `repr()` of a config URL already checked for ASCII and control characters (`:151`), or `_quote` of a config path. I found no route for ESC, BEL, CR or LF from the server into the reply. The tests cover this with the hostile status line and the malformed and long status lines (`tests/test_teacher_client.py` `test_a_hostile_status_line_never_reaches_the_terminal`, `test_a_long_status_line_is_cut_to_one_short_line`). These are the hostile cases, not just the friendly path.
+- **UI spoofing.** A server can still choose up to 200 printable characters after the fixed `The model server could not be used: ` prefix, on one line. That is shorter than the framed proposal block, and the line starts with nl-shell's own prefix. No finding.
+- **Hang or crash from the server.** One deadline in the calling thread (`:384-390`). `abandon` shuts down every adopted socket (`:243`), which wakes reads inside `http.client`'s chunked reader. Waits are clamped by `_wait_for`. I suspected a gap during the TLS handshake: `wrap_socket` detaches the adopted raw socket, and the new `SSLSocket` is only adopted after the handshake (`:297-299`). So I ran a reproducer, a server that drips one byte every 0.3 s during the handshake with `timeout_s=0.5`. The caller raised `DeadlineExceeded` at 0.50 s and the worker thread was gone within 1 s. CPython's SSL handshake applies the socket timeout as one total deadline, so the gap can't be used. No finding.
+- **Memory.** The body is read in chunks with the cap checked on each chunk (`_read`). A declared `Content-Length` over the cap is refused before reading. Error bodies are capped at 800 bytes. Status and header lines are bounded by `http.client`'s own limits (65536 bytes per line, 100 headers), and the deadline still applies. JSON nesting bombs are caught as `RecursionError`. No finding.
+- **Redirects and proxies.** A 3xx raises before the body is read, and `Location` is never read or echoed. `http.client` reads no `HTTP(S)_PROXY`. No finding.
+- **TLS.** Uses `create_default_context()` with `CERT_REQUIRED` and `check_hostname=True`, and never falls back to plain HTTP. Tested.
+- **The model's content.** It is returned raw to `proposal.parse` (`repl.py:170`), the one strict parser. The client never parses, repairs or retries it. The gate's assumptions about model output (item 5) are unchanged.
+- **"What must hold" properties.** "No network for the command model, socket only" and "no outbound connection in the default config" still hold. The client is reachable only when a caller builds it with an http(s) `Endpoint`, and this diff adds no such caller. Whether the threat model should now describe the client (T2, `gate-logs/T2-threat-model.log`) is already held for the human from earlier rounds, so I don't raise it again here.
+
+## Optional note (trusted input, not a NEEDS-HUMAN item)
+
+- Low (information leak in an error message), `src/nl_shell/teacher_client.py:163`. The userinfo refusal puts the whole URL into the error, password included. `Endpoint("http", "http://user:s3cret@127.0.0.1:8080/")` gives the reply `The model server could not be used: the URL 'http://user:s3cret@127.0.0.1:8080/' holds user info, which is refused.` The URL comes from the user's own config, which is trusted, and today the text only reaches the user's screen. It would matter if a later change logged error replies. Leaving the netloc out of that message would be enough. I list it for completeness only. No attacker controls this input.
+
+<!-- pdca:leaf-complete -->

@@ -1,0 +1,16 @@
+Slice too big; split it in Plan rather than rebuild. Third round with the same pattern:
+each build closes the last review's bypass list and the reviewers find a new batch of the
+same kinds. Patch is 203 KB (2x the 100 KB backstop). v3 still has in-class bypasses:
+`[ -v 'a[$(…)]' ]`; nameref target subscripts (`declare -n r='x[$(sudo -i)]'; r=1`);
+quoted compound array values (`declare -a PROMPT_COMMAND='("sudo -i")'`,
+`declare -a x='($(sudo -i))'`); run-time command words filled by non-literal/stdin
+positionals (`bash -c '"$@"' _ "$v"`, `xargs sh -c '"$@"' _`); undecoded ANSI-C words
+(`$'\x73udo' -i`); stdin into shells opened with no command (`unshare <<<'sudo -i'`,
+`chroot /`, `script`, `sg`, `newgrp`); `fc -e` text read as a file, not bash;
+`BASH_FUNC_*%%` env assignments. Also a scope drift: target id picked as the sole folder
+under targets/ instead of the agreed constant "ubuntu-26.04" (commands.py:63-73).
+Open spec question for the re-plan: should non-literal parsed text that names sudo /
+a §5 form (`bash -c "sudo -i $x"`, `eval "sudo -S true${x:-}"`) be rejected rather than
+decision B "destructive"? The threat-model text added in v3 claims it cannot hide.
+Split with `nl-shell-pdca split 197` so each child owns a small set of classes and its own
+adversarial review, instead of one bundle carrying all seven.

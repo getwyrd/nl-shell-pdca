@@ -1,0 +1,4 @@
+Core freeze check is accepted as correct; rebuild to close two gaps found at Check, keeping everything else as is.
+1. The workflow must not run the PR head's copy of scripts/docs_checks.py, because a PR can then disable its own check. Run the base commit's copy instead (e.g. `git show "$BASE:scripts/docs_checks.py" | python - immutability "$BASE" "$HEAD"`), with a fallback to the head copy only when the script does not exist at the base (the PR that first adds it). Keep `pull_request` (never `pull_request_target`) and read-only permissions.
+2. A file starting with a UTF-8 BOM (EF BB BF) is read as having no frontmatter and is never frozen. Strip a leading BOM before frontmatter/status parsing, and add a must-fail test: an Accepted ADR saved with a BOM whose body is edited exits 1 and names the path.
+Leave unchanged: the "any text after `Superseded by ADR-NNNN`" rule (it matches the brief) and empty `status:` counting as frozen.

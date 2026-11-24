@@ -1,0 +1,31 @@
+Choose an OS target at start-up from os-release or --target
+
+nl-shell used to start on any OS without knowing which supported release it
+was on, so nothing could load the per-OS knowledge ADR-0023 keeps in
+targets/<id>/. Now, before the REPL starts, nl-shell reads os-release and picks
+the target whose ID and VERSION_ID match exactly. There is no ID_LIKE or
+near-version fallback. If nothing matches and no target is named, it refuses
+with a message that names the detected OS, the available targets, and how to
+name one.
+
+A user can name a target with --target <id> or with target = "<id>" in
+$XDG_CONFIG_HOME/nl-shell/config.toml (the flag wins). A named target that
+does not match this OS still starts, with a warning, and is recorded as "target
+does not match this OS" so the policy gate (#12) can run it in degraded mode.
+:status now shows the active target and whether it matches.
+
+Adds targets/ubuntu-26.04/target.toml, a target loader, an os-release reader
+and a config.toml reader. The product tagline no longer names an OS, so no OS
+name is left in src/.
+
+:status lines are now held per session, by the Repl, instead of in the
+module-level STATUS_LINES list, so one session's target cannot show up in
+another. Later issues (#16, #77) add a line by adding a callable to the tuple
+cli.main builds, not by appending to STATUS_LINES.
+
+This is a narrowed slice of #92: the allowlist moves to #139 and degraded
+enforcement lands with #12, so this does not close #92. Known limit: after a
+non-editable `pip install .` nl-shell refuses to start, because targets/ is not
+packaged yet (#48, #50); `pip install -e` works.
+
+Refs #92

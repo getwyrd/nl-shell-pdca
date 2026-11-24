@@ -1,0 +1,1776 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index a120eee..c9346ee 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -14,6 +14,10 @@ dependencies = [
+     "prompt_toolkit>=3.0",
+     "ptyprocess>=0.7",
+     "PyYAML>=6",
++    # The policy gate's parser (spec policy-gate/v1 §1.2): pinned exactly, since a new
++    # grammar can add node kinds the gate has no handler for.
++    "tree-sitter==0.26.0",
++    "tree-sitter-bash==0.25.1",
+ ]
+ 
+ [project.optional-dependencies]
+diff --git a/src/nl_shell/gate/__init__.py b/src/nl_shell/gate/__init__.py
+new file mode 100644
+index 0000000..7d36069
+--- /dev/null
++++ b/src/nl_shell/gate/__init__.py
+@@ -0,0 +1,133 @@
++"""The policy gate: the class of a command before anything runs (ADR-0013).
++
++``classify`` follows the decision procedure of spec ``policy-gate/v1`` §1. The result is
++the highest class any step produces:
++
++1. §1.1 characters: a character ``nl_shell.render`` hides, or a run of combining marks
++   it caps, rejects a model proposal, as the proposal parser does
++   (``nl_shell.proposal``), and makes typed input at least ``mutating``. The check is
++   ``render.has_hidden``, which looks at quoted text too, so it is stricter than §1.1.
++2. §1.2 parse with the pinned tree-sitter-bash; an ERROR or MISSING node makes the
++   command unparseable, at least ``mutating``.
++3. §1.3 and §1.4: the shell layer (``nl_shell.gate.parse``) walks every node and
++   decides what holds whatever the commands are (prefix assignments, redirections,
++   descriptors, function definitions, assignments to session variables); the command
++   layer (``nl_shell.gate.rules``) classes each simple command.
++4. §1.5 live-session resolution (``nl_shell.gate.live``) for each simple command still
++   ``read-only``; §1.6 sensitive locations (``nl_shell.gate.sensitive``) and mixed-script
++   words (``nl_shell.gate.words``) for every one.
++5. §1.7 the model's label raises the class, never lowers it.
++
++Decision C: when the gate cannot class a command (a node kind with no handler, the work
++budget exceeded, any internal error) the command is ``privileged`` and rejected, reason
++"could not class". ``classify`` never raises.
++
++The gate is not wired to the REPL yet (#78).
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++from nl_shell import render
++from nl_shell.gate import live, parse, rules, sensitive, words
++from nl_shell.gate.verdict import (
++    CLASSES,
++    DESTRUCTIVE,
++    MUTATING,
++    PRIVILEGED,
++    READ_ONLY,
++    SESSION_ALTERING,
++    Verdict,
++    rank,
++)
++
++__all__ = [
++    "CLASSES",
++    "COULD_NOT_CLASS",
++    "DESTRUCTIVE",
++    "MUTATING",
++    "ORIGINS",
++    "PRIVILEGED",
++    "READ_ONLY",
++    "SESSION_ALTERING",
++    "GateResult",
++    "classify",
++    "rank",
++]
++
++ORIGINS = ("proposal", "typed")
++COULD_NOT_CLASS = "could not class"
++UNPARSEABLE_REASON = "unparseable: the parser found an ERROR or MISSING node"
++NOTHING_CLASSED_REASON = "no simple command was classed"
++
++
++@dataclass(frozen=True)
++class GateResult:
++    """The gate's answer for one command. ``as_log`` is the session-log ``gate`` object
++    (spec ``session-log/v1``)."""
++
++    cls: str
++    reasons: tuple[str, ...]
++    rejected: bool
++
++    def as_log(self) -> dict[str, object]:
++        return {"class": self.cls, "reasons": list(self.reasons), "rejected": self.rejected}
++
++
++def classify(
++    command: str, *, origin: str = "proposal", label: str | None = None
++) -> GateResult:
++    """Class ``command`` (spec ``policy-gate/v1`` §1). Never raises.
++
++    ``origin`` is ``"proposal"`` for a model proposal and ``"typed"`` for the user's own
++    input; ``label`` is the class the model gave its proposal (§1.7)."""
++    try:
++        if origin not in ORIGINS:
++            raise ValueError(f"origin must be one of {ORIGINS}")
++        if label is not None and label not in CLASSES:
++            raise ValueError(f"label must be one of {CLASSES}")
++        verdict = _classify(command, origin)
++        if label is not None and rank(label) > rank(verdict.cls):  # §1.7
++            verdict.raise_to(label, f"the model labelled it {label}")
++    except Exception as error:  # noqa: BLE001 - decision C: never raise, fail closed
++        verdict = Verdict()
++        verdict.raise_to(PRIVILEGED, f"{COULD_NOT_CLASS}: {_describe(error)}")
++        verdict.reject(f"{COULD_NOT_CLASS}: {_describe(error)}")
++    return GateResult(
++        cls=verdict.cls, reasons=tuple(verdict.reasons), rejected=verdict.rejected
++    )
++
++
++def _describe(error: Exception) -> str:
++    if isinstance(error, parse.GateFailure):
++        return str(error)
++    return f"internal error ({type(error).__name__})"
++
++
++def _classify(command: str, origin: str) -> Verdict:
++    """§1.1–§1.6; ``classify`` adds §1.7 and decision C."""
++    total = Verdict()
++    if not isinstance(command, str):
++        raise TypeError("command must be text")
++    if render.has_hidden(command) or render.too_many_marks(command):  # §1.1
++        if origin == "proposal":
++            total.reject("hidden character in a model proposal")
++        else:
++            total.raise_to(MUTATING, "hidden character in typed input")
++    budget = parse.Budget()
++    walked = parse.walk(command, budget)  # §1.2, and the shell layer of §1.3 / §1.4
++    if walked.unparseable:
++        total.raise_to(MUTATING, UNPARSEABLE_REASON)
++    total.merge(walked.findings)
++    for invocation in walked.invocations:
++        verdict = rules.classify(invocation, budget)  # §1.3, §1.4
++        if verdict.cls == READ_ONLY:
++            verdict = live.resolve(invocation, verdict)  # §1.5
++        verdict.merge(sensitive.check(invocation))  # §1.6
++        verdict.merge(words.check(invocation))
++        total.merge(verdict)
++    if not walked.invocations and total.cls == READ_ONLY:
++        # Nothing was classed (empty text, a comment, `a=1`): nothing proved it read-only.
++        total.raise_to(MUTATING, NOTHING_CLASSED_REASON)
++    return total
+diff --git a/src/nl_shell/gate/live.py b/src/nl_shell/gate/live.py
+new file mode 100644
+index 0000000..099a0d1
+--- /dev/null
++++ b/src/nl_shell/gate/live.py
+@@ -0,0 +1,25 @@
++"""Live-session resolution, spec ``policy-gate/v1`` §7 — a fail-closed stub for now.
++
++The pipeline (``nl_shell.gate.classify``, step §1.5) calls ``resolve`` for every simple
++command still ``read-only`` after §1–§6. Resolving aliases, functions, disabled
++builtins, ``PATH``, traps and the pager and loader variables needs the session snapshot
++(spec ``pty-protocol/v1`` §3); #192 replaces this module. Until then nothing is proved
++read-only: every such command becomes ``mutating``, reason ``STUB_REASON``.
++"""
++
++from __future__ import annotations
++
++from nl_shell.gate.parse import Invocation
++from nl_shell.gate.verdict import MUTATING, READ_ONLY, Verdict
++
++STUB_REASON = "live-session resolution not implemented"
++
++
++def resolve(invocation: Invocation, verdict: Verdict) -> Verdict:
++    """§7 for one simple command and its verdict so far. Returns the new verdict."""
++    result = Verdict(
++        cls=verdict.cls, reasons=list(verdict.reasons), rejected=verdict.rejected
++    )
++    if result.cls == READ_ONLY:
++        result.raise_to(MUTATING, STUB_REASON)
++    return result
+diff --git a/src/nl_shell/gate/parse.py b/src/nl_shell/gate/parse.py
+new file mode 100644
+index 0000000..6781072
+--- /dev/null
++++ b/src/nl_shell/gate/parse.py
+@@ -0,0 +1,766 @@
++"""The shell layer of the gate: parse with the pinned grammar and walk every node.
++
++Spec ``policy-gate/v1`` §1.2 and §1.4. ``walk`` parses a command with the tree-sitter-bash
++grammar pinned in ``pyproject.toml`` and visits every node of the tree. Each named node
++kind of the grammar has exactly one handler in ``HANDLERS``; a node whose kind has none
++raises ``UnhandledNode``, so syntax the gate does not know fails closed (decision C in
++``nl_shell.gate``). ``grammar_node_kinds`` lists the kinds from the grammar itself, at run
++time, so a test can hold the two together.
++
++One ``Context`` travels the walk: where standard input comes from (``Stdin``), the
++redirections of the statements around the current node, the depth, and the ``Budget``,
++which counts every node visited across the whole classification (a caller that classes
++inner text, such as ``bash -c``, passes the same budget on).
++
++The walker hands each simple command to the command layer (``nl_shell.gate.rules``) as an
++``Invocation``: its words after quote removal, each marked literal or not; its prefix
++assignments; its redirections (its own and those around it); and its standard input.
++``declaration_command`` (``export``, ``declare``, ``typeset``, ``local``, ``readonly``)
++and ``unset_command`` nodes become invocations too, with their keyword as command word.
++
++What the shell layer decides itself (``Walk.findings``), because it holds whatever the
++command is: §2 prefix assignments, output redirections, ``/dev/tcp`` and ``/dev/udp``
++words, a command word that is not a literal or is a path outside the system directories,
++process substitution; §3 function definitions and assignments to the listed variables;
++§5 redirections the gate cannot prove use only descriptors 0-2, and assignments to
++``SUDO_PROMPT`` or ``SUDO_ASKPASS``.
++"""
++
++from __future__ import annotations
++
++import re
++from collections.abc import Callable
++from dataclasses import dataclass, field, replace
++from functools import cache
++
++import tree_sitter
++import tree_sitter_bash
++
++from nl_shell.gate.verdict import MUTATING, SESSION_ALTERING, Verdict
++
++_ENCODING = ("utf-8", "surrogatepass")
++
++# The total work of one classification: nodes visited, and how deep the walk may go.
++MAX_WORK = 20_000
++MAX_DEPTH = 150
++
++# Spec Conventions: the system directories.
++SYSTEM_DIRECTORIES = frozenset({"/usr/bin", "/usr/sbin", "/bin", "/sbin"})
++
++# §3: variables an assignment to which alters the session.
++SESSION_VARIABLES = frozenset(
++    {
++        "PATH", "BASH_ENV", "ENV", "CDPATH", "PROMPT_COMMAND",
++        "PS0", "PS1", "PS2", "PS3", "PS4",
++        "IFS", "HISTFILE", "PAGER", "MANPAGER", "SYSTEMD_PAGER", "GIT_PAGER",
++        "LESSOPEN", "LESSCLOSE", "EDITOR", "VISUAL", "BROWSER", "NODE_OPTIONS",
++    }
++)  # fmt: skip
++SESSION_VARIABLE_PREFIXES = ("LD_", "SUDO_", "PYTHON", "PERL5", "GIT_")
++# §5: assigning or exporting these is rejected.
++REJECTED_VARIABLES = frozenset({"SUDO_PROMPT", "SUDO_ASKPASS"})
++
++_NETWORK_PATH = re.compile(r"/dev/(?:tcp|udp)/")
++_GLOB = frozenset("*?[")
++_BRACE = re.compile(r"\{[^{}]*(?:,|\.\.)[^{}]*\}")
++# `{name}>file`: bash's named descriptor. tree-sitter-bash does not give it a node of its
++# own (it is an argument word, or an ERROR), so it is read from the bytes just before
++# the redirection.
++_NAMED_FD = re.compile(rb"\{[A-Za-z_][A-Za-z0-9_]*\}$")
++_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
++
++_OUTPUT_OPERATORS = frozenset({">", ">>", ">|", "&>", "&>>", "<>"})
++_DUPLICATE_OPERATORS = frozenset({">&", "<&"})
++_CLOSE_OPERATORS = frozenset({">&-", "<&-"})
++_INPUT_FIRST = ("<",)  # operators that act on descriptor 0 when none is given
++
++
++class GateFailure(Exception):
++    """The walk cannot class the command; ``nl_shell.gate`` fails closed (decision C)."""
++
++
++class UnhandledNode(GateFailure):
++    def __init__(self, kind: str) -> None:
++        super().__init__(f"no handler for node kind {kind!r}")
++        self.kind = kind
++
++
++class BudgetExceeded(GateFailure):
++    pass
++
++
++@dataclass
++class Budget:
++    """Work left for one classification, shared by every walk that is part of it."""
++
++    work: int = MAX_WORK
++    depth: int = MAX_DEPTH
++    used: int = 0
++
++    def spend(self, amount: int = 1) -> None:
++        self.used += amount
++        if self.used > self.work:
++            raise BudgetExceeded(f"work budget exceeded ({self.work} nodes)")
++
++
++@dataclass(frozen=True)
++class Stdin:
++    """Where a simple command's standard input comes from.
++
++    ``source`` is one of ``terminal``, ``pipe``, ``file``, ``heredoc``, ``herestring``,
++    ``descriptor`` (duplicated from another descriptor) or ``closed``. ``text`` is the
++    literal text a here-document or here-string feeds (None when it is not literal), or
++    the file name for ``file`` when it is literal.
++    """
++
++    source: str
++    text: str | None = None
++
++
++TERMINAL = Stdin("terminal")
++PIPE = Stdin("pipe")
++
++
++@dataclass(frozen=True)
++class Word:
++    """One shell word. ``value`` is the word after quote removal (None when an expansion
++    makes it unknowable); ``literal`` is False when the shell would still expand it
++    (an expansion, a substitution, a glob or brace expansion)."""
++
++    text: str
++    value: str | None
++    literal: bool
++
++
++@dataclass(frozen=True)
++class Assignment:
++    """``NAME=value`` or ``NAME+=value``."""
++
++    name: str
++    operator: str
++    value: Word | None
++    text: str
++
++
++@dataclass(frozen=True)
++class Redirect:
++    """One redirection. ``kind`` is ``file``, ``heredoc`` or ``herestring``; ``operator``
++    the operator token; ``descriptor`` the explicit descriptor text, if any;
++    ``target`` the destination word (None for a here-document); ``named_fd`` True for
++    ``{name}>``; ``body`` the literal text a here-document or here-string feeds."""
++
++    kind: str
++    operator: str
++    descriptor: str | None
++    target: Word | None
++    named_fd: bool
++    text: str
++    body: str | None = None
++
++    @property
++    def acts_on(self) -> str:
++        """The descriptor it acts on: the explicit one, or bash's default."""
++        if self.descriptor is not None:
++            return self.descriptor
++        if self.kind != "file" or self.operator.startswith(_INPUT_FIRST):
++            return "0"
++        return "1"
++
++
++@dataclass(frozen=True)
++class Invocation:
++    """One simple command, as the command layer sees it.
++
++    ``kind`` is ``command``, ``declaration`` or ``unset``. ``words`` holds the command
++    word first (the keyword for a declaration or ``unset``); it is empty for a command
++    with no command word. ``assignments`` are the prefix assignments (``VAR=x cmd``);
++    ``redirects`` its own redirections, then those of the statements around it."""
++
++    kind: str
++    text: str
++    words: tuple[Word, ...]
++    assignments: tuple[Assignment, ...]
++    redirects: tuple[Redirect, ...]
++    stdin: Stdin
++
++    @property
++    def command_word(self) -> Word | None:
++        return self.words[0] if self.words else None
++
++
++@dataclass(frozen=True)
++class Context:
++    """What travels the walk."""
++
++    stdin: Stdin
++    redirects: tuple[Redirect, ...]
++    depth: int
++    budget: Budget
++
++    def nested(self, **changes: object) -> Context:
++        return replace(self, **changes)  # type: ignore[arg-type]
++
++
++@dataclass
++class Walk:
++    """The result of walking one command."""
++
++    unparseable: bool
++    invocations: list[Invocation] = field(default_factory=list)
++    findings: Verdict = field(default_factory=Verdict)
++
++
++@cache
++def language() -> tree_sitter.Language:
++    return tree_sitter.Language(tree_sitter_bash.language())
++
++
++@cache
++def _parser() -> tree_sitter.Parser:
++    return tree_sitter.Parser(language())
++
++
++def grammar_node_kinds() -> frozenset[str]:
++    """Every named node kind of the pinned grammar, read from the grammar itself."""
++    lang = language()
++    return frozenset(
++        lang.node_kind_for_id(kind)
++        for kind in range(lang.node_kind_count)
++        if lang.node_kind_is_named(kind) and lang.node_kind_is_visible(kind)
++    )
++
++
++def walk(text: str, budget: Budget | None = None, stdin: Stdin = TERMINAL) -> Walk:
++    """Parse ``text`` and walk every node of it.
++
++    Raises ``GateFailure`` (an unhandled node kind, the budget exceeded); the caller
++    fails closed."""
++    budget = budget if budget is not None else Budget()
++    source = text.encode(*_ENCODING)
++    tree = _parser().parse(source)
++    walker = _Walker(source, Walk(unparseable=tree.root_node.has_error))
++    if _NETWORK_PATH.search(text):
++        walker.result.findings.raise_to(MUTATING, NETWORK_REASON)
++    walker.walk(tree.root_node, Context(stdin, (), 0, budget))
++    return walker.result
++
++
++# -- reasons -------------------------------------------------------------------------------
++
++NETWORK_REASON = "a /dev/tcp or /dev/udp path"
++PROCESS_SUBSTITUTION_REASON = "process substitution"
++DESCRIPTOR_REASON = "a redirection the gate cannot prove uses only descriptors 0-2"
++
++
++# -- words ---------------------------------------------------------------------------------
++
++
++def _text(node: tree_sitter.Node) -> str:
++    """The node's source text. tree-sitter splits bytes it cannot read as UTF-8 (a lone
++    surrogate) into nodes of their own, so a piece that does not decode keeps its bytes
++    as escapes (§1.1 has already flagged such text)."""
++    raw = node.text or b""
++    try:
++        return raw.decode(*_ENCODING)
++    except UnicodeDecodeError:
++        return raw.decode("utf-8", "surrogateescape")
++
++
++def word(node: tree_sitter.Node) -> Word:
++    """The ``Word`` for a word-like node, after quote removal."""
++    value, shape = _evaluate(node)
++    literal = (
++        value is not None
++        and shape is not None
++        and not any(char in _GLOB for char in shape)
++        and not _BRACE.search(shape)
++    )
++    return Word(text=_text(node), value=value, literal=literal)
++
++
++def _literal(text: str) -> Word:
++    return Word(text=text, value=text, literal=True)
++
++
++def _unescape_unquoted(raw: str) -> tuple[str, str]:
++    value, shape = [], []
++    chars = iter(raw)
++    for char in chars:
++        if char == "\\":
++            escaped = next(chars, "")
++            if escaped in ("\n", ""):
++                continue
++            value.append(escaped)
++            shape.append("x")
++        else:
++            value.append(char)
++            shape.append(char)
++    return "".join(value), "".join(shape)
++
++
++def _unescape_double(raw: str) -> str:
++    out = []
++    chars = iter(raw)
++    for char in chars:
++        if char == "\\":
++            escaped = next(chars, "")
++            if escaped == "\n":
++                continue
++            out.append(escaped if escaped in ('"', "\\", "$", "`") else char + escaped)
++        else:
++            out.append(char)
++    return "".join(out)
++
++
++def _evaluate(node: tree_sitter.Node) -> tuple[str | None, str | None]:
++    """(the value after quote removal, its shape with quoted characters as "x"), or
++    (None, None) when an expansion makes the value unknowable."""
++    kind = node.type
++    if kind in ("word", "number"):
++        if node.named_child_count:
++            return None, None
++        return _unescape_unquoted(_text(node))
++    if kind == "command_name":
++        if node.named_child_count != 1:
++            return None, None
++        return _evaluate(node.named_children[0])
++    if kind == "raw_string":
++        inner = _text(node)[1:-1]
++        return inner, "x" * len(inner)
++    if kind == "string":
++        parts = []
++        for child in node.named_children:
++            if child.type != "string_content":
++                return None, None
++            parts.append(_unescape_double(_text(child)))
++        inner = "".join(parts)
++        return inner, "x" * len(inner)
++    if kind == "concatenation":
++        values, shapes = [], []
++        for child in node.children:
++            value, shape = _evaluate(child)
++            if value is None or shape is None:
++                return None, None
++            values.append(value)
++            shapes.append(shape)
++        return "".join(values), "".join(shapes)
++    # $'…', $"…", $x, ${x}, $(…), `…`, $((…)), <(…), and anything else.
++    return None, None
++
++
++def _below_three(text: str) -> bool:
++    """True when ``text`` names descriptor 0, 1 or 2 (ASCII digits, leading zeros allowed).
++    Never converts the number, so a 40-digit descriptor costs nothing."""
++    if not text or not text.isascii() or not text.isdigit():
++        return False
++    return (text.lstrip("0") or "0") in ("0", "1", "2")
++
++
++def _is_zero(text: str) -> bool:
++    return bool(text) and text.isascii() and text.isdigit() and not text.lstrip("0")
++
++
++def _system_command_path(value: str) -> bool:
++    """True when ``value`` names a file directly in a system directory. Repeated slashes
++    collapse, as Linux resolves them (``//usr/bin/rm``); ``.`` and ``..`` never pass."""
++    collapsed = re.sub("/+", "/", value)
++    directory, _, name = collapsed.rpartition("/")
++    parts = collapsed.split("/")
++    if not name or "." in parts or ".." in parts:
++        return False
++    return directory in SYSTEM_DIRECTORIES
++
++
++def is_session_variable(name: str) -> bool:
++    """§3: an assignment to ``name`` alters the session."""
++    return name in SESSION_VARIABLES or name.startswith(SESSION_VARIABLE_PREFIXES)
++
++
++# -- the walker ----------------------------------------------------------------------------
++
++Handler = Callable[["_Walker", tree_sitter.Node, Context], object]
++
++
++class _Walker:
++    def __init__(self, source: bytes, result: Walk) -> None:
++        self.source = source
++        self.result = result
++
++    @property
++    def findings(self) -> Verdict:
++        return self.result.findings
++
++    def walk(
++        self, node: tree_sitter.Node, ctx: Context, handler: Handler | None = None
++    ) -> object:
++        """Visit ``node``: charge the budget, then run its kind's handler (or ``handler``,
++        which a parent uses for a node whose meaning depends on where it sits)."""
++        ctx.budget.spend()
++        depth = ctx.depth + 1
++        if depth > ctx.budget.depth:
++            raise BudgetExceeded(f"nesting deeper than {ctx.budget.depth} nodes")
++        registered = HANDLERS.get(node.type)
++        if registered is None:
++            raise UnhandledNode(node.type)
++        return (handler or registered)(self, node, ctx.nested(depth=depth))
++
++    def children(self, node: tree_sitter.Node, ctx: Context) -> None:
++        for child in node.named_children:
++            self.walk(child, ctx)
++
++    # -- redirections ----------------------------------------------------------------------
++
++    def redirect(self, node: tree_sitter.Node) -> Redirect:
++        descriptor: str | None = None
++        operator = ""
++        target: Word | None = None
++        start: tree_sitter.Node | None = None
++        body: tree_sitter.Node | None = None
++        for index, child in enumerate(node.children):
++            name = node.field_name_for_child(index)
++            if child.type == "file_descriptor" or name == "descriptor":
++                descriptor = _text(child)
++            elif child.type == "heredoc_start":
++                start = child
++            elif child.type == "heredoc_body":
++                body = child
++            elif not child.is_named:
++                operator = operator or _text(child)
++            elif target is None and (
++                name == "destination" or node.type == "herestring_redirect"
++            ):
++                target = word(child)
++        kind = {"heredoc_redirect": "heredoc", "herestring_redirect": "herestring"}.get(
++            node.type, "file"
++        )
++        text: str | None = None
++        if kind == "herestring" and target is not None and target.literal:
++            text = f"{target.value}\n"
++        elif kind == "heredoc":
++            text = _heredoc_text(start, body, strip_tabs=operator == "<<-")
++        named_fd = descriptor is None and bool(
++            _NAMED_FD.search(self.source[: node.start_byte])
++        )
++        return Redirect(
++            kind=kind,
++            operator=operator,
++            descriptor=descriptor,
++            target=None if kind == "heredoc" else target,
++            named_fd=named_fd,
++            text=_text(node),
++            body=text,
++        )
++
++    def check_redirect(self, redirect: Redirect) -> None:
++        """§2 output redirections and ``/dev/tcp``, §5 descriptors."""
++        findings = self.findings
++        target = redirect.target
++        if redirect.named_fd:
++            findings.reject(f"{DESCRIPTOR_REASON}: a named descriptor in {redirect.text!r}")
++        if redirect.descriptor is not None and not _below_three(redirect.descriptor):
++            findings.reject(f"{DESCRIPTOR_REASON}: {redirect.text!r}")
++        if target is not None and target.value is not None:
++            if _NETWORK_PATH.search(target.value):
++                findings.raise_to(MUTATING, NETWORK_REASON)
++        op = redirect.operator
++        if op in _DUPLICATE_OPERATORS:
++            if target is None or not target.literal or target.value is None:
++                findings.reject(f"{DESCRIPTOR_REASON}: {redirect.text!r}")
++            elif target.value.isascii() and target.value.isdigit():
++                if not _below_three(target.value):
++                    findings.reject(f"{DESCRIPTOR_REASON}: {redirect.text!r}")
++            elif target.value == "-":
++                pass
++            elif op == ">&":
++                # `>&file` is `&>file`: both output descriptors go to a file.
++                self._output(redirect, target)
++            else:
++                findings.reject(f"{DESCRIPTOR_REASON}: {redirect.text!r}")
++        elif op in _OUTPUT_OPERATORS:
++            self._output(redirect, target)
++
++    def _output(self, redirect: Redirect, target: Word | None) -> None:
++        if target is not None and target.literal and target.value == "/dev/null":
++            return
++        self.findings.raise_to(MUTATING, f"output redirection: {redirect.text!r}")
++
++    # -- assignments -----------------------------------------------------------------------
++
++    def check_assignment(self, assignment: Assignment, *, prefix: bool) -> None:
++        name = assignment.name
++        if name in REJECTED_VARIABLES:
++            self.findings.reject(f"assignment to {name}")
++        if prefix:
++            self.findings.raise_to(MUTATING, f"prefix assignment: {name}")
++        elif is_session_variable(name):
++            self.findings.raise_to(SESSION_ALTERING, f"assignment to {name}")
++
++
++def _assignment(node: tree_sitter.Node) -> Assignment:
++    name_node = node.child_by_field_name("name")
++    if name_node is None:
++        name_node = node.named_children[0] if node.named_child_count else node
++    if name_node.type == "subscript":
++        inner = name_node.child_by_field_name("name")
++        name_node = inner if inner is not None else name_node
++    match = _IDENTIFIER.match(_text(name_node))
++    name = match.group(0) if match else _text(name_node)
++    operator = next(
++        (_text(child) for child in node.children if not child.is_named), "="
++    )
++    value_node = node.child_by_field_name("value")
++    return Assignment(
++        name=name,
++        operator=operator,
++        value=word(value_node) if value_node is not None else None,
++        text=_text(node),
++    )
++
++
++def _assignment_word(assignment: Assignment) -> Word:
++    """``NAME=value`` as one argument word of ``export``/``declare``/…"""
++    head = f"{assignment.name}{assignment.operator}"
++    value = assignment.value
++    if value is None:
++        return _literal(head)
++    if value.value is None:
++        return Word(text=assignment.text, value=None, literal=False)
++    return Word(text=assignment.text, value=head + value.value, literal=value.literal)
++
++
++def _heredoc_text(
++    start: tree_sitter.Node | None, body: tree_sitter.Node | None, *, strip_tabs: bool
++) -> str | None:
++    """A here-document's text when it is literal: a quoted delimiter, or a body with no
++    expansion and no backslash. None otherwise."""
++    if body is None:
++        return ""
++    text = _text(body)
++    quoted = start is not None and any(q in _text(start) for q in ("'", '"', "\\"))
++    if not quoted and (
++        "\\" in text or any(c.type != "heredoc_content" for c in body.named_children)
++    ):
++        return None
++    if strip_tabs:
++        text = "".join(line.lstrip("\t") for line in text.splitlines(keepends=True))
++    return text
++
++
++def _stdin_after(own: list[Redirect], stdin: Stdin) -> Stdin:
++    """Where standard input comes from once ``own`` redirections apply."""
++    for redirect in own:
++        if not _is_zero(redirect.acts_on):
++            continue
++        op = redirect.operator
++        if redirect.kind in ("heredoc", "herestring"):
++            stdin = Stdin(redirect.kind, redirect.body)
++        elif op in ("<", "<>"):
++            target = redirect.target
++            stdin = Stdin("file", target.value if target and target.literal else None)
++        elif op == "<&":
++            stdin = Stdin("descriptor")
++        elif op == "<&-":
++            stdin = Stdin("closed")
++    return stdin
++
++
++# -- handlers ------------------------------------------------------------------------------
++
++
++def _leaf(w: _Walker, node: tree_sitter.Node, ctx: Context) -> None:
++    """A node with nothing below it to class (its parent reads its text)."""
++
++
++def _children(w: _Walker, node: tree_sitter.Node, ctx: Context) -> None:
++    """A node whose meaning is its children's, in the same context."""
++    w.children(node, ctx)
++
++
++def _pipeline(w: _Walker, node: tree_sitter.Node, ctx: Context) -> None:
++    """Every stage after a ``|`` or ``|&`` reads the pipe. A here-document's pipeline
++    (``cat <<E | x``) starts with the ``|`` token, so its first stage reads the pipe too
++    (the v2 walker treated it as reading the terminal)."""
++    piped = False
++    for child in node.children:
++        if not child.is_named:
++            if child.type in ("|", "|&"):
++                piped = True
++            continue
++        w.walk(child, ctx.nested(stdin=PIPE) if piped else ctx)
++
++
++def _redirected_statement(w: _Walker, node: tree_sitter.Node, ctx: Context) -> None:
++    own: list[Redirect] = []
++    bodies = []
++    for child in node.named_children:
++        if child.type.endswith("_redirect"):
++            own.append(w.walk(child, ctx))  # type: ignore[arg-type]
++        else:
++            bodies.append(child)
++    inner = ctx.nested(
++        stdin=_stdin_after(own, ctx.stdin), redirects=tuple(own) + ctx.redirects
++    )
++    for body in bodies:
++        w.walk(body, inner)
++
++
++def _redirect(w: _Walker, node: tree_sitter.Node, ctx: Context) -> Redirect:
++    """A redirection: record it and check it, then walk what is inside it (a
++    substitution in its target, a here-document's body, and the pipeline or list that
++    continues after a here-document's start, which tree-sitter-bash puts inside it)."""
++    redirect = w.redirect(node)
++    w.check_redirect(redirect)
++    w.children(node, ctx)
++    return redirect
++
++
++def _command(w: _Walker, node: tree_sitter.Node, ctx: Context) -> None:
++    name: Word | None = None
++    args: list[Word] = []
++    assignments: list[Assignment] = []
++    own: list[Redirect] = []
++    nested = []
++    for child in node.named_children:
++        if child.type == "variable_assignment" and name is None and not args:
++            assignment = _assignment(child)
++            assignments.append(assignment)
++            w.walk(child, ctx, handler=_prefix_assignment)
++        elif child.type.endswith("_redirect"):
++            own.append(w.walk(child, ctx))  # type: ignore[arg-type]
++        elif child.type == "command_name":
++            name = word(child)
++            nested.append(child)
++        else:
++            args.append(word(child))
++            nested.append(child)
++    words = ((name,) if name is not None else ()) + tuple(args)
++    _check_words(w, words)
++    if name is not None:
++        _check_command_word(w, name)
++    w.result.invocations.append(
++        Invocation(
++            kind="command",
++            text=_text(node),
++            words=words,
++            assignments=tuple(assignments),
++            redirects=tuple(own) + ctx.redirects,
++            stdin=_stdin_after(own, ctx.stdin),
++        )
++    )
++    # Substitutions in the words run before the command's own redirections apply.
++    for child in nested:
++        w.walk(child, ctx)
++
++
++def _check_words(w: _Walker, words: tuple[Word, ...]) -> None:
++    for item in words:
++        if item.value is not None and _NETWORK_PATH.search(item.value):
++            w.findings.raise_to(MUTATING, NETWORK_REASON)
++
++
++def _check_command_word(w: _Walker, name: Word) -> None:
++    """§2: a command word that is not a literal, or a path outside the system
++    directories."""
++    if not name.literal or name.value is None:
++        w.findings.raise_to(MUTATING, f"command word is not a literal: {name.text!r}")
++    elif "/" in name.value and not _system_command_path(name.value):
++        w.findings.raise_to(
++            MUTATING,
++            f"command word is a path outside the system directories: {name.value!r}",
++        )
++
++
++def _keyword_invocation(kind: str) -> Handler:
++    """``declaration_command`` and ``unset_command``: an invocation with the keyword as
++    command word; the command layer gives it meaning (#197)."""
++
++    def handler(w: _Walker, node: tree_sitter.Node, ctx: Context) -> None:
++        keyword = _text(node.children[0]) if node.child_count else ""
++        words = [_literal(keyword)]
++        for child in node.named_children:
++            if child.type == "variable_assignment":
++                words.append(_assignment_word(_assignment(child)))
++            else:
++                words.append(word(child))
++        _check_words(w, tuple(words))
++        w.result.invocations.append(
++            Invocation(
++                kind=kind,
++                text=_text(node),
++                words=tuple(words),
++                assignments=(),
++                redirects=ctx.redirects,
++                stdin=ctx.stdin,
++            )
++        )
++        w.children(node, ctx)
++
++    return handler
++
++
++def _variable_assignment(w: _Walker, node: tree_sitter.Node, ctx: Context) -> None:
++    """An assignment that sets a shell variable: standalone, in ``export``/``declare``/…,
++    or in an arithmetic ``for`` header. §3 and §5 apply."""
++    w.check_assignment(_assignment(node), prefix=False)
++    w.children(node, ctx)
++
++
++def _prefix_assignment(w: _Walker, node: tree_sitter.Node, ctx: Context) -> None:
++    """``VAR=x cmd``: §2 (any prefix assignment) and §5 (``SUDO_PROMPT``/``ASKPASS``)."""
++    w.check_assignment(_assignment(node), prefix=True)
++    w.children(node, ctx)
++
++
++def _function_definition(w: _Walker, node: tree_sitter.Node, ctx: Context) -> None:
++    name = node.child_by_field_name("name")
++    label = _text(name) if name is not None else _text(node)
++    w.findings.raise_to(SESSION_ALTERING, f"function definition: {label}")
++    # The body runs later, when the function is called, not under these redirections.
++    w.children(node, ctx.nested(stdin=TERMINAL, redirects=()))
++
++
++def _substitution(w: _Walker, node: tree_sitter.Node, ctx: Context) -> None:
++    """``$(…)``, `` `…` ``, ``<(…)``, ``>(…)``: the inner commands' output is
++    captured, so the redirections around do not apply to them; their standard input is
++    the one the shell has where the substitution is expanded."""
++    if node.type == "process_substitution":
++        w.findings.raise_to(MUTATING, PROCESS_SUBSTITUTION_REASON)
++    w.children(node, ctx.nested(redirects=()))
++
++
++_LEAVES = (
++    "ansi_c_string", "comment", "extglob_pattern", "file_descriptor", "heredoc_content",
++    "heredoc_end", "heredoc_start", "number", "raw_string", "regex",
++    "special_variable_name", "string_content", "test_operator", "variable_name", "word",
++)  # fmt: skip
++_CONTAINERS = (
++    # statements: the same context reaches every child
++    "program", "list", "compound_statement", "subshell", "do_group", "if_statement",
++    "elif_clause", "else_clause", "while_statement", "for_statement",
++    "c_style_for_statement", "case_statement", "case_item", "negated_command",
++    "test_command", "variable_assignments",
++    # words and expressions: only substitutions inside them hold commands
++    "arithmetic_expansion", "array", "binary_expression", "brace_expression",
++    "command_name", "concatenation", "expansion", "heredoc_body",
++    "parenthesized_expression", "postfix_expression", "simple_expansion", "string",
++    "subscript", "ternary_expression", "translated_string", "unary_expression",
++    # what the parser could not read: the tree is unparseable; its parts are still walked
++    "ERROR",
++)  # fmt: skip
++
++HANDLERS: dict[str, Handler] = {
++    **{kind: _leaf for kind in _LEAVES},
++    **{kind: _children for kind in _CONTAINERS},
++    "command": _command,
++    "declaration_command": _keyword_invocation("declaration"),
++    "unset_command": _keyword_invocation("unset"),
++    "variable_assignment": _variable_assignment,
++    "function_definition": _function_definition,
++    "pipeline": _pipeline,
++    "redirected_statement": _redirected_statement,
++    "file_redirect": _redirect,
++    "heredoc_redirect": _redirect,
++    "herestring_redirect": _redirect,
++    "command_substitution": _substitution,
++    "process_substitution": _substitution,
++}
+diff --git a/src/nl_shell/gate/rules.py b/src/nl_shell/gate/rules.py
+new file mode 100644
+index 0000000..e944654
+--- /dev/null
++++ b/src/nl_shell/gate/rules.py
+@@ -0,0 +1,24 @@
++"""The command layer of the gate: what one simple command means — a stub for now.
++
++Spec ``policy-gate/v1`` §1.4: the per-command rules (§2 operand rules, §3 builtins, §4
++destructive and privileged commands and wrappers, §5 ``sudo`` options and pipes) and the
++allowlist (§6). The shell layer (``nl_shell.gate.parse``) hands every simple command here
++as an ``Invocation``. Until #197 gives commands meaning and #198 brings the allowlist, no
++command is allowlisted, so every one is at least ``mutating``, reason "not allowlisted"
++(decision A's floor: an opaque command is at least ``mutating``).
++"""
++
++from __future__ import annotations
++
++from nl_shell.gate.parse import Budget, Invocation
++from nl_shell.gate.verdict import MUTATING, Verdict
++
++NOT_ALLOWLISTED = "not allowlisted"
++
++
++def classify(invocation: Invocation, budget: Budget) -> Verdict:
++    """The class of one simple command. ``budget`` is the classification's shared work
++    budget, for rules that class inner text (``bash -c``) with ``parse.walk``."""
++    verdict = Verdict()
++    verdict.raise_to(MUTATING, NOT_ALLOWLISTED)
++    return verdict
+diff --git a/src/nl_shell/gate/sensitive.py b/src/nl_shell/gate/sensitive.py
+new file mode 100644
+index 0000000..8151fc2
+--- /dev/null
++++ b/src/nl_shell/gate/sensitive.py
+@@ -0,0 +1,16 @@
++"""Sensitive locations, spec ``policy-gate/v1`` §8 — not implemented yet (#190).
++
++The pipeline (``nl_shell.gate.classify``, step §1.6) already calls ``check`` for every
++simple command; #190 replaces this module (``targets/<id>/sensitive.toml``, ``realpath``
++of file operands, and the file-type parts of §2 and §4). Until then it adds nothing.
++"""
++
++from __future__ import annotations
++
++from nl_shell.gate.parse import Invocation
++from nl_shell.gate.verdict import Verdict
++
++
++def check(invocation: Invocation) -> Verdict:
++    """§8 for one simple command. The stub raises nothing."""
++    return Verdict()
+diff --git a/src/nl_shell/gate/vectors.py b/src/nl_shell/gate/vectors.py
+new file mode 100644
+index 0000000..5c5750d
+--- /dev/null
++++ b/src/nl_shell/gate/vectors.py
+@@ -0,0 +1,134 @@
++"""Conformance vectors: loading ``targets/<id>/gate-vectors.toml``.
++
++Spec ``policy-gate/v1`` Conformance: each target has its own vectors, and the tests run
++them through ``nl_shell.gate.classify``. The file is an array of ``[[vector]]`` tables:
++
++- ``command`` (required): the command text;
++- ``class`` (required): the class the gate gives it, one of the five;
++- ``row``: the spec's Conformance row number;
++- ``origin``: ``"proposal"`` (the default) or ``"typed"``;
++- ``label``: the class the model gave its proposal (§1.7);
++- ``rejected``: whether the gate rejects it (default false);
++- ``reason``: text one of the gate's reasons contains;
++- ``note``: free text for the reader.
++
++Anything else is an error that names the entry, as is a missing or mistyped field.
++"""
++
++from __future__ import annotations
++
++import tomllib
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any
++
++from nl_shell import targets
++from nl_shell.gate.verdict import CLASSES
++
++VECTORS_FILE = "gate-vectors.toml"
++ORIGINS = ("proposal", "typed")
++_KEYS = frozenset(
++    {"row", "command", "class", "origin", "label", "rejected", "reason", "note"}
++)
++
++
++class VectorError(Exception):
++    """The vectors file could not be read; the message names the file and the entry."""
++
++
++@dataclass(frozen=True)
++class Vector:
++    command: str
++    cls: str
++    rejected: bool = False
++    row: int | None = None
++    origin: str = "proposal"
++    label: str | None = None
++    reason: str | None = None
++    note: str | None = None
++
++
++def load(target_id: str, root: Path = targets.TARGETS_ROOT) -> tuple[Vector, ...]:
++    """Load ``root/<target_id>/gate-vectors.toml``."""
++    if not targets.is_plain_id(target_id):
++        raise VectorError(
++            f"invalid target id {target_id!r}: a target id is a plain folder name"
++        )
++    folder = root / target_id
++    if not folder.is_dir() or not folder.resolve().is_relative_to(root.resolve()):
++        raise VectorError(f"no target {target_id!r} in {root}")
++    return read(folder / VECTORS_FILE)
++
++
++def read(path: Path) -> tuple[Vector, ...]:
++    """Read and validate one vectors file."""
++    try:
++        data = path.read_bytes()
++    except FileNotFoundError:
++        raise VectorError(f"{path}: missing") from None
++    except OSError as exc:
++        raise VectorError(f"{path}: cannot read: {exc.strerror or exc}") from None
++    try:
++        doc = tomllib.loads(data.decode("utf-8"))
++    except UnicodeDecodeError:
++        raise VectorError(f"{path}: not valid TOML: not valid UTF-8") from None
++    except tomllib.TOMLDecodeError as exc:
++        raise VectorError(f"{path}: not valid TOML: {exc}") from None
++    extra = sorted(set(doc) - {"vector"})
++    if extra:
++        raise VectorError(f"{path}: unknown top-level key `{extra[0]}`")
++    entries = doc.get("vector", [])
++    if not isinstance(entries, list):
++        raise VectorError(f"{path}: `vector` must be an array of tables ([[vector]])")
++    return tuple(
++        _vector(entry, f"{path}: vector {index}")
++        for index, entry in enumerate(entries, 1)
++    )
++
++
++def _vector(entry: Any, where: str) -> Vector:
++    if not isinstance(entry, dict):
++        raise VectorError(f"{where}: must be a table")
++    if isinstance(entry.get("row"), int):
++        where = f"{where} (row {entry['row']})"
++    unknown = sorted(set(entry) - _KEYS)
++    if unknown:
++        raise VectorError(f"{where}: unknown key `{unknown[0]}`")
++
++    def text(key: str, required: bool = False) -> str | None:
++        if key not in entry:
++            if required:
++                raise VectorError(f"{where}: missing required field `{key}`")
++            return None
++        value = entry[key]
++        if not isinstance(value, str) or (required and not value):
++            raise VectorError(f"{where}: `{key}` must be a non-empty string")
++        return value
++
++    command = text("command", required=True)
++    cls = text("class", required=True)
++    if cls not in CLASSES:
++        raise VectorError(f"{where}: class {cls!r} is not one of {', '.join(CLASSES)}")
++    label = text("label")
++    if label is not None and label not in CLASSES:
++        raise VectorError(f"{where}: label {label!r} is not one of {', '.join(CLASSES)}")
++    origin = text("origin") or "proposal"
++    if origin not in ORIGINS:
++        raise VectorError(f"{where}: origin {origin!r} is not one of {', '.join(ORIGINS)}")
++    rejected = entry.get("rejected", False)
++    if not isinstance(rejected, bool):
++        raise VectorError(f"{where}: `rejected` must be true or false")
++    row = entry.get("row")
++    if row is not None and (isinstance(row, bool) or not isinstance(row, int)):
++        raise VectorError(f"{where}: `row` must be an integer")
++    assert command is not None and cls is not None
++    return Vector(
++        command=command,
++        cls=cls,
++        rejected=rejected,
++        row=row,
++        origin=origin,
++        label=label,
++        reason=text("reason"),
++        note=text("note"),
++    )
+diff --git a/src/nl_shell/gate/verdict.py b/src/nl_shell/gate/verdict.py
+new file mode 100644
+index 0000000..f29be72
+--- /dev/null
++++ b/src/nl_shell/gate/verdict.py
+@@ -0,0 +1,62 @@
++"""The five classes and the running verdict every step of the gate raises.
++
++Spec ``policy-gate/v1`` Conventions: ``read-only`` < ``mutating`` = ``session-altering`` <
++``destructive`` < ``privileged``; *at least X* is the higher of the current class and X.
++``mutating`` and ``session-altering`` rank the same. When both apply, the verdict names
++``session-altering``: it says more about the command, and it is never lower.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++
++READ_ONLY = "read-only"
++MUTATING = "mutating"
++SESSION_ALTERING = "session-altering"
++DESTRUCTIVE = "destructive"
++PRIVILEGED = "privileged"
++CLASSES = (READ_ONLY, MUTATING, SESSION_ALTERING, DESTRUCTIVE, PRIVILEGED)
++_RANK = {READ_ONLY: 0, MUTATING: 1, SESSION_ALTERING: 1, DESTRUCTIVE: 2, PRIVILEGED: 3}
++
++
++def rank(cls: str) -> int:
++    """The rank of ``cls``; ``mutating`` and ``session-altering`` share one."""
++    return _RANK[cls]
++
++
++def higher(current: str, other: str) -> str:
++    """The higher of two classes; ``session-altering`` over ``mutating`` at equal rank."""
++    if rank(other) > rank(current):
++        return other
++    if rank(other) == rank(current) and other == SESSION_ALTERING:
++        return other
++    return current
++
++
++@dataclass
++class Verdict:
++    """A class, the reasons that raised it, and whether the command is rejected."""
++
++    cls: str = READ_ONLY
++    reasons: list[str] = field(default_factory=list)
++    rejected: bool = False
++
++    def _reason(self, reason: str) -> None:
++        if reason not in self.reasons:
++            self.reasons.append(reason)
++
++    def raise_to(self, cls: str, reason: str) -> None:
++        """At least ``cls``, because of ``reason``."""
++        self.cls = higher(self.cls, cls)
++        self._reason(reason)
++
++    def reject(self, reason: str) -> None:
++        """The command cannot be confirmed or run at all, because of ``reason``."""
++        self.rejected = True
++        self._reason(reason)
++
++    def merge(self, other: Verdict) -> None:
++        self.cls = higher(self.cls, other.cls)
++        self.rejected = self.rejected or other.rejected
++        for reason in other.reasons:
++            self._reason(reason)
+diff --git a/src/nl_shell/gate/words.py b/src/nl_shell/gate/words.py
+new file mode 100644
+index 0000000..b655641
+--- /dev/null
++++ b/src/nl_shell/gate/words.py
+@@ -0,0 +1,16 @@
++"""Mixed-script words — not implemented yet (#191).
++
++The pipeline (``nl_shell.gate.classify``) already calls ``check`` for every simple
++command; #191 replaces this module (a command word mixing scripts, and the differential
++parser test of spec ``policy-gate/v1`` Conformance). Until then it adds nothing.
++"""
++
++from __future__ import annotations
++
++from nl_shell.gate.parse import Invocation
++from nl_shell.gate.verdict import Verdict
++
++
++def check(invocation: Invocation) -> Verdict:
++    """Word checks for one simple command. The stub raises nothing."""
++    return Verdict()
+diff --git a/targets/ubuntu-26.04/gate-vectors.toml b/targets/ubuntu-26.04/gate-vectors.toml
+new file mode 100644
+index 0000000..9ba0052
+--- /dev/null
++++ b/targets/ubuntu-26.04/gate-vectors.toml
+@@ -0,0 +1,73 @@
++# Policy-gate conformance vectors for the ubuntu-26.04 target
++# (docs/design/specs/policy-gate/v1.md, Conformance). tests/test_policy_gate.py runs every
++# entry through nl_shell.gate.classify; nl_shell.gate.vectors reads this file.
++#
++# This file holds the rows landed so far, not the whole table. The spec requires every
++# row (v1.md:245-249); the set is complete only when #192 (live-session resolution, §7)
++# lands. Rows whose answer depends on a later child (#197 command meaning, #198 the
++# allowlist, #190 sensitive locations) are added with that child.
++#
++# Each [[vector]]: `command` and `class` are required; `row`, `origin` ("proposal" or
++# "typed", default "proposal"), `label`, `rejected` (default false), `reason` (text one of
++# the gate's reasons contains) and `note` are optional. `class` is the gate's exact answer
++# today; a child that raises it updates the entry.
++
++[[vector]]
++row = 7
++command = "PAGER=sh git log"
++class = "mutating"
++reason = "prefix assignment"
++
++[[vector]]
++row = 13
++command = "LD_PRELOAD=./x.so ls"
++class = "mutating"
++reason = "prefix assignment"
++
++[[vector]]
++row = 14
++command = "cat </dev/tcp/example.org/80"
++class = "mutating"
++reason = "/dev/tcp"
++
++[[vector]]
++row = 15
++command = "ls > ~/.bashrc"
++class = "mutating"
++reason = "output redirection"
++
++[[vector]]
++row = 16
++command = "$'\\x72m' -rf ~"
++class = "mutating"
++reason = "command word is not a literal"
++note = "spec: mutating at least; #197 may raise it"
++
++[[vector]]
++row = 23
++command = "SUDO_PROMPT=x sudo true"
++class = "mutating"
++rejected = true
++reason = "SUDO_PROMPT"
++note = "#197 adds privileged for sudo"
++
++[[vector]]
++row = 25
++command = "echo hi >&3"
++class = "mutating"
++rejected = true
++reason = "descriptor"
++
++[[vector]]
++row = 30
++command = "ls ‮txt.exe"
++class = "mutating"
++rejected = true
++reason = "hidden character"
++note = "U+202E RIGHT-TO-LEFT OVERRIDE in a model proposal"
++
++[[vector]]
++row = 31
++command = "if true; then"
++class = "mutating"
++reason = "unparseable"
+diff --git a/tests/test_policy_gate.py b/tests/test_policy_gate.py
+new file mode 100644
+index 0000000..9733787
+--- /dev/null
++++ b/tests/test_policy_gate.py
+@@ -0,0 +1,452 @@
++"""The policy gate's shell layer (#196): spec ``policy-gate/v1`` §1, the shell-level parts
++of §2, §3 and §5, and decision C (the gate fails closed).
++
++The command layer (``nl_shell.gate.rules``) is a stub here: every simple command is
++``mutating``, reason "not allowlisted". Live-session resolution (``nl_shell.gate.live``)
++is a fail-closed stub. So no result in this file is ``read-only``, and ``check`` asserts
++that for every case.
++
++The gate's modules are imported inside the tests, never at module level, so this file
++still loads (and fails) on a tree without them. The conformance rows come from
++``targets/ubuntu-26.04/gate-vectors.toml`` through the gate's own loader.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++COULD_NOT_CLASS = "could not class"
++STUB_REASON = "live-session resolution not implemented"
++LANDED_ROWS = {7, 13, 14, 15, 16, 23, 25, 30, 31}
++
++
++def check(command, cls, reason, *, rejected=False, origin="proposal", label=None):
++    """Classify ``command`` and assert its class, a reason, and the rejection."""
++    from nl_shell.gate import classify
++
++    result = classify(command, origin=origin, label=label)
++    assert result.cls == cls, (command, result)
++    assert any(reason in r for r in result.reasons), (command, reason, result)
++    assert not any(COULD_NOT_CLASS in r for r in result.reasons), (command, result)
++    assert result.rejected is rejected, (command, result)
++    assert result.cls != "read-only", (command, result)
++    log = result.as_log()
++    assert set(log) == {"class", "reasons", "rejected"}
++    assert log["class"] == cls and log["reasons"] == list(result.reasons)
++    return result
++
++
++def check_could_not_class(result):
++    assert result.cls == "privileged", result
++    assert result.rejected is True, result
++    assert any(COULD_NOT_CLASS in r for r in result.reasons), result
++
++
++def read_only_for(monkeypatch, *names):
++    """Make the command layer return ``read-only`` for the given command words."""
++    from nl_shell.gate import rules
++    from nl_shell.gate.verdict import Verdict
++
++    original = rules.classify
++
++    def fake(invocation, budget):
++        word = invocation.command_word
++        if word is not None and word.value in names:
++            return Verdict()
++        return original(invocation, budget)
++
++    monkeypatch.setattr(rules, "classify", fake)
++
++
++def record_invocations(monkeypatch):
++    """Record every invocation the command layer receives."""
++    from nl_shell.gate import rules
++
++    seen = []
++    original = rules.classify
++
++    def recorder(invocation, budget):
++        seen.append(invocation)
++        return original(invocation, budget)
++
++    monkeypatch.setattr(rules, "classify", recorder)
++    return seen
++
++
++def invocation_named(seen, name):
++    matches = [
++        i for i in seen if i.command_word is not None and i.command_word.value == name
++    ]
++    assert matches, (name, [i.text for i in seen])
++    return matches[0]
++
++
++# -- conformance vectors -------------------------------------------------------------------
++
++
++def test_conformance_vectors_from_the_target_file():
++    from nl_shell.gate import vectors
++
++    loaded = vectors.load("ubuntu-26.04")
++    assert {v.row for v in loaded} == LANDED_ROWS
++    for vector in loaded:
++        check(
++            vector.command,
++            vector.cls,
++            vector.reason or "",
++            rejected=vector.rejected,
++            origin=vector.origin,
++            label=vector.label,
++        )
++
++
++@pytest.mark.parametrize(
++    ("body", "message"),
++    [
++        (
++            '[[vector]]\nrow = 3\nclass = "mutating"\n',
++            "vector 1 (row 3): missing required field `command`",
++        ),
++        ('[[vector]]\ncommand = "ls"\n', "vector 1: missing required field `class`"),
++        ('[[vector]]\ncommand = "ls"\nclass = "harmless"\n', "vector 1: class 'harmless'"),
++        (
++            '[[vector]]\ncommand = "ls"\nclass = "mutating"\n'
++            '[[vector]]\ncommand = "ls"\nclass = "mutating"\nexpected = 1\n',
++            "vector 2: unknown key `expected`",
++        ),
++        ('[[vector]\ncommand = "ls"\n', "not valid TOML"),
++    ],
++)
++def test_vector_loader_rejects(tmp_path, body, message):
++    from nl_shell.gate import vectors
++
++    path = tmp_path / "gate-vectors.toml"
++    path.write_text(body, encoding="utf-8")
++    with pytest.raises(vectors.VectorError) as raised:
++        vectors.read(path)
++    assert message in str(raised.value)
++    assert str(path) in str(raised.value)
++
++
++def test_vectors_file_says_it_is_partial_until_192():
++    from nl_shell.gate import vectors
++    from nl_shell.targets import TARGETS_ROOT
++
++    path = TARGETS_ROOT / "ubuntu-26.04" / vectors.VECTORS_FILE
++    header = path.read_text(encoding="utf-8")
++    assert "rows landed so far" in header
++    assert "#192" in header and "v1.md:245-249" in header
++
++
++# -- §1.1 characters, §1.2 parse, §1.7 label -----------------------------------------------
++
++
++def test_hidden_character_typed_is_at_least_mutating():
++    check("ls ‮txt.exe", "mutating", "hidden character", origin="typed")
++
++
++def test_lone_surrogate_in_a_proposal_is_rejected():
++    check("ls \udcff", "mutating", "hidden character", rejected=True)
++
++
++@pytest.mark.parametrize(
++    ("command", "node"), [("if true; then", "MISSING fi"), ("case x in", "ERROR")]
++)
++def test_unparseable(command, node):
++    import tree_sitter
++
++    from nl_shell.gate import parse
++
++    check(command, "mutating", "unparseable")
++    tree = tree_sitter.Parser(parse.language()).parse(command.encode())
++    found = []
++
++    def visit(n):
++        if n.is_missing:
++            found.append(f"MISSING {n.type}")
++        if n.type == "ERROR":
++            found.append("ERROR")
++        for child in n.children:
++            visit(child)
++
++    visit(tree.root_node)
++    assert node in found, found
++
++
++def test_label_raises_never_lowers():
++    check("true", "destructive", "labelled it destructive", label="destructive")
++    result = check("true", "mutating", "not allowlisted", label="read-only")
++    assert not any("labelled" in r for r in result.reasons)
++
++
++def test_label_against_a_read_only_class(monkeypatch):
++    read_only_for(monkeypatch, "true")
++    check("true", "destructive", "labelled it destructive", label="destructive")
++    result = check("true", "mutating", STUB_REASON, label="read-only")
++    assert not any("labelled" in r for r in result.reasons)
++
++
++# -- shell-level §2 ------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    ("command", "reason"),
++    [
++        ("PAGER=sh git log", "prefix assignment"),
++        ("LD_PRELOAD=./x.so ls", "prefix assignment"),
++        ("LESSOPEN='|sh %s' less f", "prefix assignment"),
++        ("ls > ~/.bashrc", "output redirection"),
++        ("cat </dev/tcp/example.org/80", "/dev/tcp"),
++        ("$'\\x72m' -rf ~", "command word is not a literal"),
++        ("$(echo rm) -rf ~", "command word is not a literal"),
++        ("diff <(ls) <(ls)", "process substitution"),
++        ("/tmp/rm x", "path outside the system directories"),
++        ("./rm x", "path outside the system directories"),
++    ],
++)
++def test_static_rules(command, reason):
++    check(command, "mutating", reason)
++
++
++@pytest.mark.parametrize(
++    "command",
++    [
++        "echo x >/dev/null",
++        "echo x 2>&1",
++        "echo x 1>&2",
++        "echo x >&2",
++        "/usr/bin/rm x",
++        "//usr/bin/rm x",
++    ],
++)
++def test_no_shell_level_reason(command):
++    result = check(command, "mutating", "not allowlisted")
++    assert list(result.reasons) == ["not allowlisted"], result
++
++
++# -- shell-level §3 ------------------------------------------------------------------------
++
++
++def test_function_definition_is_session_altering():
++    check("f() { true; }", "session-altering", "function definition")
++
++
++@pytest.mark.parametrize(
++    ("command", "name"),
++    [
++        ("PATH=x", "PATH"),
++        ("IFS=x", "IFS"),
++        ("LD_PRELOAD=x", "LD_PRELOAD"),
++        ("LD_LIBRARY_PATH=x", "LD_LIBRARY_PATH"),
++        ("GIT_DIR=x", "GIT_DIR"),
++        ("GIT_PAGER=x", "GIT_PAGER"),
++        ("PS1=x", "PS1"),
++        ("PYTHONPATH=x", "PYTHONPATH"),
++        ("NODE_OPTIONS=x", "NODE_OPTIONS"),
++        ("export PATH=./bin", "PATH"),
++        # A `mutating` reason first: `session-altering` still names the class.
++        ("A=1 true; PATH=x", "PATH"),
++    ],
++)
++def test_session_variable_assignment(command, name):
++    check(command, "session-altering", name)
++
++
++# -- shell-level §5 ------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "command",
++    [
++        "echo hi >&3",
++        "3>x",
++        "{fd}>x",
++        "exec 3>&-",
++        "echo x >&$x",
++        "cat <&$fd",
++        'echo x >&"$X"',
++        "echo x 2>&${FD}",
++        "echo x >&" + "4" * 40,
++    ],
++)
++def test_descriptor_not_provably_below_three_is_rejected(command):
++    check(command, "mutating", "descriptor", rejected=True)
++
++
++@pytest.mark.parametrize(
++    ("command", "cls"),
++    [
++        ("SUDO_PROMPT=x sudo true", "mutating"),
++        ("SUDO_ASKPASS=/x sudo true", "mutating"),
++        ("export SUDO_PROMPT=x", "session-altering"),
++        ("SUDO_ASKPASS=/x", "session-altering"),
++    ],
++)
++def test_sudo_prompt_and_askpass_assignments_are_rejected(command, cls):
++    check(command, cls, "SUDO_", rejected=True)
++
++
++# -- walk coverage -------------------------------------------------------------------------
++
++
++def test_every_simple_command_reaches_the_command_layer(monkeypatch):
++    seen = record_invocations(monkeypatch)
++    command = (
++        "a1 | a2; b1 && b2 || b3; (c1); { c2; }; "
++        "if d1; then d2; elif d3; then d4; else d5; fi; "
++        "while e1; do e2; done; until e3; do e4; done; for x in 1; do f1; done; "
++        "for ((i=0; i<1; i++)); do f2; done; case x in y) g1;; esac; "
++        "h() { h1; }; function h2f { h2; }; echo $(i1) `i2` \"$(i3)\"; ! j1"
++    )
++    check(command, "session-altering", "function definition")
++    words = {i.command_word.value for i in seen if i.command_word is not None}
++    expected = {
++        "a1", "a2", "b1", "b2", "b3", "c1", "c2", "d1", "d2", "d3", "d4", "d5", "e1", "e2",
++        "e3", "e4", "f1", "f2", "g1", "h1", "h2", "echo", "i1", "i2", "i3", "j1",
++    }  # fmt: skip
++    assert expected <= words, expected - words
++
++
++@pytest.mark.parametrize(
++    ("command", "keyword", "kind"),
++    [
++        ("export X=1", "export", "declaration"),
++        ("declare -a y", "declare", "declaration"),
++        ("typeset z", "typeset", "declaration"),
++        ("local w=2", "local", "declaration"),
++        ("readonly v", "readonly", "declaration"),
++        ("unset u", "unset", "unset"),
++    ],
++)
++def test_declarations_and_unset_reach_the_command_layer(
++    monkeypatch, command, keyword, kind
++):
++    seen = record_invocations(monkeypatch)
++    check(command, "mutating", "not allowlisted")
++    invocation = invocation_named(seen, keyword)
++    assert invocation.kind == kind
++    assert invocation.words[0].literal
++
++
++def test_invocation_record_shape(monkeypatch):
++    seen = record_invocations(monkeypatch)
++    check("A=1 \"e\"'c'ho $x 'a b' > /dev/null", "mutating", "prefix assignment")
++    invocation = invocation_named(seen, "echo")
++    assert [(w.value, w.literal) for w in invocation.words] == [
++        ("echo", True), (None, False), ("a b", True)
++    ]  # fmt: skip
++    assert [a.name for a in invocation.assignments] == ["A"]
++    assert [r.text for r in invocation.redirects] == ["> /dev/null"]
++    assert invocation.stdin.source == "terminal"
++
++
++def test_every_grammar_node_kind_has_a_handler():
++    from nl_shell.gate import parse
++
++    kinds = parse.grammar_node_kinds()
++    assert kinds, "the grammar lists no named node kinds"
++    assert kinds <= set(parse.HANDLERS), sorted(kinds - set(parse.HANDLERS))
++
++
++# -- stdin context -------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    ("command", "consumer"),
++    [
++        ("cat <<E | sudo tee /x\nx\nE", "sudo"),
++        ("cat <<E | doas id\nx\nE", "doas"),
++        ("cat <x | y", "y"),
++        ("cat <<<x | y", "y"),
++    ],
++)
++def test_second_stage_reads_the_pipe(monkeypatch, command, consumer):
++    seen = record_invocations(monkeypatch)
++    check(command, "mutating", "not allowlisted")
++    assert invocation_named(seen, consumer).stdin.source == "pipe"
++    assert invocation_named(seen, "cat").stdin.source != "terminal"
++
++
++@pytest.mark.parametrize(
++    ("command", "source", "text"),
++    [
++        ("bash <<<'rm -rf ~'", "herestring", "rm -rf ~"),
++        ("bash <<'E'\nrm -rf $HOME\nE", "heredoc", "rm -rf $HOME"),
++    ],
++)
++def test_literal_input_text_is_recorded(monkeypatch, command, source, text):
++    seen = record_invocations(monkeypatch)
++    check(command, "mutating", "not allowlisted")
++    stdin = invocation_named(seen, "bash").stdin
++    assert stdin.source == source
++    assert stdin.text is not None and text in stdin.text
++
++
++# -- decision C ----------------------------------------------------------------------------
++
++
++def test_unhandled_node_kind_fails_closed(monkeypatch):
++    from nl_shell.gate import classify, parse
++
++    monkeypatch.delitem(parse.HANDLERS, "pipeline")
++    check_could_not_class(classify("ls | wc"))
++
++
++def test_deep_nesting_fails_closed():
++    from nl_shell.gate import classify
++
++    depth = 300
++    result = classify("echo " + "$(" * depth + "true" + ")" * depth)
++    check_could_not_class(result)
++
++
++def test_long_substitution_chain_under_the_depth_limit_fails_closed():
++    from nl_shell.gate import classify, parse
++
++    result = classify("echo" + " $(true)" * (parse.MAX_WORK // 3))
++    check_could_not_class(result)
++    assert any("work budget" in r for r in result.reasons), result
++
++
++def test_internal_error_fails_closed(monkeypatch):
++    from nl_shell.gate import classify, rules
++
++    def broken(invocation, budget):
++        raise RuntimeError("boom")
++
++    monkeypatch.setattr(rules, "classify", broken)
++    check_could_not_class(classify("ls"))
++
++
++@pytest.mark.parametrize(
++    "call",
++    [
++        {"command": None},
++        {"command": "ls", "origin": "keyboard"},
++        {"command": "ls", "label": "harmless"},
++    ],
++)
++def test_classify_never_raises(call):
++    from nl_shell.gate import classify
++
++    check_could_not_class(classify(**call))
++
++
++# -- the §7 stub ---------------------------------------------------------------------------
++
++
++def test_live_stub_raises_read_only_to_mutating(monkeypatch):
++    read_only_for(monkeypatch, "ls")
++    result = check("ls", "mutating", STUB_REASON)
++    assert STUB_REASON in result.reasons
++
++
++def test_live_resolve_directly():
++    from nl_shell.gate import live, parse
++    from nl_shell.gate.verdict import Verdict
++
++    assert live.STUB_REASON == STUB_REASON
++    invocation = parse.walk("ls").invocations[0]
++    result = live.resolve(invocation, Verdict())
++    assert result.cls == "mutating"
++    assert STUB_REASON in result.reasons

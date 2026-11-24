@@ -1,0 +1,7 @@
+Human chose iterate-do and again explicitly overrode the size-backstop recommendation (iterate-plan); do not re-split this round.
+Fix the confirmed round-4 adversary/security findings, each with a test:
+- Two here-docs joined by |, &&, || on one line (cat <<A | cat <<B ...): tree-sitter nests the second heredoc_redirect inside the first and mis-assigns bodies, hiding a line from the gate. Fail closed when a heredoc_redirect contains another heredoc_redirect, or when here-doc bodies are not in the same source order as their heredoc_start nodes. Add the |, &&, || reproducers as decision-C cases.
+- Extglob redirect targets (>/dev/@(fd)/3, >/dev/+(fd)/3, >/dev/!(x)/3, >/proc/@(self)/fd/3, >/@(dev)/fd/3) must be rejected: treat a file-redirect target followed by "(" and ending in one of ?*+@! as a pattern, or reject any file redirect inside a tree with an ERROR node.
+- /proc/<x>/cwd/ and /proc/<x>/task/<t>/cwd/ redirect targets must be treated as unprovable descriptors (rejected), like "..".
+- Correct the parse-time figure in the threat model and parse.py comment: worst known input is "$[" repeated (~12.7 s at the 64 KiB cap; "a=(" ~7.7 s, "${" ~3.0 s), or bound the parse via tree-sitter's progress_callback and treat cancellation as decision C. Add a timing test.
+Keep the threat-model wording accurate to what the code actually rejects. Do not widen behaviour for the still-undecided scope questions (non-literal redirect targets like >$F; arithmetic assignments).

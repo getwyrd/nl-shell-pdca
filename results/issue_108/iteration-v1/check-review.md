@@ -1,0 +1,21 @@
+Review issue #108: route command-prefixed English sentences and unbalanced apostrophes as natural language using the specified deterministic heuristic.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The routing contract defines word splitting, quote precedence, exclusions and twelve observable examples; the target tests exercise the specified REPL outcomes (target/tests/test_repl.py:89). |
+| C2 Reproduction (red pre-fix) | PASS | Independently stashing only production router changes reproduced six incorrect command routes among twelve vectors (reviewer-red.log:1); frozen REPL evidence likewise shows six assertion failures without collection errors (gate-logs/C4-verify.log:275). |
+| C3 Change | PASS | The patch stays within router behavior, its REPL tests and the architecture description; first_token remains unchanged for its other caller (target/src/nl_shell/router.py:53; target/docs/design/architecture/05-building-block-view.md:75). |
+| C4 Verification (red→green) | PASS | Independent direct routing checks changed from six failures to twelve passes after restoring production changes (reviewer-green.log:1); frozen pytest evidence shows 33 passing REPL tests and six pre-fix failures (gate-logs/C4-verify.log:11; gate-logs/C4-verify.log:282). |
+| C5 Causal adequacy | PASS | The resolved-first-token decision now applies the exact specified sentence rule and quote precedence; the six independently reproduced misroutes disappear without a capability probe or symptom guard (target/src/nl_shell/router.py:86; target/src/nl_shell/router.py:115). |
+| T1 Structure | PASS | Routing remains independent of the REPL, with bounded private helpers and unchanged tokenization API; no new dependency or cross-layer coupling is introduced (target/src/nl_shell/router.py:91; target/src/nl_shell/router.py:107). |
+| T2 Shape | PASS | The change preserves command handling and policy boundaries; the frozen threat-model scanner reports no security-relevant path touched, consistent with the three affected paths (gate-logs/T2-threat-model.log:10; target/src/nl_shell/router.py:115). |
+| T3 Runtime | PASS | Frozen full-suite output reports 1112 passed, one skipped and one forkpty warning, covering the unchanged first_token consumer; local pytest rerun is unavailable because this reviewer host lacks pytest (gate-logs/T3-suite.log:33; target/src/nl_shell/router.py:53). |
+| T4 Contribution | N/A | Contribution artifacts are absent by design at Check; the logged substantive audit is deferred to the mandatory publish rerun (gate-logs/T4-contribution.log:10). |
+| T5 Judgment | NEEDS-HUMAN | Confirm the path-specific prior-art results remain current for the router, REPL tests and architecture document — the brief records router/test history and closed-PR checks, but this target has only one synthetic base commit and no remote, so merged/rejected-work overlap cannot be independently settled (brief.md:58; target/docs/design/architecture/05-building-block-view.md:75). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Accept the deliberate usability tradeoff of sentence heuristics, including short English remaining commands and odd apostrophes overriding echo — deterministic checks establish the agreed examples, while suitability for everyday shell input remains a maintainer decision (target/src/nl_shell/router.py:7; target/src/nl_shell/router.py:22; target/tests/test_repl.py:107). |
+
+Independent verification used rerun-router.py with all specified executable command names present on an isolated PATH and kill/echo provided by the builtin set. This fixture is appropriate to command-name resolution; real command execution and external services are not dependencies of the requested routing behavior. Only src/nl_shell/router.py was stashed for the red leg, preserving the new vectors, and the patch was restored afterward. No production source was edited by the reviewer. git diff --check passed.
+
+The reviewer host's python3 reports “No module named pytest”; therefore the full REPL and suite conclusions above rely on the frozen gate logs, not a claimed local pytest run. The instance-scoped gate wrappers are not included here; their available logs were read. No INTEGRATION.md is present in the supplied target. No stale-target caveat was needed.
+
+<!-- pdca:leaf-complete -->

@@ -1,0 +1,5 @@
+Keep scripts/docs_links.py, the workflow step and decision 5's rule exactly as they are; the behavior is correct. Only add the three tests the iteration-3 adversary review found missing (SUMMARY §6 items 3-5). Each must go red if its rule clause is removed from the script:
+1. Fence inside a ">" block quote, closed by a longer run so inline code cannot pair the runs: "> ```\n> [x](missing.md)\n> ````\n" must PASS. It must fail if scripts/docs_links.py:87 strips only whitespace and not ">" markers.
+2. A longer run closes a fence: "```\n[a](guide.md)\n````\n[y](after-longer.md)\n" must FAIL and name after-longer.md. It must fail if ">=" at scripts/docs_links.py:107 becomes "==".
+3. Badge / nested link: "[![b](missing.png)](guide.md)\n" must FAIL and name missing.png. It must fail if the rescan at scripts/docs_links.py:185 skips past the outer link.
+Do not change anything else.

@@ -1,0 +1,10 @@
+Not converging: each round the adversary finds a new I1 bypass in the same area, so the brief, not the build, needs to change. Re-plan the brief; do not split again (already depth 2).
+In-scope defect the next build must fix: a self-removing DEBUG trap runs `stty -isig` after the D check (PROMPT_COMMAND top level, session.py:279) and removes itself before `__nls_snap`, so the next paste goes out with -isig while healthy (10/10 repro) — violates (h)/(j). Take the synchronized ISIG/termios reading at the last point hook-time code can run, check `trap -p DEBUG` before D, add this reproducer as a test row, and fix the spec/comment claims about E-time and D-time termios (v1.md:278, :289-290; session.py:956-960).
+Scope decisions the re-plan must write into the brief (open, decide in Plan):
+- background-job termios race between pre-paste check and write (session.py:722-726): named Known gap + follow-up, or block/degrade while jobs are live;
+- setsid'd process reading the PTY slave and stealing paste bytes: named Known gap + follow-up, or a /proc/*/fd outside-check;
+- PS4: accept `readonly PS4` (breaks `PS4=...; set -x` debugging) or go back to detect-in-H with xtrace off before PS4 expands;
+- criterion (r): keep "no marker" strictly, or accept the relaxed test;
+- `bind -v` in H makes `HISTSIZE=7` / `LC_ALL=C` degrade (h-changed): accept the false alarms or exclude those variables;
+- whether the printf-success runtime guard is the right causal boundary (C5).
+The 8 plan-review items are already answered at brief.md:25.

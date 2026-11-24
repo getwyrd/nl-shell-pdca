@@ -1,0 +1,75 @@
+{
+  "attempts": [
+    {
+      "n": 1,
+      "builder": "claude",
+      "family": "claude",
+      "model": "",
+      "effort": ""
+    },
+    {
+      "n": 2,
+      "builder": "claude",
+      "family": "claude",
+      "model": "",
+      "effort": ""
+    },
+    {
+      "n": 3,
+      "builder": "claude",
+      "family": "claude",
+      "model": "",
+      "effort": ""
+    },
+    {
+      "n": 4,
+      "builder": "claude",
+      "family": "claude",
+      "model": "",
+      "effort": ""
+    },
+    {
+      "n": 5,
+      "builder": "claude",
+      "family": "claude",
+      "model": "",
+      "effort": ""
+    },
+    {
+      "n": 6,
+      "builder": "claude",
+      "family": "claude",
+      "model": "",
+      "effort": ""
+    },
+    {
+      "n": 7,
+      "builder": "claude",
+      "family": "claude",
+      "model": "",
+      "effort": ""
+    },
+    {
+      "n": 7,
+      "builder": "claude",
+      "family": "claude",
+      "model": "",
+      "effort": ""
+    },
+    {
+      "n": 7,
+      "builder": "claude",
+      "family": "claude",
+      "model": "",
+      "effort": ""
+    },
+    {
+      "n": 8,
+      "builder": "claude",
+      "family": "claude",
+      "model": "",
+      "effort": ""
+    }
+  ],
+  "iterations_to_pass": 10
+}

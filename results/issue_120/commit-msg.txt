@@ -1,0 +1,31 @@
+session: hold background job output between commands
+
+Output that a background job (`cmd &`) wrote while no command was running
+was never shown. Nothing read the PTY between commands, so the bytes sat
+in the kernel until the next run() read them and threw them away. A job
+that wrote more than the PTY buffer holds blocked until the user ran
+another command.
+
+The session now keeps reading the PTY between commands on a thread of its
+own. Once bash is seen waiting for its next line, what arrives is
+background output: it goes into a 64 KiB buffer that keeps the newest
+bytes and counts the dropped ones. It is never written to the terminal
+and never becomes part of a CommandResult. The caller can ask whether
+output is waiting (Session.background_waiting) and take it as one block
+under a "[background output]" line, with an "[N bytes dropped]" line when
+the buffer overflowed (Session.take_background_output). The bytes are
+untrusted (ADR-0016).
+
+The prompt and PROMPT_COMMAND output are still dropped as before. Job
+notices that bash prints during a later command stay that command's
+output. The reader stops before every run() and before close(). It holds
+the session only through a weak reference, so a session dropped without
+close() is still collected and its bash still exits.
+
+pty-protocol v1 section 6.6 gains the exact boundary of what counts as
+background output, and the conformance paragraph and threat model now say
+what this covers. The notice during a confirm (#74) and showing the block
+above the prompt (#78) build on this. This follows the terminal ownership
+work in 59988582859b1003c8c9cc9467d5ae09257f6fcc.
+
+Fixes #120

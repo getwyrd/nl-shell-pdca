@@ -1,0 +1,18 @@
+# Adversarial review — issue_140 (persistent-bash-session-core), round 4
+
+Re-ran attacks against the patched target with real bash 5.3.9 and ptyprocess. pytest is not
+installed here, so I could not re-run the suite. I drove `Session` directly with small scripts
+in my scratch dir instead. The C4 log shows 95/95 red (every red is `ModuleNotFoundError:
+nl_shell.session`, as expected for new code, gate-logs/C4-verify.log:47) and 95 passed green
+(:13). T3 is 332 passed. The evidence holds up. The two findings below are holes in the fix.
+
+- NEEDS-HUMAN [impl] — **The per-function trace flag (`declare -ft`) gets around the round-3 functrace fix and breaks I2.** `src/nl_shell/session.py:88-89` and spec `docs/design/specs/pty-protocol/v1.md:138` say "each hook first turns functrace off, so no DEBUG trap runs inside it after `H` is taken". That is false. `set +T` (session.py:118, :136) clears only the global option. `declare -ft __nls_snap` sets the function's own trace flag, which `set +T` does not clear. `declare -f` in H (session.py:154) does not print that flag, and neither does `__nls_f`, which looks only at `$-`. Repro on a fresh session:
+  `declare -ft __nls_snap; trap 'case $BASH_COMMAND in *"set +T"*) [[ -n ${zz+x} ]] && PS0=$zz;; "__nls_enc V"*) zz=$PS0; PS0=;; esac' DEBUG`
+  then `true` → `ran=False`, healthy. Then `touch MARK; echo printed; (exit 7)` → `ran=False st=7 out=''`, healthy, and **MARK exists**. Every later command is also reported "nothing ran", and the session never degrades. The trap clears PS0 after H is taken and puts it back before the next H, so H never differs. This is the round-3 item 2 attack again, just one step around the fix. `tests/test_session.py:640-668` (`_FUNCTRACE_ATTACKS`, the `debug-trap-functrace` row) tests only global `set -T`, so it stays green. Fix: add `\builtin declare -F -t` to the H block (it prints `declare -ft __nls_snap` when the flag is set; I checked this on 5.3.9) or `declare -pF` of each hook. Add a `declare -ft __nls_snap` / `declare -ft __nls_done` row to `_TABLE_A_ROW_1` and `_FUNCTRACE_ATTACKS`. If the flag is left out of H, the docs must say I2 does not hold against it.
+
+- NEEDS-HUMAN [impl] — **`read -u 2 x` (a read of the terminal on fd 2) dodges the prompt rule, so `run()` without a timeout hangs forever.** `src/nl_shell/session.py:701-702` counts `read` as a terminal read only when `arg0 == 0`. fd 2 is the same PTY. Measured: `read x </dev/tty` and `read x <&2` degrade after 1.1 s (the round-3 fix works), but `read -u 2 x` hit my 8 s caller timeout with no degrade, so with `timeout=None` it never returns. This is the same class as round-3 item 3, which was fixed only for fd 0. Fix: for `read`, accept any fd whose `/proc/<pid>/fd/<n>` is the PTY slave or `/dev/tty`, not only fd 0. Then add `read -u 2 x` to the `test_read_with_no_input_degrades` parametrize (`tests/test_session.py:746`).
+
+- Not a finding: I checked the "hidden" functrace test row (`tests/test_session.py:658-660`). Its trap runs `set +T` when the top-level `__nls_snap` call fires the trap, so functrace is already off inside `__nls_snap` and the `"PS1="*` branch can never fire inside the hook. That row cannot go red for the reason it claims to test. It is weak but harmless, so it is worth replacing with the `declare -ft` row above.
+
+- Attempted and could not break: alias shadowing with `\builtin` in PS0, `__nls_done` and the `$( … )` bodies (aliases on `printf` via `builtin=" "` cannot reach in, because the first word is backslash-quoted); a global `set -T` plus DEBUG trap (caught by `__nls_f` in H); `read x </dev/tty` and `read x <&2` (both degrade in 1.1 s). The gate evidence (C4/T3) is consistent with the patch.
+<!-- pdca:leaf-complete -->

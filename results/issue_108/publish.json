@@ -1,0 +1,10 @@
+{
+  "mode": "new-pr",
+  "branch": "enhancement/108-router-english-sentence-rule",
+  "pr_url": "https://github.com/eduralph/nl-shell/pull/199",
+  "base": "main",
+  "repo": "eduralph/nl-shell",
+  "by": "Eduard Ralph",
+  "date": "2026-10-23",
+  "id_pending": false
+}

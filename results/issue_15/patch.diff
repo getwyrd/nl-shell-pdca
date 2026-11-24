@@ -1,0 +1,254 @@
+diff --git a/docs/design/architecture/05-building-block-view.md b/docs/design/architecture/05-building-block-view.md
+index aa86b6c..d7bfb54 100644
+--- a/docs/design/architecture/05-building-block-view.md
++++ b/docs/design/architecture/05-building-block-view.md
+@@ -72,4 +72,5 @@ Python package `nl_shell` under `src/`, tests under `tests/`, run with `python3
+ |---|---|---|
+ | `nl_shell.cli` | Entry point (`nl-shell`, `python -m nl_shell`) | built (M0.1) |
+ | `nl_shell.repl` | The read loop; exit commands | built (M0.1) |
+-| PTY session, state capture, policy gate, confirm UI, model backend, input router, session log | — | *(planned, M0.2–M0.10)* |
++| `nl_shell.router` | Input router: heuristic command vs. natural language (first token is on `$PATH` or a bash builtin); the M3 classifier keeps it as its fallback | built (M0.7) |
++| PTY session, state capture, policy gate, confirm UI, model backend, prefix modes, session log | — | *(planned, M0.2–M0.10)* |
+diff --git a/src/nl_shell/repl.py b/src/nl_shell/repl.py
+index 4a9a9c7..180d09e 100644
+--- a/src/nl_shell/repl.py
++++ b/src/nl_shell/repl.py
+@@ -1,7 +1,9 @@
+ """The read-eval loop.
+ 
+-M0.1 scaffold: reads lines and handles the exit commands. Routing, the policy gate and
+-the PTY session arrive in later M0 issues (see docs/design/architecture/05-building-block-view.md).
++Reads lines, handles the exit commands, and routes everything else as a shell command or
++natural language (``nl_shell.router``). Nothing runs yet: the policy gate, the PTY session
++and the model backend arrive in later M0 issues (see
++docs/design/architecture/05-building-block-view.md).
+ """
+ 
+ from __future__ import annotations
+@@ -10,9 +12,22 @@ from collections.abc import Callable
+ from typing import TextIO
+ import sys
+ 
++from nl_shell.router import Route, route
++
+ PROMPT = "nl> "
+ EXIT_COMMANDS = frozenset({":quit", ":exit"})
+-NOT_YET = "nl-shell can't run anything yet: the bash session arrives in M0.2."
++COMMAND_NOT_YET = (
++    "That looks like a shell command, but nl-shell can't run anything yet: "
++    "the bash session arrives in M0.2."
++)
++NATURAL_LANGUAGE_NOT_YET = (
++    "That looks like a natural-language request, but nl-shell can't answer it yet: "
++    "the model backend arrives in M0.8."
++)
++REPLIES = {
++    Route.COMMAND: COMMAND_NOT_YET,
++    Route.NATURAL_LANGUAGE: NATURAL_LANGUAGE_NOT_YET,
++}
+ 
+ 
+ class Repl:
+@@ -44,4 +59,4 @@ class Repl:
+                 continue
+             if text in EXIT_COMMANDS:
+                 return 0
+-            print(NOT_YET, file=self._out)
++            print(REPLIES[route(text)], file=self._out)
+diff --git a/src/nl_shell/router.py b/src/nl_shell/router.py
+new file mode 100644
+index 0000000..07e9ccc
+--- /dev/null
++++ b/src/nl_shell/router.py
+@@ -0,0 +1,67 @@
++"""The M0 input router: a heuristic that tells shell commands from natural language.
++
++M0.7 placeholder. If the first token of the input is a bash builtin or an executable
++(found on ``$PATH``, or named by a path containing ``/``), the input is a command;
++otherwise it is natural language. The M3 intent classifier replaces this and keeps it
++as its fallback, so it stays a unit of its own with no REPL dependency.
++
++Known limitation, on purpose: English that starts with a command name ("find large
++files in my home") routes as a command. Bash keywords (``if``, ``for``…), leading
++variable assignments, aliases and shell functions are not recognised.
++"""
++
++from __future__ import annotations
++
++import enum
++import os
++import shlex
++import shutil
++
++
++class Route(enum.Enum):
++    COMMAND = "command"
++    NATURAL_LANGUAGE = "natural_language"
++
++
++# Output of `compgen -b` in bash 5. Keywords (`if`, `for`, `while`…) are left out.
++BASH_BUILTINS = frozenset(
++    """
++    . : [ alias bg bind break builtin caller cd command compgen complete compopt
++    continue declare dirs disown echo enable eval exec exit export false fc fg getopts
++    hash help history jobs kill let local logout mapfile popd printf pushd pwd read
++    readarray readonly return set shift shopt source suspend test times trap true type
++    typeset ulimit umask unalias unset wait
++    """.split()
++)
++
++
++def first_token(text: str) -> str:
++    """The first shell word of ``text``, or "" if there is none. Never raises."""
++    lexer = shlex.shlex(text, posix=True)
++    lexer.whitespace_split = True
++    try:
++        token = lexer.get_token()
++    except ValueError:
++        # Not valid shell quoting (e.g. "what's using port 80"): fall back to whitespace.
++        words = text.split()
++        return words[0] if words else ""
++    return token or ""
++
++
++def is_executable_file(path: str) -> bool:
++    path = os.path.expanduser(path)
++    return os.path.isfile(path) and os.access(path, os.X_OK)
++
++
++def route(text: str) -> Route:
++    """Route one input line. ``$PATH`` is read on every call, never cached."""
++    token = first_token(text)
++    if not token:
++        return Route.NATURAL_LANGUAGE
++    if token in BASH_BUILTINS:
++        return Route.COMMAND
++    if "/" in token:
++        return Route.COMMAND if is_executable_file(token) else Route.NATURAL_LANGUAGE
++    if shutil.which(token) is not None:
++        return Route.COMMAND
++    return Route.NATURAL_LANGUAGE
+diff --git a/tests/test_repl.py b/tests/test_repl.py
+index 81bb3e3..8708088 100644
+--- a/tests/test_repl.py
++++ b/tests/test_repl.py
+@@ -2,7 +2,19 @@ import io
+ 
+ import pytest
+ 
+-from nl_shell.repl import NOT_YET, Repl
++from nl_shell.repl import Repl
++
++# The two route replies, pinned as literals: the module must import on `main`, where
++# these constants do not exist, so the router-table test can fail rather than not load.
++COMMAND = (
++    "That looks like a shell command, but nl-shell can't run anything yet: "
++    "the bash session arrives in M0.2."
++)
++NATURAL_LANGUAGE = (
++    "That looks like a natural-language request, but nl-shell can't answer it yet: "
++    "the model backend arrives in M0.8."
++)
++ROUTE_NAMES = {COMMAND: "command", NATURAL_LANGUAGE: "natural-language"}
+ 
+ 
+ def scripted(*lines):
+@@ -27,6 +39,24 @@ def run(*lines):
+     return status, out.getvalue()
+ 
+ 
++def make_executable(path):
++    path.write_text("#!/bin/sh\n")
++    path.chmod(0o755)
++    return path
++
++
++@pytest.fixture
++def fake_path(tmp_path, monkeypatch):
++    """``$PATH`` holding only fake ``ls``, ``git`` and ``find``, so routing does not
++    depend on what the host has installed. Returns the directory."""
++    bin_dir = tmp_path / "bin"
++    bin_dir.mkdir()
++    for name in ("ls", "git", "find"):
++        make_executable(bin_dir / name)
++    monkeypatch.setenv("PATH", str(bin_dir))
++    return bin_dir
++
++
+ def test_end_of_input_exits_cleanly():
+     assert run() == (0, "")
+ 
+@@ -42,13 +72,69 @@ def test_blank_lines_are_ignored():
+     assert run("", "   ") == (0, "")
+ 
+ 
+-def test_ctrl_c_clears_the_line_and_keeps_going():
++def test_ctrl_c_clears_the_line_and_keeps_going(fake_path):
+     status, out = run(KeyboardInterrupt(), "ls")
+     assert status == 0
+-    assert out == NOT_YET + "\n"
++    assert out == COMMAND + "\n"
+ 
+ 
+-def test_input_is_not_run_yet():
++def test_input_is_not_run_yet(fake_path):
+     status, out = run("show disk usage")
+     assert status == 0
+-    assert out == NOT_YET + "\n"
++    assert out == NATURAL_LANGUAGE + "\n"
++
++
++@pytest.mark.parametrize(
++    ("line", "expected"),
++    [
++        ("ls -la", COMMAND),
++        ("git status", COMMAND),
++        # Known heuristic limitation, pinned on purpose: English that starts with a
++        # command name routes as a command. The M3 classifier fixes this.
++        ("find large files in my home", COMMAND),
++        ("cd /tmp", COMMAND),  # bash builtin, not on $PATH
++        ("export FOO=1", COMMAND),  # bash builtin, not on $PATH
++        ("  ls", COMMAND),
++        ("show disk usage", NATURAL_LANGUAGE),
++        ("what's using port 80", NATURAL_LANGUAGE),  # unbalanced quote must not raise
++        ("frobnicate the widgets", NATURAL_LANGUAGE),
++    ],
++    ids=lambda value: ROUTE_NAMES.get(value, value),
++)
++def test_input_is_routed_as_command_or_natural_language(fake_path, line, expected):
++    status, out = run(line)
++    assert status == 0
++    assert out == expected + "\n"
++
++
++def test_path_to_an_executable_routes_as_a_command(fake_path, tmp_path):
++    script = make_executable(tmp_path / "build.sh")
++    status, out = run(f"{script} --release")
++    assert status == 0
++    assert out == COMMAND + "\n"
++
++
++def test_path_is_read_on_every_line(fake_path, tmp_path, monkeypatch):
++    """``$PATH`` is looked up per line, not cached: a tool added later is found."""
++    later = tmp_path / "later"
++    later.mkdir()
++    make_executable(later / "frobnicate")
++    calls = []
++
++    def read(_prompt):
++        calls.append(None)
++        if len(calls) > 2:
++            raise EOFError
++        if len(calls) == 2:
++            monkeypatch.setenv("PATH", f"{fake_path}:{later}")
++        return "frobnicate the widgets"
++
++    out = io.StringIO()
++    assert Repl(read, out).run() == 0
++    assert out.getvalue() == NATURAL_LANGUAGE + "\n" + COMMAND + "\n"
++
++
++def test_exit_commands_are_checked_before_routing(fake_path):
++    status, out = run("ls", ":quit", "git status")
++    assert status == 0
++    assert out == COMMAND + "\n"

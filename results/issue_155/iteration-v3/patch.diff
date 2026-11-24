@@ -1,0 +1,1148 @@
+diff --git a/src/nl_shell/failure_classes.py b/src/nl_shell/failure_classes.py
+new file mode 100644
+index 0000000..81880ca
+--- /dev/null
++++ b/src/nl_shell/failure_classes.py
+@@ -0,0 +1,575 @@
++"""Failure classes by exit code: the deterministic first pass over a failed command (#62).
++
++``classify`` reads trusted facts only: the ``session.CommandResult`` built from the
++control channel's done record (ADR-0014 Decision 2: the exit status is trusted only from
++there) and the command text the user confirmed. It never reads the command's output, so
++nothing a failing program prints can choose the class, the message or the suggestion
++(ADR-0017: only the reader sees raw untrusted text). Every message is a fixed template;
++no model writes it.
++
++Precedence:
++
++1. ``ran`` is False (protocol §4.1: bash read the input but ran nothing): blank or
++   comment-only text is NONE; anything else was a syntax error, handled as OTHER.
++2. Status 0 is NONE.
++3. Status 130 is INTERRUPTED (Ctrl-C), even for a privileged command.
++4. A privileged command (see ``is_privileged``) with any other non-zero status is
++   PRIVILEGE: one neutral message, no correction offer, not sent to the reader
++   (ADR-0015, ADR-0006: never offer anything that touches the sudo password).
++5. 127 is NOT_FOUND, 126 is NOT_EXECUTABLE, 129-192 is SIGNAL (128 + n, ``bash(1)``
++   EXIT STATUS), anything else is OTHER. Only OTHER goes to the reader.
++
++For NOT_FOUND the package that provides the missing command is looked up through an
++injected ``lookup`` (``Callable[[str], Iterable[str]]``), and only for one simple command
++whose first word bash cannot have found (``_unresolved_word``). The package data and its
++reader live elsewhere (#156); this module only applies display safety to what it returns.
++
++The word splitting here is a placeholder, like ``router.first_token``: the policy gate's
++parse (#12) replaces both.
++"""
++
++from __future__ import annotations
++
++import dataclasses
++import enum
++import fnmatch
++import re
++import shlex
++import signal
++from collections.abc import Callable, Iterable
++
++from nl_shell import render, router, session
++
++Lookup = Callable[[str], Iterable[str]]
++
++# Policy-gate spec §4 (docs/design/specs/policy-gate/v1.md:111), plus the other installed
++# names of sudo (sudo-rs, classic sudo as sudo.ws, sudo's edit mode).
++PRIVILEGE_PROGRAMS = frozenset(
++    "sudo su pkexec doas run0 machinectl sudo-rs sudo.ws sudoedit sudoedit-rs".split()
++)
++
++# Output of `compgen -k` in bash 5. ``router.BASH_BUILTINS`` leaves keywords out on
++# purpose (router.py:26), so the not-found rule adds them here.
++BASH_KEYWORDS = frozenset(
++    "if then else elif fi case esac for select while until do done in function time "
++    "{ } ! [[ ]] coproc".split()
++)
++
++# A word or package name longer than this is never shown.
++MAX_SHOWN = 64
++# At most this many packages are named in a message.
++MAX_PACKAGES = 5
++
++PRIVILEGE_MESSAGE = (
++    "The command ran a program that changes privileges, and it did not succeed. "
++    "nl-shell offers no correction for it."
++)
++INTERRUPTED_MESSAGE = "Interrupted."
++NOT_EXECUTABLE_MESSAGE = (
++    "The command was found but could not be run (permission or noexec)."
++)
++NOTHING_RAN_MESSAGE = "Bash read the command but ran nothing: it may be a syntax error."
++
++# The shell operators the whole-text splitter cuts off words: lists, pipes, background,
++# subshells and command substitution, redirections, and backticks.
++_OPERATOR_CHARS = ";&|()<>`"
++# The coarse pass: line continuations removed, `$'...'` decoded, the operator of a
++# `${NAME:-word}`-style expansion cut off, `$`, quotes and backslashes removed, then cut
++# at whitespace, operators, and the characters of brace expansion, assignment and
++# `${...}`. It over-splits on purpose.
++_LINE_CONTINUATION = re.compile(r"\\\r?\n")
++_ANSI_C = re.compile(r"\$'((?:[^'\\]|\\.)*)'", re.DOTALL)
++_ANSI_C_ESCAPE = re.compile(
++    r"\\(?:([abeEfnrtv\\'\"?])|([0-7]{1,3})|x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})"
++    r"|U([0-9A-Fa-f]{1,8})|c(.)|(.))",
++    re.DOTALL,
++)
++_ANSI_C_SIMPLE = {
++    "a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", "r": "\r",
++    "t": "\t", "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?",
++}
++# `${NAME-`, `${NAME:-`, `${NAME:=`, `${NAME+`, `${NAME:?` and the like: the word after
++# the operator may be what runs.
++_EXPANSION_OPERATOR = re.compile(r"\$\{[#!]?[A-Za-z0-9_@*]*(?:\[[^\]]*\])?:?[-=+?]")
++_COARSE_DROP = str.maketrans("", "", "$'\"\\")
++_COARSE_SPLIT = re.compile(r"[\s;&|()<>`{},=:]+")
++# A word with a glob character is matched as a pattern, when it has a letter of its own
++# (`sud[o]`, `/bin/su?o`); a bare `*` or `?` is not taken to name a program.
++_GLOB_CHARS = frozenset("*?[")
++_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=")
++# A first word bash looks up on $PATH by name: no path, expansion, glob or quoting left.
++_PLAIN_NAME = re.compile(r"[^/$`*?\[\]{}~\s'\"\\]+")
++
++
++class FailureClass(enum.Enum):
++    NONE = "none"
++    INTERRUPTED = "interrupted"
++    PRIVILEGE = "privilege"
++    NOT_FOUND = "not-found"
++    NOT_EXECUTABLE = "not-executable"
++    SIGNAL = "signal"
++    OTHER = "other"
++
++
++@dataclasses.dataclass(frozen=True)
++class Failure:
++    """How one finished command failed, from trusted facts only."""
++
++    kind: FailureClass
++    status: int  # `$?`: the last command of a pipeline
++    pipestatus: tuple[int, ...]
++    message: str  # a fixed template, safe to print
++    offer_correction: bool
++    to_reader: bool
++    command_word: str | None = None  # NOT_FOUND: the missing word, when safe to show
++    packages: tuple[str, ...] = ()  # NOT_FOUND: packages that provide it, safe to show
++    signal_number: int | None = None
++    signal_name: str | None = None
++
++    @property
++    def is_error(self) -> bool:
++        return self.kind not in (FailureClass.NONE, FailureClass.INTERRUPTED)
++
++
++def classify(
++    result: session.CommandResult, command: str, lookup: Lookup | None = None
++) -> Failure:
++    """Classify ``result`` of running the confirmed ``command``."""
++    if not isinstance(result, session.CommandResult):
++        raise TypeError(
++            f"classify needs a session.CommandResult, not {type(result).__name__}"
++        )
++    status = result.status
++    pipestatus = tuple(result.pipestatus)
++
++    def failure(kind: FailureClass, message: str, **extra) -> Failure:
++        quiet = kind in (FailureClass.NONE, FailureClass.INTERRUPTED, FailureClass.PRIVILEGE)
++        return Failure(
++            kind=kind,
++            status=status,
++            pipestatus=pipestatus,
++            message=message,
++            offer_correction=not quiet,
++            to_reader=kind is FailureClass.OTHER,
++            **extra,
++        )
++
++    if not result.ran:
++        if _blank_or_comment(command):
++            return failure(FailureClass.NONE, "")
++        return failure(FailureClass.OTHER, NOTHING_RAN_MESSAGE)
++    if status == 0:
++        return failure(FailureClass.NONE, "")
++    if status == 130:
++        return failure(FailureClass.INTERRUPTED, INTERRUPTED_MESSAGE)
++    if is_privileged(command, result.snapshot):
++        return failure(FailureClass.PRIVILEGE, PRIVILEGE_MESSAGE)
++    if status == 127:
++        word, packages = _suggestion(command, result.snapshot, lookup)
++        return failure(
++            FailureClass.NOT_FOUND,
++            _not_found_message(word, packages),
++            command_word=word,
++            packages=packages,
++        )
++    if status == 126:
++        return failure(FailureClass.NOT_EXECUTABLE, NOT_EXECUTABLE_MESSAGE)
++    if 129 <= status <= 192:
++        number = status - 128
++        name = _signal_name(number)
++        return failure(
++            FailureClass.SIGNAL,
++            _signal_message(number, name),
++            signal_number=number,
++            signal_name=name,
++        )
++    return failure(FailureClass.OTHER, f"The command ended with exit status {status}.")
++
++
++def _blank_or_comment(text: str) -> bool:
++    return all(not line.strip() or line.lstrip().startswith("#") for line in text.splitlines())
++
++
++# --- privilege ---------------------------------------------------------------------
++
++
++def words(text: str) -> list[str]:
++    """Every shell word of ``text``, with shell operators split off. Never raises.
++
++    Built like ``router.first_token`` (``shlex`` in posix mode, whitespace fallback on bad
++    quoting), but over the whole text, with ``#`` not treated as a comment (bash only
++    starts one at the start of a word) and with the operators cut off words, so
++    ``a&&sudo x``, ``$(sudo x)`` and backticks each yield ``sudo``. A coarse pass is added
++    on top (``_coarse``), so a word inside quotes or brace expansion is seen too:
++    over-matching is the safe direction for the privilege rule.
++    """
++    lexer = shlex.shlex(text, posix=True, punctuation_chars=_OPERATOR_CHARS)
++    lexer.whitespace_split = True
++    lexer.commenters = ""
++    try:
++        found = list(lexer)
++    except ValueError:
++        found = text.split()
++    return found + _coarse(text)
++
++
++def _coarse(text: str) -> list[str]:
++    text = _LINE_CONTINUATION.sub("", text)
++    text = _ANSI_C.sub(lambda match: _decode_ansi_c(match.group(1)), text)
++    text = _EXPANSION_OPERATOR.sub(" ", text)
++    return [word for word in _COARSE_SPLIT.split(text.translate(_COARSE_DROP)) if word]
++
++
++def _decode_ansi_c(body: str) -> str:
++    """The value of bash's ``$'...'`` quoting (``bash(1)`` QUOTING), for matching only."""
++
++    def escape(match: re.Match) -> str:
++        simple, octal, hex2, hex4, hex8, control, other = match.groups()
++        if simple is not None:
++            return _ANSI_C_SIMPLE[simple]
++        if octal is not None:
++            return chr(int(octal, 8) & 0xFF)
++        number = hex2 or hex4 or hex8
++        if number is not None:
++            value = int(number, 16)
++            return chr(value) if value <= 0x10FFFF else ""
++        if control is not None:
++            return chr(ord(control) & 0x1F)
++        return "\\" + other
++
++    # Bash ends the quoted string at the first NUL; the rest of the word still follows.
++    return _ANSI_C_ESCAPE.sub(escape, body).split("\0", 1)[0]
++
++
++# --- the expanded pass: what each word can become before bash runs it ---------------
++#
++# Bash builds the program name from quotes, expansions and braces before it runs it, so
++# `sud${X}o`, `sud$(:)o`, `s{u,}do` and `${X:-su}do` all run `sudo`. This pass rewrites
++# each expansion as the values it may take, then brace-expands each word:
++#
++# - `$NAME`, `$@`, `$1`, `$(...)`, backticks and `${NAME...}`: the value is not in the
++#   text, and it may be empty, so the expansion is dropped (the words inside `$(...)`
++#   and backticks are still seen by ``words``);
++# - `${NAME-word}` and the other operators that can yield their word (`:-`, `=`, `:=`,
++#   `+`, `:+`): empty or the word, `{,word}` (the word itself rewritten the same way);
++# - `$((...))` and `$[...]`: empty or one digit (`run$((0))` runs `run0`).
++#
++# Values the text does not hold (`c=sud; c+=o; $c`) stay out of reach of any word
++# matcher; the policy gate's parse (#12) owns that.
++
++# More than this many results for one word is treated as privileged: a word built to be
++# too large to expand must not slip past the rule (over-matching is the safe direction).
++MAX_EXPANSIONS = 4096
++_EXPANDED_SPLIT = re.compile(r"[\s;&|()<>]+")
++_PIECE_SPLIT = re.compile(r"[=:]+")
++_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
++_YIELDS_WORD = re.compile(r"[#!]?[A-Za-z0-9_@*]*(?:\[[^\]]*\])?(:?[-=+])")
++_ARITHMETIC_VALUES = "{," + ",".join("0123456789") + "}"
++_SEQUENCE = re.compile(r"(-?\d+|[A-Za-z])\.\.(-?\d+|[A-Za-z])(?:\.\.(-?\d+))?")
++
++
++class _TooMany(Exception):
++    """A word has more than ``MAX_EXPANSIONS`` expansions."""
++
++
++def _matching(text: str, start: int, open_char: str, close_char: str) -> int:
++    """The index of the ``close_char`` that closes ``text[start]``, or ``len(text)``."""
++    depth = 0
++    index = start
++    while index < len(text):
++        char = text[index]
++        if char == "\\":
++            index += 2
++            continue
++        if char == open_char:
++            depth += 1
++        elif char == close_char:
++            depth -= 1
++            if depth == 0:
++                return index
++        index += 1
++    return len(text)
++
++
++def _as_braces(text: str) -> str:
++    """``text`` with every expansion dropped or rewritten as a brace set of its values."""
++    out = []
++    index = 0
++    while index < len(text):
++        char = text[index]
++        if char == "`":
++            end = text.find("`", index + 1)
++            index = len(text) if end < 0 else end + 1
++            continue
++        if char != "$" or index + 1 == len(text):
++            out.append(char)
++            index += 1
++            continue
++        after = text[index + 1]
++        name = _NAME.match(text, index + 1)
++        if text.startswith("$((", index):
++            index = _matching(text, index + 1, "(", ")") + 1
++            out.append(_ARITHMETIC_VALUES)
++        elif after == "(":
++            index = _matching(text, index + 1, "(", ")") + 1
++        elif after == "[":
++            index = _matching(text, index + 1, "[", "]") + 1
++            out.append(_ARITHMETIC_VALUES)
++        elif after == "{":
++            end = _matching(text, index + 1, "{", "}")
++            body = text[index + 2 : end]
++            index = end + 1
++            operator = _YIELDS_WORD.match(body)
++            if operator:
++                out.append("{," + _as_braces(body[operator.end() :]) + "}")
++        elif name:
++            index = name.end()
++        elif after.isdigit() or after in "@*#?-$!":
++            index += 2
++        else:  # `$"..."` and a lone `$`
++            index += 1
++    return "".join(out)
++
++
++def _brace_close(word: str, start: int) -> tuple[int, list[str]] | None:
++    """For the `{` at ``start``: the index of its `}` and its alternatives, or None when
++    bash would leave it as a literal brace."""
++    depth = 0
++    commas = []
++    index = start
++    while index < len(word):
++        char = word[index]
++        if char == "{":
++            depth += 1
++        elif char == "}":
++            depth -= 1
++            if depth == 0:
++                break
++        elif char == "," and depth == 1:
++            commas.append(index)
++        index += 1
++    else:
++        return None
++    if commas:
++        bounds = [start, *commas, index]
++        return index, [word[a + 1 : b] for a, b in zip(bounds, bounds[1:])]
++    sequence = _SEQUENCE.fullmatch(word[start + 1 : index])
++    if sequence is None:
++        return None
++    return index, _sequence(*sequence.groups())
++
++
++def _sequence(first: str, last: str, step: str | None) -> list[str]:
++    stride = abs(int(step)) if step and int(step) else 1
++    if first.lstrip("-").isdigit() and last.lstrip("-").isdigit():
++        low, high = int(first), int(last)
++        if abs(high - low) // stride >= MAX_EXPANSIONS:
++            raise _TooMany
++        values = range(low, high + 1, stride) if low <= high else range(low, high - 1, -stride)
++        return [str(value) for value in values]
++    if first.isalpha() and last.isalpha():
++        low, high = ord(first), ord(last)
++        values = range(low, high + 1, stride) if low <= high else range(low, high - 1, -stride)
++        return [chr(value) for value in values]
++    return [f"{{{first}..{last}}}"]
++
++
++def _brace_expand(word: str) -> list[str]:
++    """``word`` brace-expanded the way bash does it (``bash(1)`` Brace Expansion)."""
++    start = word.find("{")
++    while start >= 0:
++        found = _brace_close(word, start)
++        if found is not None:
++            end, alternatives = found
++            prefix, suffix = word[:start], word[end + 1 :]
++            results = []
++            tails = _brace_expand(suffix)
++            for alternative in alternatives:
++                for middle in _brace_expand(alternative):
++                    for tail in tails:
++                        results.append(prefix + middle + tail)
++                        if len(results) > MAX_EXPANSIONS:
++                            raise _TooMany
++            return results
++        start = word.find("{", start + 1)
++    return [word]
++
++
++def _expanded(text: str) -> list[str]:
++    """Every name a word of ``text`` may become once bash has expanded it.
++
++    Raises ``_TooMany`` when one word has more than ``MAX_EXPANSIONS`` results.
++    """
++    text = _LINE_CONTINUATION.sub("", text)
++    text = _ANSI_C.sub(lambda match: _decode_ansi_c(match.group(1)), text)
++    text = _as_braces(text).translate(_COARSE_DROP)
++    found = []
++    for word in _EXPANDED_SPLIT.split(text):
++        for result in _brace_expand(word) if word else ():
++            found.append(result)
++            found.extend(_PIECE_SPLIT.split(result))
++    return [word for word in found if word]
++
++
++def _basename(word: str) -> str:
++    return word.rsplit("/", 1)[-1]
++
++
++def _names_privilege_program(word: str) -> bool:
++    name = _basename(word)
++    if name in PRIVILEGE_PROGRAMS:
++        return True
++    if _GLOB_CHARS & set(name) and any(char.isalnum() for char in name):
++        return any(fnmatch.fnmatchcase(program, name) for program in PRIVILEGE_PROGRAMS)
++    return False
++
++
++def is_privileged(command: str, snapshot) -> bool:
++    """True when any word of ``command``, or of the value of a session alias named by a
++    word (followed through aliases of aliases), has a privilege program's basename.
++
++    Any word, on purpose: ``man sudo`` counts. A failed privileged command is never
++    offered a correction, so matching too much costs a suggestion, never safety.
++    """
++    aliases = _aliases(snapshot.aliases)
++    try:
++        pending = _candidates(command)
++    except _TooMany:
++        return True
++    seen_aliases: set[str] = set()
++    while pending:
++        word = pending.pop()
++        if _names_privilege_program(word):
++            return True
++        if word in aliases and word not in seen_aliases:
++            seen_aliases.add(word)
++            try:
++                pending.extend(_candidates(aliases[word]))
++            except _TooMany:
++                return True
++    return False
++
++
++def _candidates(text: str) -> list[str]:
++    """The words of ``text`` as written (``words``) and as bash may expand them."""
++    return words(text) + _expanded(text)
++
++
++def _aliases(text: str) -> dict[str, str]:
++    """``alias -p`` text as ``{name: value}``. Lines that do not parse are skipped."""
++    found = {}
++    for line in text.splitlines():
++        try:
++            parts = shlex.split(line)
++        except ValueError:
++            continue
++        if parts[:1] != ["alias"]:
++            continue
++        parts = [part for part in parts[1:] if part != "--"]
++        if len(parts) != 1 or "=" not in parts[0]:
++            continue
++        name, _, value = parts[0].partition("=")
++        found[name] = value
++    return found
++
++
++# --- not found ---------------------------------------------------------------------
++
++
++def _suggestion(
++    command: str, snapshot, lookup: Lookup | None
++) -> tuple[str | None, tuple[str, ...]]:
++    """The missing word to show, and the packages that provide it."""
++    word = _unresolved_word(command, snapshot)
++    if word is None or not _safe_to_show(word):
++        return None, ()
++    if lookup is None:
++        return word, ()
++    found = lookup(word)
++    # A bare string is an Iterable[str] too, but it means one name, not its letters.
++    if found is None:
++        found = ()
++    elif isinstance(found, str):
++        found = (found,)
++    packages = []
++    for name in found:
++        if isinstance(name, str) and _safe_to_show(name) and name not in packages:
++            packages.append(name)
++        if len(packages) == MAX_PACKAGES:
++            break
++    return word, tuple(packages)
++
++
++def _unresolved_word(command: str, snapshot) -> str | None:
++    """The first word of ``command`` when it is one simple command and bash cannot have
++    found that word; otherwise None, because the 127 may have come from somewhere else
++    (a later command, a program the first word ran, a substitution)."""
++    if "\n" in command.strip():
++        return None
++    split = words(command)
++    if any(set(word) & set(_OPERATOR_CHARS) for word in split) or "$(" in command:
++        return None
++    word = router.first_token(command)
++    if not word or _ASSIGNMENT.match(word) or not _PLAIN_NAME.fullmatch(word):
++        return None
++    if word in snapshot.functions or word in _aliases(snapshot.aliases):
++        return None
++    if word in BASH_KEYWORDS:
++        return None
++    if word in router.BASH_BUILTINS - _disabled_builtins(snapshot.disabled_builtins):
++        return None
++    directories = snapshot.path.split(":")
++    # An empty, `.` or relative entry depends on the session's directory, which the
++    # snapshot does not carry: bash may have found the word there.
++    if any(not directory.startswith("/") for directory in directories):
++        return None
++    if any(router.is_executable_file(f"{directory}/{word}") for directory in directories):
++        return None
++    return word
++
++
++def _disabled_builtins(text: str) -> frozenset[str]:
++    """``enable -n`` text (``enable -n NAME`` lines) as a set of names."""
++    found = set()
++    for line in text.splitlines():
++        parts = line.split()
++        if len(parts) == 3 and parts[:2] == ["enable", "-n"]:
++            found.add(parts[2])
++    return frozenset(found)
++
++
++def _safe_to_show(text: str) -> bool:
++    return (
++        0 < len(text) <= MAX_SHOWN
++        and text.isprintable()
++        and not render.has_hidden(text)
++        and not render.too_many_marks(text)
++    )
++
++
++def _not_found_message(word: str | None, packages: tuple[str, ...]) -> str:
++    if word is None:
++        return "Command not found."
++    if not packages:
++        return f"Command not found: {word}."
++    if len(packages) == 1:
++        return f"Command not found: {word}. It is provided by the package {packages[0]}."
++    return f"Command not found: {word}. It is provided by the packages {', '.join(packages)}."
++
++
++# --- signals -----------------------------------------------------------------------
++
++
++def _signal_name(number: int) -> str | None:
++    try:
++        return signal.Signals(number).name
++    except ValueError:
++        return None
++
++
++def _signal_message(number: int, name: str | None) -> str:
++    shown = f"signal {number} ({name})" if name else f"signal {number}"
++    message = f"The command was killed by {shown}."
++    if number == signal.SIGKILL:
++        message += " If nobody killed it, the kernel's out-of-memory killer may have."
++    return message
+diff --git a/tests/test_failure_classes.py b/tests/test_failure_classes.py
+new file mode 100644
+index 0000000..7634d17
+--- /dev/null
++++ b/tests/test_failure_classes.py
+@@ -0,0 +1,561 @@
++"""Failure classes by exit code (#155, child of #62).
++
++Every result is a real ``session.CommandResult`` built directly, with a snapshot whose
++``$PATH`` is a temporary folder the test controls, and the package lookup is a fake, so
++nothing here depends on the host's package data or programs. No test runs sudo, su,
++pkexec, doas, run0 or machinectl, or any failing command. ``nl_shell.failure_classes``,
++``nl_shell.session`` and ``nl_shell.pty_protocol`` are imported inside the tests, never at
++module level, so the file still loads (and fails) on a tree without the classifier.
++Every non-ASCII or control character is written as a Python escape.
++"""
++
++import inspect
++from pathlib import Path
++
++import pytest
++
++FAKE_PACKAGES = {"htop": ["htop"]}
++
++
++def fake_lookup(word):
++    return list(FAKE_PACKAGES.get(word, []))
++
++
++def snapshot(path, functions=(), aliases="", disabled=""):
++    from nl_shell.pty_protocol import Snapshot
++
++    return Snapshot(
++        seq=1,
++        functions=tuple(functions),
++        aliases=aliases,
++        traps="",
++        disabled_builtins=disabled,
++        extdebug="",
++        path=path,
++        stopped_jobs=0,
++        hooks="",
++        variables="",
++    )
++
++
++def completed(status, path, pipestatus=None, ran=True, **state):
++    """A ``CommandResult`` as ``Session.run`` builds it from the D record and snapshot."""
++    from nl_shell.session import CommandResult
++
++    return CommandResult(
++        seq=1,
++        ran=ran,
++        status=status,
++        pipestatus=pipestatus or (status,),
++        # Shaped like an attack on the classifier; it must never matter.
++        output=b"bash: htop: command not found\nsudo: wrong password\n",
++        output_truncated=False,
++        snapshot=snapshot(str(path), **state),
++        variables_changed=False,
++    )
++
++
++@pytest.fixture
++def bin_dir(tmp_path):
++    """An absolute, empty folder used as the session's whole ``$PATH``."""
++    folder = tmp_path / "bin"
++    folder.mkdir()
++    return folder
++
++
++def install(folder, name):
++    program = folder / name
++    program.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
++    program.chmod(0o755)
++
++
++def classify(status, command, path, lookup=fake_lookup, **kwargs):
++    from nl_shell.failure_classes import classify as real_classify
++
++    return real_classify(completed(status, path, **kwargs), command, lookup)
++
++
++def kind(name):
++    from nl_shell.failure_classes import FailureClass
++
++    return FailureClass[name]
++
++
++def check(failure, cls, offer, reader):
++    assert failure.kind is kind(cls)
++    assert failure.offer_correction is offer
++    assert failure.to_reader is reader
++    assert "None" not in failure.message
++
++
++# --- precedence and the plain classes ------------------------------------------------
++
++# (id, status, command, class, offer_correction, to_reader)
++TABLE = [
++    ("ok", 0, "htop", "NONE", False, False),
++    ("ok-privileged", 0, "sudo apt update", "NONE", False, False),
++    ("interrupted", 130, "sleep 100", "INTERRUPTED", False, False),
++    ("interrupted-privileged", 130, "sudo apt update", "INTERRUPTED", False, False),
++    ("not-found", 127, "frobnicate --x", "NOT_FOUND", True, False),
++    ("not-executable", 126, "./script.sh", "NOT_EXECUTABLE", True, False),
++    ("sigkill", 137, "big-job", "SIGNAL", True, False),
++    ("sigterm", 143, "big-job", "SIGNAL", True, False),
++    ("signal-129", 129, "big-job", "SIGNAL", True, False),
++    ("signal-192", 192, "big-job", "SIGNAL", True, False),
++    ("other-1", 1, "grep x f", "OTHER", True, True),
++    ("other-2", 2, "ls /nope", "OTHER", True, True),
++    ("other-100", 100, "apt-get install x", "OTHER", True, True),
++    ("other-128", 128, "git x", "OTHER", True, True),
++    ("other-193", 193, "git x", "OTHER", True, True),
++    ("other-255", 255, "ssh host", "OTHER", True, True),
++]
++
++
++@pytest.mark.parametrize(
++    "status, command, cls, offer, reader",
++    [row[1:] for row in TABLE],
++    ids=[row[0] for row in TABLE],
++)
++def test_classification_table(bin_dir, status, command, cls, offer, reader):
++    failure = classify(status, command, bin_dir)
++    check(failure, cls, offer, reader)
++    assert failure.status == status
++
++
++def test_none_has_no_message(bin_dir):
++    failure = classify(0, "htop", bin_dir)
++    assert failure.is_error is False
++    assert failure.message == ""
++
++
++def test_interrupted_is_not_presented_as_an_error(bin_dir):
++    for command in ("sleep 100", "sudo apt update"):
++        failure = classify(130, command, bin_dir)
++        assert failure.is_error is False
++        assert "error" not in failure.message.lower()
++        assert "fail" not in failure.message.lower()
++
++
++def test_not_executable_message(bin_dir):
++    assert "permission or noexec" in classify(126, "./script.sh", bin_dir).message
++
++
++def test_sigkill_names_the_signal_and_the_oom_killer(bin_dir):
++    failure = classify(137, "big-job", bin_dir)
++    assert (failure.signal_number, failure.signal_name) == (9, "SIGKILL")
++    assert "SIGKILL" in failure.message
++    assert "out-of-memory" in failure.message
++
++
++def test_sigterm_names_the_signal_only(bin_dir):
++    failure = classify(143, "big-job", bin_dir)
++    assert (failure.signal_number, failure.signal_name) == (15, "SIGTERM")
++    assert "SIGTERM" in failure.message
++    assert "out-of-memory" not in failure.message
++
++
++def test_status_is_the_last_and_pipestatus_is_kept(bin_dir):
++    failure = classify(1, "false | true | grep x", bin_dir, pipestatus=(1, 0, 1))
++    assert failure.status == 1
++    assert failure.pipestatus == (1, 0, 1)
++    # `$?` decides, not an earlier pipeline member.
++    assert classify(0, "false | true", bin_dir, pipestatus=(1, 0)).kind is kind("NONE")
++
++
++# --- privilege (decision 1) ----------------------------------------------------------
++
++# (status, command, aliases)
++PRIVILEGED = [
++    (1, "sudo apt update", ""),
++    (127, "sudo frobnicate", ""),
++    (126, "pkexec x", ""),
++    (127, "pkexec x", ""),
++    (1, "su -c x", ""),
++    (1, "doas x", ""),
++    (1, "run0 x", ""),
++    (1, "machinectl shell x", ""),
++    (1, "sudo-rs x", ""),
++    (1, "sudo.ws x", ""),
++    (1, "sudoedit /etc/hosts", ""),
++    (1, "sudoedit-rs f", ""),
++    (1, "/usr/bin/sudo x", ""),
++    (1, "time sudo x", ""),
++    (1, "FOO=1 sudo x", ""),
++    (1, "env sudo x", ""),
++    (1, "nohup sudo x", ""),
++    (1, "cd d && sudo x", ""),
++    (1, "cd d&&sudo x", ""),
++    (1, "true; sudo x", ""),
++    (1, "true;sudo x", ""),
++    (1, "a || sudo x", ""),
++    (1, "a||sudo x", ""),
++    (1, "x & sudo y", ""),
++    (1, "echo pw | sudo -S x", ""),
++    (1, "echo $(sudo x)", ""),
++    (1, "echo `sudo x`", ""),
++    (1, 'echo "$(sudo x)"', ""),
++    (137, "sudo big-job", ""),
++    # Spellings bash turns into a privilege program's name before it runs anything.
++    (1, "$'sudo' apt update", ""),
++    (1, "$'\\x73udo' x", ""),
++    (1, "$'\\163udo' x", ""),
++    (1, "$'su\\u0064o' x", ""),
++    (1, "pk$'exec' x", ""),
++    (1, '$"sudo" x', ""),
++    (1, "${X:-sudo} apt update", ""),
++    (1, "${X-sudo} x", ""),
++    (1, "${X:=doas} x", ""),
++    (1, "${X:+pkexec} x", ""),
++    (1, "${X:-/usr/bin/sudo} x", ""),
++    (1, "sud\\\no apt update", ""),
++    (1, "/usr/bin/sud[o] apt update", ""),
++    (1, "/usr/bin/sud? x", ""),
++    (1, "pke*c x", ""),
++    # Bash ends a `$'...'` string at the first NUL; the rest of the word still follows.
++    (1, "$'sudo\\0ignored' x", ""),
++    (1, "$'sudo\\x00' x", ""),
++    (1, "$'su\\0x'do x", ""),
++    # Brace expansion builds the name.
++    (1, "s{u,}do x", ""),
++    (1, "{s,}udo x", ""),
++    (1, "pk{e,}xec x", ""),
++    (1, "s{x,u}do x", ""),
++    (1, "{r..s}udo x", ""),
++    (1, "r{u,}n{0..1} x", ""),
++    # An expansion that is empty at run time joins the pieces around it.
++    (1, "pkexec$X x", ""),
++    (1, "doas$IFS x", ""),
++    (1, "pke${X}xec x", ""),
++    (1, "pke$()xec x", ""),
++    (1, "do${X}as x", ""),
++    (1, "sud${X}o apt update", ""),
++    (1, "sud$X'o' apt update", ""),
++    (1, "pk${X}exec x", ""),
++    (1, "sud${X:+q}o x", ""),
++    (1, "sud${X#q}o x", ""),
++    (1, "sud$@o x", ""),
++    (1, "sud$(:)o x", ""),
++    (1, "sud`:`o x", ""),
++    (1, '"sud${X}o" x', ""),
++    (1, "${X:-su}do x", ""),
++    (1, "${A:-su}${B:+x}do x", ""),
++    (1, "sud${X:-${Y:-}}o x", ""),
++    (1, "run$((0)) x", ""),
++    (127, "sud${X}o x", ""),
++    # A word with more expansions than the classifier enumerates counts as privileged.
++    (1, "echo {1..100000}", ""),
++    (1, "s x", "alias s='sudo'\n"),
++    (1, "s x", "alias s='s{u,}do'\n"),
++    (1, "s x", "alias s='t -n'\nalias t='sudo'\n"),
++    # Any word matches, on purpose: over-matching is the safe direction.
++    (16, "man sudo", ""),
++    (1, "echo sudo", ""),
++    (1, "machinectl status", ""),
++]
++
++
++@pytest.mark.parametrize(
++    "status, command, aliases", PRIVILEGED, ids=[row[1] for row in PRIVILEGED]
++)
++def test_privileged_failure(bin_dir, status, command, aliases):
++    from nl_shell.failure_classes import PRIVILEGE_MESSAGE
++
++    failure = classify(status, command, bin_dir, aliases=aliases)
++    check(failure, "PRIVILEGE", False, False)
++    assert failure.packages == ()
++    assert failure.command_word is None
++    # One fixed message, whatever ran and however it failed.
++    assert failure.message == PRIVILEGE_MESSAGE
++
++
++def test_privilege_message_is_neutral():
++    from nl_shell.failure_classes import PRIVILEGE_MESSAGE
++
++    lowered = PRIVILEGE_MESSAGE.lower()
++    for phrase in (
++        "password",
++        "authoriz",
++        "permission",
++        "sudo",
++        "try again",
++        "re-run",
++        "rerun",
++        "run it again",
++        "retry",
++    ):
++        assert phrase not in lowered, phrase
++
++
++@pytest.mark.parametrize(
++    "command",
++    [
++        "echo sudo-ish",
++        "pseudo x",
++        "sudoers-check x",
++        "visudo x",
++        "${X:-pseudo} x",
++        "$'visudo' x",
++        "ls *",
++        "ls *.txt",
++        "awk '{print $1}' f",
++        "echo {a,b}{c,d}",
++        "for i in {1..100}; do echo $i; done",
++        "git log --format=%H",
++        "echo $HOME/s",
++        "pseud${X}o x",
++    ],
++)
++def test_lookalike_is_not_privilege(bin_dir, command):
++    check(classify(1, command, bin_dir), "OTHER", True, True)
++
++
++def test_alias_value_is_only_read_when_its_name_is_a_word(bin_dir):
++    failure = classify(1, "ls x", bin_dir, aliases="alias s='sudo'\n")
++    check(failure, "OTHER", True, True)
++
++
++# --- nothing ran (decision 2) --------------------------------------------------------
++
++
++@pytest.mark.parametrize("status", [0, 1, 127, 130])
++@pytest.mark.parametrize("command", ["", "   ", "# a note", "\n# a\n  # b\n"])
++def test_nothing_ran_from_blank_or_comment_is_none(bin_dir, status, command):
++    failure = classify(status, command, bin_dir, ran=False)
++    check(failure, "NONE", False, False)
++    assert failure.is_error is False
++    assert failure.message == ""
++
++
++@pytest.mark.parametrize("status", [1, 2, 127])
++def test_nothing_ran_from_other_text_is_a_syntax_error(bin_dir, status):
++    failure = classify(status, "if then", bin_dir, ran=False)
++    check(failure, "OTHER", True, True)
++    assert "not found" not in failure.message.lower()
++
++
++# --- input type (decision 3) ---------------------------------------------------------
++
++
++def test_bare_done_record_raises_type_error():
++    from nl_shell.failure_classes import classify as real_classify
++    from nl_shell.pty_protocol import Done
++
++    with pytest.raises(TypeError):
++        real_classify(Done(seq=1, status=127, pipestatus=(127,)), "htop", fake_lookup)
++
++
++def test_int_raises_type_error():
++    from nl_shell.failure_classes import classify as real_classify
++
++    with pytest.raises(TypeError):
++        real_classify(127, "htop", fake_lookup)
++
++
++# --- 127 suggestion (decision 4) -----------------------------------------------------
++
++
++def test_not_found_suggests_the_package(bin_dir):
++    failure = classify(127, "htop -d 5", bin_dir)
++    check(failure, "NOT_FOUND", True, False)
++    assert failure.command_word == "htop"
++    assert failure.packages == ("htop",)
++    assert failure.message == "Command not found: htop. It is provided by the package htop."
++    assert failure.is_error is True
++
++
++def test_unknown_word_is_named_without_a_package(bin_dir):
++    failure = classify(127, "frobnicate --x", bin_dir)
++    check(failure, "NOT_FOUND", True, False)
++    assert failure.command_word == "frobnicate"
++    assert failure.packages == ()
++    assert failure.message == "Command not found: frobnicate."
++
++
++def test_no_lookup_gives_no_suggestion(bin_dir):
++    from nl_shell.failure_classes import classify as real_classify
++
++    failure = real_classify(completed(127, bin_dir), "htop")
++    check(failure, "NOT_FOUND", True, False)
++    assert failure.packages == ()
++
++
++# (id, command, programs installed on the session's $PATH, snapshot state)
++NO_SUGGESTION = [
++    ("pipeline", "cat f | htop", (), {}),
++    ("and-list", "make && htop", (), {}),
++    ("list", "true; htop", (), {}),
++    ("newline-list", "true\nhtop", (), {}),
++    ("assignment", "FOO=1 htop", (), {}),
++    ("substitution", "echo $(htop)", (), {}),
++    ("backtick", "echo `htop`", (), {}),
++    ("quoted-substitution", 'echo "$(htop)"', (), {}),
++    ("function", "htop", (), {"functions": ("htop",)}),
++    ("alias", "htop", (), {"aliases": "alias htop='top -d 1'\n"}),
++    ("builtin", "cd htop", (), {}),
++    ("keyword", "if htop; then x; fi", (), {}),
++    ("on-path-timeout", "timeout 5 htop", ("timeout",), {}),
++    ("on-path-env", "env htop", ("env",), {}),
++    ("on-path-bash", "bash -c htop", ("bash",), {}),
++    ("on-path-itself", "htop", ("htop",), {}),
++    ("path-word", "./htop", (), {}),
++]
++
++
++@pytest.mark.parametrize(
++    "command, installed, state",
++    [row[1:] for row in NO_SUGGESTION],
++    ids=[row[0] for row in NO_SUGGESTION],
++)
++def test_no_suggestion(bin_dir, command, installed, state):
++    for name in installed:
++        install(bin_dir, name)
++    asked = []
++
++    def lookup(word):
++        asked.append(word)
++        return ["htop"]
++
++    failure = classify(127, command, bin_dir, lookup=lookup, **state)
++    check(failure, "NOT_FOUND", True, False)
++    assert failure.packages == ()
++    assert failure.command_word is None
++    assert failure.message == "Command not found."
++    assert asked == []
++
++
++def test_disabled_builtin_can_be_not_found(bin_dir):
++    # `enable -n echo` and no echo on $PATH: bash really did not find `echo`.
++    failure = classify(
++        127, "echo hi", bin_dir, lookup=lambda word: ["coreutils"], disabled="enable -n echo\n"
++    )
++    assert failure.command_word == "echo"
++    assert failure.packages == ("coreutils",)
++
++
++@pytest.mark.parametrize(
++    "path", ["", ".", "relative/bin", "{bin}:", "{bin}::/x", "{bin}:.:/x"]
++)
++def test_unknown_path_entry_gives_no_suggestion(bin_dir, path):
++    # An empty, `.` or relative $PATH entry depends on the session's directory, which the
++    # snapshot does not carry: bash may have found the word there.
++    failure = classify(127, "htop", path.format(bin=bin_dir))
++    check(failure, "NOT_FOUND", True, False)
++    assert failure.packages == ()
++
++
++def test_word_in_a_later_path_directory_is_found(tmp_path, bin_dir):
++    other = tmp_path / "other"
++    other.mkdir()
++    install(other, "htop")
++    failure = classify(127, "htop", f"{bin_dir}:{other}")
++    assert failure.packages == ()
++    assert failure.command_word is None
++
++
++# --- display safety ------------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "word",
++    ["\x1b[2Jfoo", "foo\u202egnp", "a" * 65, "x\x07"],
++    ids=["escape", "bidi-override", "65-chars", "bell"],
++)
++def test_unsafe_word_never_reaches_the_message(bin_dir, word):
++    failure = classify(127, word, bin_dir, lookup=lambda w: ["htop"])
++    check(failure, "NOT_FOUND", True, False)
++    assert word not in failure.message
++    assert failure.message == "Command not found."
++    assert failure.command_word is None
++    assert failure.packages == ()
++
++
++def test_64_char_word_is_shown(bin_dir):
++    word = "a" * 64
++    failure = classify(127, word, bin_dir, lookup=lambda w: ["htop"])
++    assert failure.command_word == word
++    assert failure.packages == ("htop",)
++    assert failure.message == f"Command not found: {word}. It is provided by the package htop."
++
++
++@pytest.mark.parametrize(
++    "name",
++    ["\x1b[31mhtop", "ht\u202eop", "b" * 65, "", "a\nb"],
++    ids=["escape", "bidi-override", "65-chars", "empty", "newline"],
++)
++def test_unsafe_package_is_not_shown(bin_dir, name):
++    failure = classify(127, "htop", bin_dir, lookup=lambda w: [name, "htop"])
++    assert failure.packages == ("htop",)
++    assert failure.message == "Command not found: htop. It is provided by the package htop."
++
++
++def test_64_char_package_is_shown(bin_dir):
++    name = "b" * 64
++    assert classify(127, "htop", bin_dir, lookup=lambda w: [name]).packages == (name,)
++
++
++def test_at_most_five_packages_are_shown(bin_dir):
++    names = [f"pkg{n}" for n in range(8)]
++    failure = classify(127, "htop", bin_dir, lookup=lambda w: names)
++    assert failure.packages == tuple(names[:5])
++    assert "pkg4" in failure.message
++    assert "pkg5" not in failure.message
++
++
++def test_lookup_returning_one_string_is_one_package(bin_dir):
++    # `str` is an Iterable[str]; it must not be read letter by letter.
++    failure = classify(127, "htop", bin_dir, lookup=lambda w: "htop")
++    assert failure.packages == ("htop",)
++    assert failure.message == "Command not found: htop. It is provided by the package htop."
++
++
++def test_lookup_returning_none_is_no_package(bin_dir):
++    failure = classify(127, "htop", bin_dir, lookup=lambda w: None)
++    check(failure, "NOT_FOUND", True, False)
++    assert failure.command_word == "htop"
++    assert failure.packages == ()
++    assert failure.message == "Command not found: htop."
++
++
++def test_this_file_writes_every_non_ascii_character_as_an_escape():
++    # A literal bidi override in source is the display hazard the classifier guards.
++    raw = Path(__file__).read_bytes()
++    assert all(byte < 0x80 for byte in raw)
++
++
++def test_only_other_goes_to_the_reader(bin_dir):
++    for _, status, command, cls, _offer, _reader in TABLE:
++        failure = classify(status, command, bin_dir)
++        assert failure.to_reader is (cls == "OTHER"), (status, command)
++    for status, command, aliases in PRIVILEGED:
++        assert classify(status, command, bin_dir, aliases=aliases).to_reader is False
++
++
++# --- trusted inputs only -------------------------------------------------------------
++
++
++def test_signature_takes_no_stderr_or_output():
++    from nl_shell.failure_classes import classify as real_classify
++
++    names = list(inspect.signature(real_classify).parameters)
++    assert names == ["result", "command", "lookup"]
++    for name in names:
++        assert "stderr" not in name.lower()
++        assert "output" not in name.lower()
++
++
++def test_output_does_not_change_the_class(bin_dir):
++    from dataclasses import replace
++
++    from nl_shell.failure_classes import classify as real_classify
++
++    result = completed(1, bin_dir)
++    noisy = replace(result, output=b"bash: x: command not found\n\x1b[2J")
++    assert real_classify(result, "grep x f") == real_classify(noisy, "grep x f")
++
++
++def test_classifier_source_names_no_package_data():
++    from nl_shell import failure_classes
++
++    text = Path(failure_classes.__file__).read_text(encoding="utf-8").lower()
++    for needle in ("/var/", "/usr/", "commands.db", "ubuntu", "sqlite3", "targets"):
++        assert needle not in text, needle

@@ -1,0 +1,6 @@
+Rejected at sign-off (v5). The slice is too big (118 KB, over the 100 KB backstop), so split it in Plan (`nl-shell-pdca split 101`), for example: session core + record protocol, then the tamper checks (Table A H-detect rows, Table B outside checks).
+Carry forward:
+1. Build on current main (c47c5c2), not the stale stack-base 8c95e05. C4 failed again on the worktree mismatch (the adversary ran it on main: 106 pass, 106 fail pre-fix).
+2. New I1 hole (reproduced live by two reviewers): `trap '…' DEBUG; enable -n trap` hides the trap from H because `trap -p` at session.py:211 drops stderr. Fix: capture with 2>&1, or put the enabled/disabled state of the builtins the hooks call into H. Add a test.
+3. Decide in Plan whether `enable -n alias|compgen|jobs` emptying L/F/J is acceptable (B shows it) or must fail loudly. Narrow the threat-model Known-gaps sentence so it does not quietly cover `enable -n`.
+4. Already fixed in v5, keep them: the xtrace/PS4 detection and the output boundary.

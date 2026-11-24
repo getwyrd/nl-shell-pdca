@@ -1,0 +1,25 @@
+Review the data-driven command policy engine for wrappers, privilege escalation, destructive commands, variable assignments, and unreadable code (#197).
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The intended fail-closed command meanings and proposal rejection rules are explicit and bounded to this child; target/docs/design/specs/policy-gate/v1.md:122 and :195. |
+| C2 Reproduction (red pre-fix) | PASS | Frozen execution demonstrates the stub misclassifies sudo as mutating and produces 222 failures out of 392 tests, rather than collection failures; gate-logs/C4-verify.log:28 and :9419. |
+| C3 Change | PASS | Reviewed command data and a shared interpreter replace the stub within the specified scope, with shared recursion accounting; target/src/nl_shell/gate/rules.py:456 and target/src/nl_shell/gate/commands.py:221. |
+| C4 Verification (red→green) | PASS | Frozen evidence records 392 passing patched tests and 222 pre-fix failures; independent pytest execution was unavailable here, so this verdict rests on the captured execution; gate-logs/C4-verify.log:17 and :9419. |
+| C5 Causal adequacy | NEEDS-HUMAN [impl] | Close the interactive-root-shell bypass for positional arguments with -s/-is: sudo bash -is dummy is privileged but unrejected in the isolated engine probe, contrary to the proposal rule; target/targets/ubuntu-26.04/commands.toml:542 and target/docs/design/specs/policy-gate/v1.md:195. |
+| T1 Structure | PASS | A validated fixed vocabulary and effect dispatch preserve the requested data-driven architecture without command-specific interpreter branches; target/src/nl_shell/gate/commands.py:31 and target/src/nl_shell/gate/rules.py:777. |
+| T2 Shape | PASS | The security model documents command-table trust and decisions A/B/C, and the independent whitespace check is clean; target/.oss-scanner/threat_model.md:182 and gate-logs/T2-threat-model.log:10. |
+| T3 Runtime | PASS | Captured full-suite execution reports 1493 passed and one skipped; this is log-supported evidence, not an independent local rerun; gate-logs/T3-suite.log:38. |
+| T4 Contribution | N/A | Contribution artifacts are absent by design at Check; the substantive audit reruns at publish; gate-logs/T4-contribution.log:10. |
+| T5 Judgment | NEEDS-HUMAN | Complete affected-path merged-history and closed/rejected-work prior-art review before sign-off: this disposable checkout has only one synthetic base commit and no remotes, and the frozen logs contain no such audit; brief.md:149. |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Decide whether the broader class increases and decision A false positives are acceptable for user confirmation and proposal rejection, after the root-shell bypass is addressed; target/docs/design/specs/policy-gate/v1.md:301 and brief.md:171. |
+
+Independent checks and limitations:
+
+- `git -C target diff --check` passed. Target citations above refer to the supplied patched source; no stale-target problem was observed.
+- `python -m pytest -q tests/test_gate_commands.py tests/test_policy_gate.py` could not start because `python` is absent. The same command with `python3` failed because pytest is absent; importing tree_sitter also failed. With no runnable local test toolchain, no stash/red/unstash/green sequence was performed. The complete frozen C4 and T3 logs show actual pytest execution, including the parser-dependent tests; the declared parser dependency was exercised there. This sandbox limitation is not a patch defect.
+- `python3 engine_probe.py` exercised the actual command loader and interpreter with terminal-stdin Invocation objects. It loaded only the parser module's data definitions, omitting tree-sitter imports and initialization; it did not exercise parsing or the full gate. Results: `sudo bash` → privileged, rejected=True, opens_shell=True; `sudo bash -s dummy` and `sudo bash -is dummy` → privileged, rejected=False, opens_shell=False. The latter explicitly requests an interactive shell, and -s treats dummy as a positional argument rather than a script filename. The stdin handler returns without setting opens_shell for terminal input (target/src/nl_shell/gate/rules.py:643); the shell row's no_operands condition suppresses the marker. Fix the row and add full-pipeline proposal regressions for these forms and an elevating wrapper such as pkexec.
+- Prior-art investigation ran `git log --all` restricted to every affected path: only `b37591f pre-fix base 0b6f18f4f70efd77d9981ee3f574a335f9ae94fc` was available. `git remote -v` returned nothing. No INTEGRATION.md was supplied or found inside the target; its enumerated human-only checklist could not be inspected. The brief references earlier v2 review findings but does not provide merged-history or closed-work audit evidence.
+- The capability-probe symptom-guard trigger does not fire: the patch's exception handling implements table validation and fail-closed classification rather than probing an optional capability around a load-time side effect.
+
+<!-- pdca:leaf-complete -->

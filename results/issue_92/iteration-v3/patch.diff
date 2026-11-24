@@ -1,0 +1,1646 @@
+diff --git a/src/nl_shell/cli.py b/src/nl_shell/cli.py
+index 5feb0c4..6ed4d25 100644
+--- a/src/nl_shell/cli.py
++++ b/src/nl_shell/cli.py
+@@ -3,16 +3,40 @@
+ from __future__ import annotations
+ 
+ import argparse
++import sys
+ 
+-from nl_shell import __version__
++from nl_shell import __version__, config, os_release, targets
+ from nl_shell.repl import Repl
+ 
+ 
+ def main(argv: list[str] | None = None) -> int:
+     parser = argparse.ArgumentParser(
+-        prog="nl-shell",
+-        description="Natural-language shell for Ubuntu 26.04.",
++        prog="nl-shell", description="Natural-language shell for Ubuntu 26.04."
+     )
+     parser.add_argument("--version", action="version", version=f"nl-shell {__version__}")
+-    parser.parse_args(argv)
+-    return Repl.interactive().run()
++    parser.add_argument(
++        "--target",
++        metavar="ID",
++        help="use this OS target (a folder under targets/) even if it does not match "
++        "this OS; overrides `target` in config.toml",
++    )
++    args = parser.parse_args(argv)
++
++    # Target selection (ADR-0023 §Choosing the target) runs before the REPL starts. The
++    # os-release paths and the targets root are read from their modules at call time,
++    # so tests can point them at fakes.
++    try:
++        settings = config.load()
++        selection = targets.select(
++            os_release.read(os_release.PATHS),
++            named=args.target if args.target is not None else settings.target,
++            root=targets.ROOT,
++            config_file=settings.path,
++        )
++    except (config.ConfigError, os_release.OsReleaseError, targets.TargetError) as exc:
++        print(f"nl-shell: {exc}", file=sys.stderr)
++        return 1
++    warning = selection.warning()
++    if warning is not None:
++        print(f"nl-shell: {warning}", file=sys.stderr)
++    return Repl.interactive(selection).run()
+diff --git a/src/nl_shell/config.py b/src/nl_shell/config.py
+new file mode 100644
+index 0000000..e8c9af2
+--- /dev/null
++++ b/src/nl_shell/config.py
+@@ -0,0 +1,54 @@
++"""The user's ``config.toml`` (ADR-0020 §1–§2).
++
++The file lives in ``$XDG_CONFIG_HOME/nl-shell/`` (default ``~/.config/nl-shell/``). A
++missing file means "no settings". A file that is not valid TOML is refused with a message,
++never half-read. Unknown keys are ignored here, so later issues can add their own (#77).
++
++This unit only reads the user's settings. The target loader (``nl_shell.targets``) is kept
++separate on purpose: later issues extend the two in parallel.
++"""
++
++from __future__ import annotations
++
++import os
++import tomllib
++from dataclasses import dataclass
++from pathlib import Path
++
++
++class ConfigError(Exception):
++    """``config.toml`` exists but can't be used. The message names the file."""
++
++
++@dataclass(frozen=True)
++class Config:
++    path: Path
++    target: str | None = None
++
++
++def config_dir() -> Path:
++    base = os.environ.get("XDG_CONFIG_HOME") or ""
++    root = Path(base) if base else Path.home() / ".config"
++    return root / "nl-shell"
++
++
++def config_path() -> Path:
++    return config_dir() / "config.toml"
++
++
++def load(path: Path | None = None) -> Config:
++    path = config_path() if path is None else path
++    try:
++        raw = path.read_bytes()
++    except FileNotFoundError:
++        return Config(path)
++    except OSError as exc:
++        raise ConfigError(f"{path}: can't be read: {exc.strerror or exc}") from exc
++    try:
++        data = tomllib.loads(raw.decode("utf-8"))
++    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
++        raise ConfigError(f"{path}: not valid TOML: {exc}") from exc
++    target = data.get("target")
++    if target is not None and (not isinstance(target, str) or not target):
++        raise ConfigError(f"{path}: 'target' must be a non-empty string")
++    return Config(path, target)
+diff --git a/src/nl_shell/input_modes.py b/src/nl_shell/input_modes.py
+index 2521399..cd0784c 100644
+--- a/src/nl_shell/input_modes.py
++++ b/src/nl_shell/input_modes.py
+@@ -75,8 +75,9 @@ def is_exit(text: str) -> bool:
+ 
+ 
+ # `:status` prints one line per entry, in list order. Each entry is a zero-argument
+-# callable returning one line. Later issues add their lines by appending here (#92 active
+-# target, #16 prompt files loaded, #77 endpoint and backend), with no other change.
++# callable returning one line. Later issues add their lines by appending here (#16 prompt
++# files loaded, #77 endpoint and backend), with no other change. The active OS target
++# (#92) is chosen per session at start-up, so `Repl` adds its lines after these.
+ STATUS_LINES: list[Callable[[], str]] = [
+     lambda: f"nl-shell {nl_shell.__version__}",
+ ]
+diff --git a/src/nl_shell/os_release.py b/src/nl_shell/os_release.py
+new file mode 100644
+index 0000000..a70c0ac
+--- /dev/null
++++ b/src/nl_shell/os_release.py
+@@ -0,0 +1,93 @@
++"""Reading os-release(5): which OS release nl-shell runs on.
++
++The file is ``/etc/os-release``, falling back to ``/usr/lib/os-release`` when the first
++does not exist, as os-release(5) specifies. That is a fallback between two copies of the
++same file, not between targets: target selection (``nl_shell.targets``) still compares
++``ID`` and ``VERSION_ID`` exactly.
++"""
++
++from __future__ import annotations
++
++import re
++from collections.abc import Iterable
++from pathlib import Path
++
++PATHS: tuple[Path, ...] = (Path("/etc/os-release"), Path("/usr/lib/os-release"))
++
++_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
++
++
++def parse(text: str) -> dict[str, str]:
++    """The ``KEY=value`` pairs of an os-release file.
++
++    Values use shell-style quoting (os-release(5)); a line that is not a valid assignment
++    is ignored, as the man page asks of readers.
++    """
++    values: dict[str, str] = {}
++    for raw in text.splitlines():
++        line = raw.strip()
++        if not line or line.startswith("#") or "=" not in line:
++            continue
++        key, _, value = line.partition("=")
++        if not _KEY.fullmatch(key):
++            continue
++        unquoted = _unquote(value.strip())
++        if unquoted is not None:
++            values[key] = unquoted
++    return values
++
++
++def _unquote(value: str) -> str | None:
++    """One os-release value without its quoting, or None when it is not valid.
++
++    os-release(5): a value with spaces or special characters is enclosed in double or
++    single quotes, and inside double quotes ``$``, ``"``, ``\\`` and backquote are escaped
++    with a backslash.
++    """
++    if len(value) >= 2 and value[0] == value[-1] == "'":
++        inner = value[1:-1]
++        return None if "'" in inner else inner
++    if len(value) >= 2 and value[0] == value[-1] == '"':
++        inner = value[1:-1]
++        if re.search(r'(?<!\\)(?:\\\\)*"', inner):
++            return None  # an unescaped quote inside: not one quoted value
++        return _ESCAPE.sub(r"\1", inner)
++    if _UNSAFE.search(value):
++        return None
++    return value
++
++
++_ESCAPE = re.compile(r'\\([$"\\`])')
++# Characters that need quoting in an unquoted value.
++_UNSAFE = re.compile(r"[\s'\"`$\\;&|<>()]")
++
++
++class OsReleaseError(Exception):
++    """An os-release file exists but can't be read. The message is meant for the user."""
++
++
++def read(paths: Iterable[Path] | None = None) -> dict[str, str]:
++    """The parsed os-release of the first of ``paths`` that exists; empty if none does.
++
++    ``paths`` defaults to ``PATHS``, looked up at call time. Only a file that does not
++    exist moves on to the next path (os-release(5)). A file that exists but can't be read
++    or isn't UTF-8 raises OsReleaseError: falling back past it would read a different
++    file than the one the OS says is current.
++    """
++    for path in PATHS if paths is None else paths:
++        try:
++            text = Path(path).read_text(encoding="utf-8")
++        except FileNotFoundError:
++            continue
++        except OSError as exc:
++            raise OsReleaseError(
++                f"{path}: can't be read ({exc.strerror or exc}), so nl-shell can't tell "
++                "which OS this is."
++            ) from exc
++        except UnicodeDecodeError as exc:
++            raise OsReleaseError(
++                f"{path}: not valid UTF-8 ({exc.reason}), so nl-shell can't tell which OS "
++                "this is."
++            ) from exc
++        return parse(text)
++    return {}
+diff --git a/src/nl_shell/repl.py b/src/nl_shell/repl.py
+index a7f9a93..1200507 100644
+--- a/src/nl_shell/repl.py
++++ b/src/nl_shell/repl.py
+@@ -10,13 +10,16 @@ docs/design/architecture/05-building-block-view.md).
+ from __future__ import annotations
+ 
+ from collections.abc import Callable
+-from typing import TextIO
++from typing import TYPE_CHECKING, TextIO
+ import sys
+ 
+ from nl_shell import input_modes
+ from nl_shell.input_modes import Mode
+ from nl_shell.router import Route, route
+ 
++if TYPE_CHECKING:
++    from nl_shell.targets import Selection
++
+ PROMPT = "nl> "
+ COMMAND_NOT_YET = (
+     "That looks like a shell command, but nl-shell can't run anything yet: "
+@@ -33,18 +36,28 @@ REPLIES = {
+ 
+ 
+ class Repl:
+-    """One REPL session. ``read`` returns the next line or raises EOFError."""
++    """One REPL session. ``read`` returns the next line or raises EOFError.
++
++    ``selection`` is the active OS target chosen at start-up (``nl_shell.targets``);
++    ``:status`` shows it. None when a session is built without one, as tests do.
++    """
+ 
+-    def __init__(self, read: Callable[[str], str], out: TextIO) -> None:
++    def __init__(
++        self,
++        read: Callable[[str], str],
++        out: TextIO,
++        selection: "Selection | None" = None,
++    ) -> None:
+         self._read = read
+         self._out = out
++        self._selection = selection
+ 
+     @classmethod
+-    def interactive(cls) -> "Repl":
++    def interactive(cls, selection: "Selection | None" = None) -> "Repl":
+         from prompt_toolkit import PromptSession
+ 
+         session: PromptSession[str] = PromptSession()
+-        return cls(session.prompt, sys.stdout)
++        return cls(session.prompt, sys.stdout, selection)
+ 
+     def run(self) -> int:
+         """Loop until an exit command or end of input. Returns the exit status."""
+@@ -63,8 +76,7 @@ class Repl:
+                 return 0
+             print(self._reply(text), file=self._out)
+ 
+-    @staticmethod
+-    def _reply(text: str) -> str:
++    def _reply(self, text: str) -> str:
+         """The reply for one stripped, non-blank, non-exit line."""
+         prefixed = input_modes.parse(text)
+         if prefixed is None:
+@@ -74,4 +86,13 @@ class Repl:
+             # the policy gate. ADR-0013 §7 (Proposed; #64 closed on it). The gate is wired
+             # in by #78, so `prefixed.payload` is the command text the gate will receive.
+             return REPLIES[Route.COMMAND]
+-        return input_modes.reply(prefixed)
++        reply = input_modes.reply(prefixed)
++        if (
++            prefixed.mode is Mode.META
++            and prefixed.payload == "status"
++            and self._selection is not None
++        ):
++            # The active target belongs to this session, not to the module-wide
++            # `input_modes.STATUS_LINES`, so its lines are added here.
++            reply = "\n".join([reply, *self._selection.status_lines()])
++        return reply
+diff --git a/src/nl_shell/targets.py b/src/nl_shell/targets.py
+new file mode 100644
+index 0000000..cdc65cb
+--- /dev/null
++++ b/src/nl_shell/targets.py
+@@ -0,0 +1,254 @@
++"""OS targets (ADR-0023): loading ``targets/<id>/target.toml`` and choosing the target.
++
++A target is one supported OS release. Everything OS-specific lives in its folder, so this
++module names no OS: the os-release match, the shell, the package-owner query and the sudo
++implementation all come from ``target.toml``.
++
++Choosing the target (ADR-0023 §Choosing the target): the target whose ``ID`` and
++``VERSION_ID`` equal the os-release values exactly. There is no fallback through
++``ID_LIKE`` or a nearby version. With no match, start-up is refused unless the user names
++a target; a named target that does not match is recorded as such, and the gate (#12) runs
++in degraded mode for it (spec ``policy-gate/v1`` §7.7).
++
++The allowlist is only located and parsed here; the gate (#12) gives it meaning.
++"""
++
++from __future__ import annotations
++
++import re
++import tomllib
++from collections.abc import Mapping
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any
++
++# At run time the targets live in the repository's `targets/`, next to `src/`. Shipping
++# them in an installed package is #48 / #50.
++ROOT = Path(__file__).resolve().parents[2] / "targets"
++
++TARGET_FILE = "target.toml"
++ALLOWLIST_FILE = "allowlist.toml"
++SUPPORTED_SHELLS = ("bash",)
++MISMATCH_REASON = "target does not match this OS"
++
++# A target id is a folder name: os-release `ID` and `VERSION_ID` characters, no `/`.
++_ID = re.compile(r"[a-z0-9][a-z0-9._-]*")
++
++# Required string fields of target.toml, as dotted paths into the TOML document.
++_REQUIRED_STRINGS = (
++    "id",
++    "display_name",
++    "shell",
++    "match.ID",
++    "match.VERSION_ID",
++    "sudo.implementation",
++    "sudo.version",
++)
++
++
++class TargetError(Exception):
++    """A target can't be loaded or chosen. The message is meant for the user."""
++
++
++@dataclass(frozen=True)
++class Target:
++    id: str
++    display_name: str
++    os_id: str
++    os_version_id: str
++    shell: str
++    package_owner_query: tuple[str, ...]
++    sudo_implementation: str
++    sudo_version: str
++    path: Path
++    fields: Mapping[str, Any] = field(repr=False)
++
++    @property
++    def allowlist_path(self) -> Path:
++        return self.path / ALLOWLIST_FILE
++
++    def matches(self, os_release: Mapping[str, str]) -> bool:
++        return (
++            os_release.get("ID") == self.os_id
++            and os_release.get("VERSION_ID") == self.os_version_id
++        )
++
++
++@dataclass(frozen=True)
++class Selection:
++    """The active target and how it relates to the OS nl-shell runs on."""
++
++    target: Target
++    matches: bool
++    detected_id: str | None
++    detected_version_id: str | None
++
++    @property
++    def reason(self) -> str | None:
++        """Why the gate runs degraded, or None when the target matches."""
++        return None if self.matches else MISMATCH_REASON
++
++    @property
++    def detected(self) -> str:
++        return describe_os(self.detected_id, self.detected_version_id)
++
++    def warning(self) -> str | None:
++        if self.matches:
++            return None
++        return (
++            f"warning: {MISMATCH_REASON} (target {self.target.id}, detected: "
++            f"{self.detected}). Every command will need a confirm, because this "
++            "target's allowlist was never checked on this OS."
++        )
++
++    def status_lines(self) -> list[str]:
++        if self.matches:
++            match = "matches this OS"
++        else:
++            match = f"does not match this OS (detected: {self.detected})"
++        return [
++            f"target: {self.target.id} ({self.target.display_name})",
++            f"target os: {match}",
++        ]
++
++
++def describe_os(os_id: str | None, version_id: str | None) -> str:
++    return f"{os_id or 'unknown'} {version_id or 'unknown'}"
++
++
++def _lookup(data: Mapping[str, Any], dotted: str) -> Any:
++    value: Any = data
++    for part in dotted.split("."):
++        if not isinstance(value, Mapping) or part not in value:
++            return None
++        value = value[part]
++    return value
++
++
++def load(target_id: str, root: Path = ROOT) -> Target:
++    """Load and validate ``root/<target_id>/target.toml``."""
++    if not _ID.fullmatch(target_id):
++        raise TargetError(
++            f"target {target_id!r} is not a valid target id "
++            f"(available targets: {_available_text(root)})"
++        )
++    folder = root / target_id
++    if not folder.is_dir():
++        raise TargetError(
++            f"target {target_id!r} has no folder {folder} "
++            f"(available targets: {_available_text(root)})"
++        )
++    path = folder / TARGET_FILE
++    try:
++        raw = path.read_bytes()
++    except FileNotFoundError:
++        raise TargetError(f"{path}: missing") from None
++    except OSError as exc:
++        raise TargetError(f"{path}: can't be read: {exc.strerror or exc}") from exc
++    try:
++        data = tomllib.loads(raw.decode("utf-8"))
++    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
++        raise TargetError(f"{path}: not valid TOML: {exc}") from exc
++
++    for name in _REQUIRED_STRINGS:
++        value = _lookup(data, name)
++        if value is None:
++            raise TargetError(f"{path}: missing required field '{name}'")
++        if not isinstance(value, str) or not value:
++            raise TargetError(f"{path}: field '{name}' must be a non-empty string")
++    query = data.get("package_owner_query")
++    if query is None:
++        raise TargetError(f"{path}: missing required field 'package_owner_query'")
++    if (
++        not isinstance(query, list)
++        or not query
++        or not all(isinstance(word, str) and word for word in query)
++    ):
++        raise TargetError(
++            f"{path}: field 'package_owner_query' must be a non-empty list of strings"
++        )
++    if data["id"] != target_id:
++        raise TargetError(
++            f"{path}: id {data['id']!r} differs from its folder name {target_id!r}"
++        )
++    if data["shell"] not in SUPPORTED_SHELLS:
++        raise TargetError(
++            f"{path}: shell {data['shell']!r} is not supported "
++            f"(supported: {', '.join(SUPPORTED_SHELLS)})"
++        )
++
++    return Target(
++        id=data["id"],
++        display_name=data["display_name"],
++        os_id=data["match"]["ID"],
++        os_version_id=data["match"]["VERSION_ID"],
++        shell=data["shell"],
++        package_owner_query=tuple(query),
++        sudo_implementation=data["sudo"]["implementation"],
++        sudo_version=data["sudo"]["version"],
++        path=folder,
++        fields=data,
++    )
++
++
++def load_allowlist(target: Target) -> dict[str, Any]:
++    """Parse the target's ``allowlist.toml``. Only parses: the gate (#12) checks it."""
++    path = target.allowlist_path
++    try:
++        return tomllib.loads(path.read_text(encoding="utf-8"))
++    except OSError as exc:
++        raise TargetError(f"{path}: can't be read: {exc.strerror or exc}") from exc
++    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
++        raise TargetError(f"{path}: not valid TOML: {exc}") from exc
++
++
++def available(root: Path = ROOT) -> list[str]:
++    """The ids of the target folders under ``root``, sorted."""
++    try:
++        entries = list(root.iterdir())
++    except OSError:
++        return []
++    return sorted(
++        entry.name
++        for entry in entries
++        if entry.is_dir() and _ID.fullmatch(entry.name) and (entry / TARGET_FILE).is_file()
++    )
++
++
++def _available_text(root: Path) -> str:
++    return ", ".join(available(root)) or "none"
++
++
++def select(
++    os_release: Mapping[str, str],
++    named: str | None = None,
++    root: Path = ROOT,
++    config_file: Path | None = None,
++) -> Selection:
++    """Choose the active target, or raise TargetError when start-up must be refused.
++
++    ``named`` is the target the user named (``--target`` wins over ``config.toml``; the
++    caller resolves that). ``config_file`` is only used to tell the user where to set one.
++    """
++    detected_id = os_release.get("ID")
++    detected_version = os_release.get("VERSION_ID")
++
++    if named is not None:
++        target = load(named, root)
++        return Selection(target, target.matches(os_release), detected_id, detected_version)
++
++    if detected_id and detected_version:
++        candidate = f"{detected_id}-{detected_version}"
++        if _ID.fullmatch(candidate) and (root / candidate).is_dir():
++            target = load(candidate, root)
++            if target.matches(os_release):
++                return Selection(target, True, detected_id, detected_version)
++
++    where = f" in {config_file}" if config_file is not None else " in config.toml"
++    raise TargetError(
++        f"no target matches this OS (detected: "
++        f"{describe_os(detected_id, detected_version)}). "
++        f"Available targets: {_available_text(root)}. nl-shell does not fall back to a "
++        "similar OS or version. To use a target anyway, name it with --target <id> or "
++        f'set target = "<id>"{where}; every command will then need a confirm.'
++    )
+diff --git a/targets/ubuntu-26.04/allowlist.toml b/targets/ubuntu-26.04/allowlist.toml
+new file mode 100644
+index 0000000..e44a274
+--- /dev/null
++++ b/targets/ubuntu-26.04/allowlist.toml
+@@ -0,0 +1,411 @@
++# Read-only allowlist for the ubuntu-26.04 target: the v1 entries of spec policy-gate/v1
++# §6.4, in the entry format of §6.2. The gate (#12) is the only reader that gives this file
++# meaning; a change here changes what runs without a confirm, so every entry is reviewed
++# by a human (spec §Versioning, nl-shell-pdca INTEGRATION §4).
++#
++# Format (§6.2): one table per command word, `[commands.<word>]`, with only these keys,
++# all optional:
++#   flags        options allowed without a value
++#   options      options allowed with a value
++#   subcommands  allowed first operands
++#   max_operands the most operands allowed
++#   stdin        true if the command reads standard input when given no file operand
++# Any option or subcommand not listed makes the simple command `mutating` (§6.2).
++#
++# Translated fail-closed (§6.3): an option is listed only if it can't write a file, run
++# another program, open a network connection or change system state. Where §6.4 says
++# "flags" without naming them, only well-known display and format options are listed. A
++# missing option costs a confirm; an extra one could run code unconfirmed.
++#
++# Two §6.4 words are left off, because §6.2 can't express their restriction:
++#   command  §6.4 allows only `command -v`. `flags = ["-v"]` would allow `-v` but not
++#            require it, so `command foo` would run `foo` unconfirmed. `type` and `which`
++#            cover the lookup.
++#   ip       §6.4 forbids `add`/`del`/`set`/`flush`, but those are the second operand
++#            (`ip addr add …`) and `subcommands` only covers the first (§6.2).
++# A later §6.2 field (#12) may put them back.
++#
++# Not on the list by design (§6.4): git, awk, sed, find, xargs, watch, timeout.
++
++spec = "policy-gate/v1"
++
++# --- Files and directories: listing and paths ------------------------------------------
++
++[commands.ls]
++flags = [
++    "-a", "-A", "-l", "-h", "-1", "-d", "-F", "-R", "-r", "-t", "-S", "-X", "-i", "-n",
++    "-g", "-o", "-s", "-p", "-Q", "-U", "-v", "-x", "-C", "-m", "-L",
++    "--all", "--almost-all", "--human-readable", "--directory", "--classify",
++    "--recursive", "--reverse", "--inode", "--numeric-uid-gid", "--size",
++    "--dereference",
++]
++options = ["--color", "--sort", "--time-style", "--block-size"]
++
++# Not `-o FILE` (writes a file), not `-R`/`-H` (HTML output writes files).
++[commands.tree]
++flags = [
++    "-a", "-d", "-f", "-i", "-s", "-h", "-p", "-u", "-g", "-D", "-F", "-C", "-n",
++    "--noreport",
++]
++options = ["-L", "-I", "-P"]
++
++[commands.stat]
++flags = ["-L", "-f", "-t", "--dereference", "--file-system", "--terse"]
++options = ["-c", "--format", "--printf"]
++
++# Not `-C` (compiles a magic file), not `-z` (may run decompressors).
++[commands.file]
++flags = [
++    "-b", "-i", "-L", "-h", "--brief", "--mime", "--mime-type", "--dereference",
++    "--no-dereference",
++]
++
++[commands.realpath]
++flags = ["-e", "-m", "-s", "-q", "-z", "-L", "-P"]
++options = ["--relative-to", "--relative-base"]
++
++[commands.readlink]
++flags = ["-f", "-e", "-m", "-n", "-q", "-s", "-v", "-z"]
++
++[commands.basename]
++flags = ["-a", "-z", "--multiple"]
++options = ["-s", "--suffix"]
++
++[commands.dirname]
++flags = ["-z"]
++
++[commands.pwd]
++flags = ["-L", "-P"]
++max_operands = 0
++
++# --- Working directory: one path each (changes the cwd only) ---------------------------
++
++[commands.cd]
++flags = ["-L", "-P"]
++max_operands = 1
++
++[commands.pushd]
++flags = ["-n"]
++max_operands = 1
++
++[commands.popd]
++flags = ["-n"]
++max_operands = 1
++
++# Not `-c` (clears the directory stack).
++[commands.dirs]
++flags = ["-l", "-p", "-v"]
++max_operands = 1
++
++# --- Reading files ---------------------------------------------------------------------
++
++[commands.cat]
++flags = ["-n", "-b", "-A", "-E", "-T", "-v", "-s", "-e", "-t"]
++stdin = true
++
++[commands.head]
++flags = ["-q", "-v", "-z"]
++options = ["-n", "-c"]
++stdin = true
++
++[commands.tail]
++flags = ["-f", "-F", "-q", "-v", "-z"]
++options = ["-n", "-c"]
++stdin = true
++
++[commands.wc]
++flags = ["-l", "-w", "-c", "-m", "-L"]
++stdin = true
++
++[commands.nl]
++options = ["-b", "-n", "-w", "-s", "-v", "-i"]
++stdin = true
++
++[commands.od]
++flags = ["-c", "-x", "-b", "-d", "-o", "-v"]
++options = ["-A", "-t", "-N", "-j", "-w"]
++stdin = true
++
++[commands.strings]
++flags = ["-a"]
++options = ["-n", "-t", "-e"]
++stdin = true
++
++[commands.md5sum]
++flags = ["-b", "-t", "-c", "--check", "--quiet", "--status", "--tag", "-z"]
++stdin = true
++
++[commands.sha256sum]
++flags = ["-b", "-t", "-c", "--check", "--quiet", "--status", "--tag", "-z"]
++stdin = true
++
++[commands.cmp]
++flags = ["-b", "-l", "-s", "--silent", "--quiet", "--print-bytes", "--verbose"]
++options = ["-i", "-n"]
++stdin = true
++
++# Not `--to-file` (§6.4).
++[commands.diff]
++flags = [
++    "-u", "-c", "-q", "-s", "-r", "-N", "-i", "-w", "-b", "-B", "-y", "-a", "-t",
++    "--brief",
++]
++options = ["-U", "-C", "-W"]
++stdin = true
++
++# --- Searching and text processing -----------------------------------------------------
++
++# Not `--pre` or any option that runs a preprocessor (§6.4).
++[commands.grep]
++flags = [
++    "-i", "-v", "-n", "-c", "-l", "-L", "-r", "-R", "-w", "-x", "-o", "-h", "-H", "-s",
++    "-q", "-E", "-F", "-a",
++]
++options = ["-e", "-m", "-A", "-B", "-C", "--include", "--exclude", "--color"]
++stdin = true
++
++[commands.egrep]
++flags = [
++    "-i", "-v", "-n", "-c", "-l", "-L", "-r", "-R", "-w", "-x", "-o", "-h", "-H", "-s",
++    "-q", "-a",
++]
++options = ["-e", "-m", "-A", "-B", "-C", "--include", "--exclude", "--color"]
++stdin = true
++
++[commands.fgrep]
++flags = [
++    "-i", "-v", "-n", "-c", "-l", "-L", "-r", "-R", "-w", "-x", "-o", "-h", "-H", "-s",
++    "-q", "-a",
++]
++options = ["-e", "-m", "-A", "-B", "-C", "--include", "--exclude", "--color"]
++stdin = true
++
++# Not `-o`/`--output`, `--compress-program` (§6.4), nor `-T` (temporary directory).
++[commands.sort]
++flags = ["-n", "-r", "-u", "-f", "-b", "-d", "-h", "-M", "-V", "-g", "-s", "-c", "-z"]
++options = ["-k", "-t"]
++stdin = true
++
++# The four below and `base64`, `xxd`: at most one file operand, because a second operand
++# is an output file (§6.4).
++[commands.uniq]
++flags = ["-c", "-d", "-u", "-i", "-D"]
++options = ["-f", "-s", "-w"]
++max_operands = 1
++stdin = true
++
++[commands.cut]
++flags = ["-s", "-z", "--complement"]
++options = ["-d", "-f", "-c", "-b"]
++max_operands = 1
++stdin = true
++
++# `tr` takes sets, not files, as operands; with at most one, `tr -d SET` runs unconfirmed
++# and `tr SET1 SET2` costs a confirm.
++[commands.tr]
++flags = ["-d", "-s", "-c", "-C", "-t"]
++max_operands = 1
++stdin = true
++
++[commands.column]
++flags = ["-t", "-x"]
++options = ["-s", "-c"]
++max_operands = 1
++stdin = true
++
++[commands.base64]
++flags = ["-d", "--decode", "-i", "--ignore-garbage"]
++options = ["-w"]
++max_operands = 1
++stdin = true
++
++# Not `-r` (reverse: writes binary data) (§6.4).
++[commands.xxd]
++flags = ["-p", "-u", "-b", "-e", "-i"]
++options = ["-c", "-g", "-l", "-s"]
++max_operands = 1
++stdin = true
++
++# Not `--rawfile`/`--slurpfile` (§6.4). Not `-f`/`-L` (filter or modules from files).
++[commands.jq]
++flags = [
++    "-r", "-c", "-S", "-e", "-n", "-s", "-j", "-a", "-M", "-C", "--tab", "--raw-output",
++    "--compact-output", "--sort-keys", "--slurp", "--null-input", "--exit-status",
++]
++options = ["--indent"]
++stdin = true
++
++# Output passes the rendering filter (#71).
++[commands.echo]
++flags = ["-n", "-e", "-E"]
++
++# Not `-v VAR` (assigns a shell variable).
++[commands.printf]
++
++# --- System information ----------------------------------------------------------------
++
++[commands.du]
++flags = ["-s", "-h", "-a", "-c", "-x", "-k", "-m", "-b", "-L", "-P", "-S"]
++options = ["-d", "--max-depth", "--block-size"]
++
++[commands.df]
++flags = ["-h", "-H", "-T", "-i", "-a", "-l", "-k", "-P", "--total"]
++options = ["-t", "-x", "-B"]
++
++[commands.free]
++flags = ["-h", "-b", "-k", "-m", "-g", "-t", "-w", "-l", "--si"]
++
++[commands.uptime]
++flags = ["-p", "-s"]
++max_operands = 0
++
++[commands.id]
++flags = ["-u", "-g", "-G", "-n", "-r", "-z"]
++
++[commands.whoami]
++max_operands = 0
++
++[commands.groups]
++
++[commands.uname]
++flags = ["-a", "-s", "-n", "-r", "-v", "-m", "-p", "-i", "-o"]
++max_operands = 0
++
++[commands.lsblk]
++flags = ["-a", "-f", "-l", "-p", "-d", "-m", "-t", "-J", "-b", "-S", "-n", "-r"]
++options = ["-o"]
++
++[commands.lscpu]
++flags = ["-a", "-b", "-c", "-e", "-p", "-J", "-x", "-y"]
++
++[commands.lsusb]
++flags = ["-v", "-t"]
++options = ["-s", "-d"]
++
++# Not `-H` (direct hardware access).
++[commands.lspci]
++flags = ["-v", "-vv", "-vvv", "-n", "-nn", "-k", "-t", "-D"]
++options = ["-s", "-d"]
++
++[commands.ps]
++flags = ["-e", "-f", "-F", "-A", "-a", "-l", "-H", "-x", "-w"]
++options = ["-u", "-U", "-p", "-C", "-o", "-g", "--sort"]
++
++[commands.nproc]
++flags = ["--all"]
++options = ["--ignore"]
++max_operands = 0
++
++# No operand: an operand sets the hostname (§6.4). Not `-F FILE` (sets it from a file),
++# not `-b`. Not `-f`/`--fqdn`, `-d`/`--domain`, `-A`, `-a`, `-i`, `-y`: they look the name
++# up through the system resolver, which can send DNS queries (§6.3: no network
++# connection). `-s` only cuts the local name at the first dot; `-I` reads the addresses
++# of the local interfaces from the kernel.
++[commands.hostname]
++flags = ["-s", "--short", "-I", "--all-ip-addresses"]
++max_operands = 0
++
++# No operand: an operand sets the date (§6.4). That means `date +FORMAT` costs a confirm
++# too, since §6.2 can't tell `+FORMAT` from a new date. Not `-s`/`--set`.
++[commands.date]
++flags = ["-u", "-R", "--utc", "--rfc-email"]
++options = ["-d", "--date"]
++max_operands = 0
++
++# No operands: with one, `env` runs a command (§6.4, §4). Not `-i`, `-u`, `-C`, `-S`.
++[commands.env]
++flags = ["-0", "--null"]
++max_operands = 0
++
++[commands.printenv]
++flags = ["-0", "--null"]
++max_operands = 0
++
++# --- Command lookup and help -----------------------------------------------------------
++
++[commands.type]
++flags = ["-a", "-t", "-p", "-P", "-f"]
++
++[commands.which]
++flags = ["-a"]
++
++# No flags: `-c`, `-d`, `-a`, `-n`, `-r`, `-w`, `-s` change the history or its file.
++[commands.history]
++max_operands = 1
++
++# Not `-P`, `-H`, `--pager`, `--html`, `-k` (§6.4). §7.5 checks `PAGER` and `MANPAGER`
++# against the baseline, but not `MANOPT` (man-db reads options, `-P`/`-H` included, from
++# it) or `LESS` (`less` reads `+cmd` from it). Those are not covered yet; that gap is the
++# human's call at sign-off, with #12 or a spec change.
++[commands.man]
++flags = ["-f", "-a", "-w", "--where", "--whatis"]
++
++# For the gate (#12): `less` reads a word that starts with `+` as a command to run at
++# start-up, and that command can be `!cmd` (run a program), `|cmd` (pipe to one) or `v`
++# (open an editor), e.g. `less '+!id' FILE`. §6.2 has no field for this, so the gate MUST
++# treat a `+` word as an option, not an operand: none is listed here, so it is
++# `mutating`. `more` takes `+NUM` and `+/PATTERN` in the same place; the same rule holds.
++# Whether `less` stays on v1 depends on #12 doing this; that is the human's call at
++# sign-off (the alternative is leaving it off, as for `command` and `ip` above).
++[commands.less]
++flags = ["-N", "-S", "-R", "-F", "-X", "-i"]
++stdin = true
++
++[commands.more]
++flags = ["-d", "-s"]
++stdin = true
++
++# --- Services, logs, network sockets ---------------------------------------------------
++
++[commands.systemctl]
++subcommands = [
++    "status", "is-active", "is-enabled", "is-failed", "list-units", "list-unit-files",
++    "show", "cat",
++]
++flags = ["--no-pager", "-a", "--all", "-l", "--full", "--failed", "--user", "--system"]
++options = ["-t", "--type", "--state", "-p", "--property", "-n"]
++
++# Exactly the §6.4 list. Not `--vacuum-*`, `--rotate`, `--flush`.
++[commands.journalctl]
++flags = ["-b", "-f", "--no-pager", "-x", "-e"]
++options = ["-u", "-n", "-p", "--since", "--until"]
++
++# Not `-K` (kills sockets), `-D` (dumps to a file), `-N` (enters a namespace).
++[commands.ss]
++flags = [
++    "-t", "-u", "-l", "-n", "-p", "-a", "-x", "-4", "-6", "-s", "-e", "-i", "-m", "-o",
++    "-w", "-H",
++]
++
++# --- Packages ---------------------------------------------------------------------------
++
++# Not `-o` or `-c`: an APT option or config file can make APT run commands.
++[commands.apt]
++subcommands = ["list", "show", "search", "policy"]
++flags = ["--installed", "--upgradable", "--all-versions"]
++
++[commands.apt-cache]
++subcommands = ["show", "search", "policy", "depends", "rdepends"]
++flags = ["--names-only", "--full", "--installed", "--recurse"]
++
++[commands.dpkg]
++flags = ["-l", "-L", "-S", "-s", "-W"]
++
++[commands.dpkg-query]
++flags = ["-l", "-L", "-S", "-s", "-W"]
++
++# --- GPU -------------------------------------------------------------------------------
++
++# No operands (§6.4: "no options except" these). `nvidia-smi` reads its first operand as a
++# subcommand (`mig`, `drain`, `clocks`, `nvlink`, `vgpu`, …), and those are what change
++# GPU state; the other two need no operand to report.
++[commands.nvidia-smi]
++flags = ["-L", "-q"]
++max_operands = 0
++
++[commands.rocminfo]
++max_operands = 0
++
++[commands.vulkaninfo]
++flags = ["--summary"]
++max_operands = 0
+diff --git a/targets/ubuntu-26.04/target.toml b/targets/ubuntu-26.04/target.toml
+new file mode 100644
+index 0000000..d2fb135
+--- /dev/null
++++ b/targets/ubuntu-26.04/target.toml
+@@ -0,0 +1,26 @@
++# OS target ubuntu-26.04 (ADR-0023 §Decision). Everything nl-shell knows about this OS
++# release lives in this folder; the code reads it from here and names no OS itself.
++
++id = "ubuntu-26.04"
++display_name = "Ubuntu 26.04 LTS"
++
++# The shell nl-shell drives. `bash` is the only accepted value (ADR-0002, ADR-0023
++# §Shells later).
++shell = "bash"
++
++# The command, as argv words, that tells which installed package owns a file. The path
++# is appended as the last word. Used by the gate's live-session resolution (spec
++# policy-gate/v1 §7.4).
++package_owner_query = ["dpkg", "-S"]
++
++# Chosen at start-up only when both values equal /etc/os-release exactly; no `ID_LIKE`
++# or nearby-version fallback (ADR-0023 §Choosing the target).
++[match]
++ID = "ubuntu"
++VERSION_ID = "26.04"
++
++# The sudo implementation this target ships, and the version the sudo handling was
++# checked against (ADR-0015 §Context).
++[sudo]
++implementation = "sudo-rs"
++version = "0.2.13"
+diff --git a/tests/test_cli.py b/tests/test_cli.py
+index 6f8ba82..ac35b1d 100644
+--- a/tests/test_cli.py
++++ b/tests/test_cli.py
+@@ -10,10 +10,20 @@ def test_version_flag(capsys):
+     assert capsys.readouterr().out.strip() == f"nl-shell {__version__}"
+ 
+ 
+-def test_main_runs_the_interactive_repl(monkeypatch):
++def test_main_runs_the_interactive_repl(monkeypatch, tmp_path):
++    # Start-up selects the OS target from os-release (#92). Point it at a fake one that
++    # matches the repository's target, so the result never depends on the host's OS.
++    from nl_shell import os_release
++
++    fake = tmp_path / "os-release"
++    fake.write_text('ID=ubuntu\nVERSION_ID="26.04"\n', encoding="utf-8")
++    monkeypatch.setattr(os_release, "PATHS", (fake,))
++
+     class FakeRepl:
+         def run(self):
+             return 0
+ 
+-    monkeypatch.setattr(cli.Repl, "interactive", classmethod(lambda cls: FakeRepl()))
++    monkeypatch.setattr(
++        cli.Repl, "interactive", classmethod(lambda cls, selection=None: FakeRepl())
++    )
+     assert cli.main([]) == 0
+diff --git a/tests/test_targets.py b/tests/test_targets.py
+new file mode 100644
+index 0000000..a47bf2a
+--- /dev/null
++++ b/tests/test_targets.py
+@@ -0,0 +1,599 @@
++"""OS targets (#92, ADR-0023): the target folder, the loader, and start-up selection.
++
++Every case uses a fake os-release file, so no result depends on the host's real
++/etc/os-release (CI runs on a GitHub image that is not the target OS). The suite's
++temporary HOME (#73, tests/conftest.py) keeps `config.toml` reads away from the real one.
++
++New modules are imported inside the test functions: with the production change reverted
++they don't exist, and a module-level import would stop the file from loading instead of
++letting each test fail.
++"""
++
++import io
++import os
++import re
++import tomllib
++from pathlib import Path
++
++import pytest
++
++from nl_shell import cli
++from nl_shell.repl import Repl
++
++REPO = Path(__file__).resolve().parents[1]
++REAL_TARGETS = REPO / "targets"
++
++MISMATCH = "target does not match this OS"
++
++TARGET_TOML = """\
++id = "{id}"
++display_name = "{display_name}"
++shell = "{shell}"
++package_owner_query = ["dpkg", "-S"]
++
++[match]
++ID = "{os_id}"
++VERSION_ID = "{version_id}"
++
++[sudo]
++implementation = "sudo-rs"
++version = "0.2.13"
++"""
++
++
++def scripted(*lines):
++    """A read function that returns ``lines`` in order, then signals end of input."""
++    it = iter(lines)
++
++    def read(_prompt):
++        try:
++            return next(it)
++        except StopIteration:
++            raise EOFError from None
++
++    return read
++
++
++def make_target(root, target_id, *, text=None, **fields):
++    """Write ``root/<target_id>/target.toml``; ``text`` replaces the whole file."""
++    values = {
++        "id": target_id,
++        "display_name": f"Fake {target_id}",
++        "shell": "bash",
++        "os_id": target_id.rsplit("-", 1)[0],
++        "version_id": target_id.rsplit("-", 1)[1],
++    }
++    values.update(fields)
++    folder = root / target_id
++    folder.mkdir(parents=True)
++    (folder / "target.toml").write_text(
++        TARGET_TOML.format(**values) if text is None else text, encoding="utf-8"
++    )
++    return folder
++
++
++@pytest.fixture
++def root(tmp_path):
++    """A fake targets directory holding one target, `ubuntu-26.04`."""
++    path = tmp_path / "targets"
++    path.mkdir()
++    make_target(path, "ubuntu-26.04", display_name="Ubuntu 26.04 LTS")
++    return path
++
++
++def os_release(tmp_path, text):
++    path = tmp_path / "os-release"
++    path.write_text(text, encoding="utf-8")
++    return path
++
++
++UBUNTU_2604 = 'NAME="Ubuntu"\nID=ubuntu\nID_LIKE=debian\nVERSION_ID="26.04"\n'
++UBUNTU_2610 = 'NAME="Ubuntu"\nID=ubuntu\nID_LIKE=debian\nVERSION_ID="26.10"\n'
++DEBIAN_LIKE_UBUNTU = 'NAME="Debian"\nID=debian\nID_LIKE=ubuntu\nVERSION_ID="26.04"\n'
++DEBIAN_13 = 'NAME="Debian GNU/Linux"\nID=debian\nVERSION_ID="13"\n'
++
++
++def start(monkeypatch, tmp_path, argv, release_text, targets_root, *lines):
++    """Run ``cli.main`` with a fake os-release and targets root.
++
++    The REPL it starts reads ``lines`` (then end of input) and writes to a buffer. Returns
++    (exit status, REPL output, the Selection the REPL got, or None if it never started).
++    ``targets_root`` None keeps the real ``targets/``.
++    """
++    from nl_shell import os_release as osr
++    from nl_shell import targets
++
++    monkeypatch.setattr(osr, "PATHS", (os_release(tmp_path, release_text),))
++    if targets_root is not None:
++        monkeypatch.setattr(targets, "ROOT", targets_root)
++    out = io.StringIO()
++    started = []
++
++    def interactive(cls, selection=None):
++        started.append(selection)
++        return cls(scripted(*lines), out, selection)
++
++    monkeypatch.setattr(cli.Repl, "interactive", classmethod(interactive))
++    status = cli.main(argv)
++    return status, out.getvalue(), started[0] if started else None
++
++
++def write_config(text):
++    folder = Path(os.environ["XDG_CONFIG_HOME"]) / "nl-shell"
++    folder.mkdir(parents=True, exist_ok=True)
++    path = folder / "config.toml"
++    path.write_text(text, encoding="utf-8")
++    return path
++
++
++# --- (a) exact match --------------------------------------------------------------------
++
++
++def test_exact_match_selects_the_target(monkeypatch, tmp_path, root, capsys):
++    status, out, selection = start(monkeypatch, tmp_path, [], UBUNTU_2604, root, ":status")
++    assert status == 0
++    assert selection.target.id == "ubuntu-26.04"
++    assert selection.matches is True
++    assert selection.reason is None
++    assert selection.target.path == root / "ubuntu-26.04"
++    assert selection.target.allowlist_path == root / "ubuntu-26.04" / "allowlist.toml"
++    lines = out.splitlines()
++    assert "target: ubuntu-26.04 (Ubuntu 26.04 LTS)" in lines
++    assert "target os: matches this OS" in lines
++    assert capsys.readouterr().err == ""
++
++
++def test_os_release_quoting_is_parsed_shell_style(tmp_path):
++    from nl_shell import os_release as osr
++
++    text = (
++        "# a comment\n"
++        "ID='ubuntu'\n"
++        'VERSION_ID="26.04"\n'
++        'PRETTY_NAME="Ubuntu \\"Plucky\\" \\$x"\n'
++        "not a line\n"
++        "\n"
++    )
++    values = osr.parse(text)
++    assert values["ID"] == "ubuntu"
++    assert values["VERSION_ID"] == "26.04"
++    assert values["PRETTY_NAME"] == 'Ubuntu "Plucky" $x'
++
++
++def test_os_release_falls_back_to_usr_lib(tmp_path):
++    """/etc/os-release missing ⇒ /usr/lib/os-release (os-release(5)). A file fallback."""
++    from nl_shell import os_release as osr
++
++    assert [str(p) for p in osr.PATHS] == ["/etc/os-release", "/usr/lib/os-release"]
++    second = os_release(tmp_path, UBUNTU_2604)
++    assert osr.read([tmp_path / "missing", second])["VERSION_ID"] == "26.04"
++    assert osr.read([tmp_path / "missing"]) == {}
++
++
++def refused_by_os_release(monkeypatch, paths, root, capsys):
++    """Run ``cli.main([])`` with os-release ``paths``; assert it refuses cleanly.
++
++    Returns what it wrote to stderr.
++    """
++    from nl_shell import os_release as osr
++    from nl_shell import targets
++
++    monkeypatch.setattr(osr, "PATHS", tuple(paths))
++    monkeypatch.setattr(targets, "ROOT", root)
++    started = []
++    monkeypatch.setattr(
++        cli.Repl, "interactive", classmethod(lambda cls, s=None: started.append(s))
++    )
++    status = cli.main([])  # must not raise: a refusal, not a traceback
++    assert status != 0
++    assert started == []  # the REPL never started
++    return capsys.readouterr().err
++
++
++def test_os_release_not_utf8_is_refused(monkeypatch, tmp_path, root, capsys):
++    bad = tmp_path / "os-release"
++    bad.write_bytes(b'ID=ubuntu\nVERSION_ID="26.04"\nNAME="Ubunt\xff"\n')
++    err = refused_by_os_release(monkeypatch, [bad], root, capsys)
++    assert f"{bad}: not valid UTF-8" in err
++    assert "can't tell which OS this is" in err
++
++
++def test_os_release_that_exists_but_cant_be_read_does_not_fall_back(
++    monkeypatch, tmp_path, root, capsys
++):
++    """os-release(5) falls back only when the first file does not exist."""
++    unreadable = tmp_path / "etc-os-release"
++    unreadable.mkdir()  # exists, but reading it fails (EISDIR), even as root
++    second = os_release(tmp_path, UBUNTU_2604)  # would match if it were read
++    err = refused_by_os_release(monkeypatch, [unreadable, second], root, capsys)
++    assert f"{unreadable}: can't be read" in err
++
++
++@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
++def test_os_release_permission_denied_does_not_fall_back(
++    monkeypatch, tmp_path, root, capsys
++):
++    denied = os_release(tmp_path, UBUNTU_2604)
++    denied.chmod(0)
++    second = tmp_path / "usr-lib-os-release"
++    second.write_text(UBUNTU_2604, encoding="utf-8")
++    try:
++        err = refused_by_os_release(monkeypatch, [denied, second], root, capsys)
++    finally:
++        denied.chmod(0o644)
++    assert f"{denied}: can't be read (Permission denied)" in err
++
++
++# --- (b) no exact match, nothing named ⇒ refused ----------------------------------------
++
++
++@pytest.mark.parametrize(
++    "release_text, detected",
++    [
++        (UBUNTU_2610, "ubuntu 26.10"),  # no near-version fallback
++        (DEBIAN_LIKE_UBUNTU, "debian 26.04"),  # no ID_LIKE fallback
++        ("NAME=Something\n", "unknown unknown"),
++    ],
++)
++def test_no_match_refuses_to_start(
++    monkeypatch, tmp_path, root, capsys, release_text, detected
++):
++    status, out, selection = start(monkeypatch, tmp_path, [], release_text, root)
++    assert status != 0
++    assert selection is None  # the REPL never started
++    err = capsys.readouterr().err
++    assert f"no target matches this OS (detected: {detected})" in err
++    assert "Available targets: ubuntu-26.04." in err
++    assert "--target <id>" in err
++    assert 'target = "<id>"' in err
++    assert str(Path(os.environ["XDG_CONFIG_HOME"]) / "nl-shell" / "config.toml") in err
++
++
++def test_folder_named_like_the_os_must_also_match_in_target_toml(
++    monkeypatch, tmp_path, capsys
++):
++    """`targets/<ID>-<VERSION_ID>` is only the candidate; its match fields must agree."""
++    root = tmp_path / "targets"
++    make_target(root, "ubuntu-26.04", version_id="26.10")
++    status, _, selection = start(monkeypatch, tmp_path, [], UBUNTU_2604, root)
++    assert status != 0
++    assert selection is None
++    assert "no target matches this OS (detected: ubuntu 26.04)" in capsys.readouterr().err
++
++
++# --- (c) --target on a non-matching OS --------------------------------------------------
++
++
++def test_named_target_on_other_os_starts_marked_as_not_matching(
++    monkeypatch, tmp_path, root, capsys
++):
++    status, out, selection = start(
++        monkeypatch, tmp_path, ["--target", "ubuntu-26.04"], DEBIAN_13, root, ":status"
++    )
++    assert status == 0
++    assert selection.target.id == "ubuntu-26.04"
++    assert selection.matches is False
++    assert selection.reason == MISMATCH
++    err = capsys.readouterr().err
++    assert "warning: target does not match this OS" in err
++    assert "debian 13" in err
++    lines = out.splitlines()
++    assert "target: ubuntu-26.04 (Ubuntu 26.04 LTS)" in lines
++    assert "target os: does not match this OS (detected: debian 13)" in lines
++
++
++def test_named_target_that_matches_is_not_degraded(monkeypatch, tmp_path, root, capsys):
++    status, _, selection = start(
++        monkeypatch, tmp_path, ["--target", "ubuntu-26.04"], UBUNTU_2604, root
++    )
++    assert status == 0
++    assert selection.matches is True
++    assert capsys.readouterr().err == ""
++
++
++# --- (d) target = in config.toml; the flag wins ----------------------------------------
++
++
++def test_config_target_behaves_like_the_flag(monkeypatch, tmp_path, root, capsys):
++    write_config('target = "ubuntu-26.04"\nsome_later_key = 1\n')
++    status, out, selection = start(monkeypatch, tmp_path, [], DEBIAN_13, root, ":status")
++    assert status == 0
++    assert selection.target.id == "ubuntu-26.04"
++    assert selection.matches is False
++    assert selection.reason == MISMATCH
++    assert "warning: target does not match this OS" in capsys.readouterr().err
++    assert "target os: does not match this OS (detected: debian 13)" in out.splitlines()
++
++
++def test_flag_wins_over_config(monkeypatch, tmp_path, root):
++    make_target(root, "debian-13")
++    write_config('target = "debian-13"\n')
++    status, _, selection = start(
++        monkeypatch, tmp_path, ["--target", "ubuntu-26.04"], DEBIAN_13, root
++    )
++    assert status == 0
++    assert selection.target.id == "ubuntu-26.04"
++    assert selection.matches is False
++
++
++def test_flag_wins_even_over_a_config_target_with_no_folder(monkeypatch, tmp_path, root):
++    write_config('target = "nosuch-1"\n')
++    status, _, selection = start(
++        monkeypatch, tmp_path, ["--target", "ubuntu-26.04"], UBUNTU_2604, root
++    )
++    assert status == 0
++    assert selection.target.id == "ubuntu-26.04"
++
++
++@pytest.mark.parametrize(
++    "text, problem",
++    [("target = \n", "not valid TOML"), ("target = 3\n", "'target' must be")],
++)
++def test_malformed_config_is_refused(monkeypatch, tmp_path, root, capsys, text, problem):
++    path = write_config(text)
++    status, _, selection = start(monkeypatch, tmp_path, [], UBUNTU_2604, root)
++    assert status != 0
++    assert selection is None
++    err = capsys.readouterr().err
++    assert str(path) in err
++    assert problem in err
++
++
++# --- (e) a named target with no folder --------------------------------------------------
++
++
++@pytest.mark.parametrize("name", ["nosuch-1", "../ubuntu-26.04"])
++def test_named_target_without_folder_is_refused(monkeypatch, tmp_path, root, capsys, name):
++    argv = ["--target", name]
++    status, _, selection = start(monkeypatch, tmp_path, argv, UBUNTU_2604, root)
++    assert status != 0
++    assert selection is None
++    err = capsys.readouterr().err
++    assert repr(name) in err
++    assert "available targets: ubuntu-26.04" in err
++
++
++def test_config_target_without_folder_is_refused(monkeypatch, tmp_path, root, capsys):
++    write_config('target = "nosuch-1"\n')
++    status, _, selection = start(monkeypatch, tmp_path, [], UBUNTU_2604, root)
++    assert status != 0
++    assert selection is None
++    assert "'nosuch-1'" in capsys.readouterr().err
++
++
++# --- (f) a broken target.toml -----------------------------------------------------------
++
++GOOD = TARGET_TOML.format(
++    id="broken-1", display_name="Broken", shell="bash", os_id="broken", version_id="1"
++)
++
++
++@pytest.mark.parametrize(
++    "text, problem",
++    [
++        (None, "missing"),
++        ("id = \n", "not valid TOML"),
++        (
++            GOOD.replace('display_name = "Broken"\n', ""),
++            "missing required field 'display_name'",
++        ),
++        (
++            GOOD.replace('VERSION_ID = "1"\n', ""),
++            "missing required field 'match.VERSION_ID'",
++        ),
++        (
++            GOOD.replace('version = "0.2.13"\n', ""),
++            "missing required field 'sudo.version'",
++        ),
++        (
++            GOOD.replace('package_owner_query = ["dpkg", "-S"]\n', ""),
++            "missing required field 'package_owner_query'",
++        ),
++        (GOOD.replace('id = "broken-1"', 'id = "other-1"'), "differs from its folder name"),
++        (GOOD.replace('shell = "bash"', 'shell = "zsh"'), "shell 'zsh' is not supported"),
++    ],
++    ids=[
++        "no-file", "bad-toml", "no-display-name", "no-version-id", "no-sudo-version",
++        "no-package-owner-query", "id-differs", "shell-not-bash",
++    ],
++)
++@pytest.mark.parametrize("how", ["flag", "auto"])
++def test_broken_target_toml_is_refused(
++    monkeypatch, tmp_path, capsys, text, problem, how
++):
++    root = tmp_path / "targets"
++    folder = root / "broken-1"
++    folder.mkdir(parents=True)
++    path = folder / "target.toml"
++    if text is not None:
++        path.write_text(text, encoding="utf-8")
++    argv = ["--target", "broken-1"] if how == "flag" else []
++    release = 'ID=broken\nVERSION_ID="1"\n'
++    status, _, selection = start(monkeypatch, tmp_path, argv, release, root)
++    assert status != 0
++    assert selection is None
++    err = capsys.readouterr().err
++    assert f"{path}: " in err
++    assert problem in err
++
++
++# --- (g) the real targets/ubuntu-26.04 --------------------------------------------------
++
++ALLOWLIST_WORDS = set(
++    """
++    ls tree stat file realpath readlink basename dirname pwd cd pushd popd dirs cat head
++    tail wc nl od strings md5sum sha256sum cmp diff grep egrep fgrep sort uniq cut tr
++    column base64 xxd jq echo printf du df free uptime id whoami groups uname lsblk lscpu
++    lsusb lspci ps nproc hostname date env printenv type which history man less more
++    systemctl journalctl ss apt apt-cache dpkg dpkg-query nvidia-smi rocminfo vulkaninfo
++    """.split()
++)
++NEVER_ON_ALLOWLIST = (
++    "command", "ip", "git", "awk", "sed", "find", "xargs", "watch", "timeout",
++)
++ENTRY_FIELDS = {"flags", "options", "subcommands", "max_operands", "stdin"}
++
++
++@pytest.fixture
++def allowlist():
++    """The real allowlist's entries, by command word, via the production loader."""
++    from nl_shell import targets
++
++    data = targets.load_allowlist(targets.load("ubuntu-26.04"))
++    return data["commands"]
++
++
++def allowed(entry):
++    return (
++        set(entry.get("flags", []))
++        | set(entry.get("options", []))
++        | set(entry.get("subcommands", []))
++    )
++
++
++def test_real_target_loads_and_matches():
++    from nl_shell import targets
++
++    assert targets.ROOT == REAL_TARGETS
++    target = targets.load("ubuntu-26.04")
++    assert target.id == "ubuntu-26.04"
++    assert target.path == REAL_TARGETS / "ubuntu-26.04"
++    assert target.allowlist_path == REAL_TARGETS / "ubuntu-26.04" / "allowlist.toml"
++    assert target.shell == "bash"
++    assert target.package_owner_query == ("dpkg", "-S")
++    assert (target.sudo_implementation, target.sudo_version) == ("sudo-rs", "0.2.13")
++    assert target.display_name
++    assert target.matches({"ID": "ubuntu", "VERSION_ID": "26.04"})
++    assert not target.matches({"ID": "ubuntu", "VERSION_ID": "26.10"})
++    assert targets.available() == ["ubuntu-26.04"]
++
++
++def test_real_target_is_selected_at_start_up(monkeypatch, tmp_path, capsys):
++    status, out, selection = start(
++        monkeypatch, tmp_path, [], UBUNTU_2604, None, ":status"
++    )
++    assert status == 0
++    assert selection.target.path == REAL_TARGETS / "ubuntu-26.04"
++    assert selection.matches is True
++    assert "target os: matches this OS" in out.splitlines()
++    assert capsys.readouterr().err == ""
++
++
++def test_real_allowlist_parses_with_only_spec_fields(allowlist):
++    data = tomllib.loads((REAL_TARGETS / "ubuntu-26.04" / "allowlist.toml").read_text())
++    assert data["spec"] == "policy-gate/v1"
++    assert set(data) == {"spec", "commands"}
++    for word, entry in allowlist.items():
++        assert set(entry) <= ENTRY_FIELDS, word
++        for key in ("flags", "options", "subcommands"):
++            assert all(isinstance(v, str) for v in entry.get(key, [])), (word, key)
++        if "max_operands" in entry:
++            assert isinstance(entry["max_operands"], int) and entry["max_operands"] >= 0
++        if "stdin" in entry:
++            assert entry["stdin"] is True or entry["stdin"] is False
++
++
++def test_real_allowlist_has_exactly_the_v1_words(allowlist):
++    assert set(allowlist) == ALLOWLIST_WORDS
++    for word in NEVER_ON_ALLOWLIST:
++        assert word not in allowlist
++
++
++def test_real_allowlist_comment_names_the_omitted_words():
++    text = (REAL_TARGETS / "ubuntu-26.04" / "allowlist.toml").read_text()
++    header = text.split("\nspec = ", 1)[0]
++    assert "§6.2" in header
++    assert re.search(r"#\s+command\s", header)
++    assert re.search(r"#\s+ip\s", header)
++
++
++def test_real_allowlist_restrictions(allowlist):
++    a = allowlist
++    assert "-r" not in allowed(a["xxd"])
++    assert not allowed(a["sort"]) & {"-o", "--output", "--compress-program"}
++    for word in ("grep", "egrep", "fgrep"):
++        assert "--pre" not in allowed(a[word]), word
++    assert not allowed(a["jq"]) & {"--rawfile", "--slurpfile"}
++    assert "--to-file" not in allowed(a["diff"])
++    for word in ("man", "less", "more"):
++        assert not allowed(a[word]) & {"-P", "-H", "--pager", "--html", "-k"}, word
++    journal = allowed(a["journalctl"])
++    assert not any(opt.startswith("--vacuum") for opt in journal)
++    assert not journal & {"--rotate", "--flush"}
++    for word in ("env", "printenv", "date", "hostname"):
++        assert a[word].get("max_operands") == 0, word
++    for word in ("uniq", "cut", "tr", "column", "base64", "xxd"):
++        assert "max_operands" in a[word] and a[word]["max_operands"] <= 1, word
++    assert set(a["systemctl"]["subcommands"]) == {
++        "status", "is-active", "is-enabled", "is-failed", "list-units", "list-unit-files",
++        "show", "cat",
++    }
++    assert len(a["systemctl"]["subcommands"]) == 8
++    assert sorted(a["apt"]["subcommands"]) == sorted(["list", "show", "search", "policy"])
++    assert sorted(a["apt-cache"]["subcommands"]) == sorted(
++        ["show", "search", "policy", "depends", "rdepends"]
++    )
++    for word in ("dpkg", "dpkg-query"):
++        assert allowed(a[word]) <= {"-l", "-L", "-S", "-s", "-W"}, word
++    for word in ("nvidia-smi", "rocminfo", "vulkaninfo"):
++        assert allowed(a[word]) <= {"-L", "-q", "--summary"}, word
++
++
++def test_real_allowlist_hostname_allows_no_resolver_lookup(allowlist):
++    """`-f`, `-d`, `-A`, `-a`, `-i`, `-y` resolve names and can send DNS queries (§6.3)."""
++    assert allowed(allowlist["hostname"]) <= {"-s", "--short", "-I", "--all-ip-addresses"}
++
++
++def test_real_allowlist_gpu_tools_take_no_operands(allowlist):
++    """`nvidia-smi <subcommand>` (`mig`, `clocks`, …) changes GPU state."""
++    for word in ("nvidia-smi", "rocminfo", "vulkaninfo"):
++        assert allowlist[word].get("max_operands") == 0, word
++        assert "subcommands" not in allowlist[word], word
++
++
++def test_real_allowlist_pins_plus_words_for_less_and_more(allowlist):
++    """`less '+!id' FILE` runs `id`. No `+` word is listed, and the entry tells #12 so."""
++    for word in ("less", "more"):
++        assert not any(opt.startswith("+") for opt in allowed(allowlist[word])), word
++    text = (REAL_TARGETS / "ubuntu-26.04" / "allowlist.toml").read_text(encoding="utf-8")
++    before_less = text.split("\n[commands.less]", 1)[0]
++    comment = before_less.rsplit("\n\n", 1)[-1]  # the comment block just above the entry
++    assert "`+`" in comment
++    assert "`mutating`" in comment
++    assert "#12" in comment
++
++
++def test_real_allowlist_man_comment_names_the_variables_baseline_misses():
++    """§7.5 doesn't snapshot `MANOPT` or `LESS`; the `man` entry must not claim it does."""
++    text = (REAL_TARGETS / "ubuntu-26.04" / "allowlist.toml").read_text(encoding="utf-8")
++    before_man = text.split("\n[commands.man]", 1)[0]
++    comment = before_man.rsplit("\n\n", 1)[-1]
++    assert "`MANOPT`" in comment
++    assert "`LESS`" in comment
++    assert "Pager variables must match the" not in comment
++
++
++# --- (h) no OS name in code ------------------------------------------------------------
++
++# The product tagline, not an OS check (brief: an exception the human approves).
++TAGLINE_LINES = {("__init__.py", 1), ("cli.py", 14)}
++
++
++def test_no_os_name_in_code():
++    src = REPO / "src" / "nl_shell"
++    hits = []
++    for path in sorted(src.rglob("*.py")):
++        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
++            if re.search(r"ubuntu|26\.04", line, re.IGNORECASE):
++                if (str(path.relative_to(src)), number) not in TAGLINE_LINES:
++                    hits.append(f"{path.relative_to(REPO)}:{number}: {line.strip()}")
++    assert hits == []
++
++
++# --- The REPL without a target ------------------------------------------------------------
++
++
++def test_repl_without_a_target_has_no_target_lines():
++    out = io.StringIO()
++    assert Repl(scripted(":status"), out).run() == 0
++    assert not any(line.startswith("target") for line in out.getvalue().splitlines())

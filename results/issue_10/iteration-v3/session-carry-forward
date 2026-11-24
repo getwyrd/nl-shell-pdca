@@ -1,0 +1,8 @@
+Re-plan to settle the security decisions before another build; more Do rounds keep patching one hole at a time in the same class (in-shell code reporting on its own state).
+Decide in the brief, and record in the threat model / spec as needed:
+- Trust model of the snapshot: is it meant to resist a hostile `source`d script? A function named `builtin`/`command` currently hides aliases/functions from F/L with H unchanged (session.py:78-79 comment overstates the guarantee). Either add a structural defence or document it as a known gap and have the gate (#12) treat `source`/`.` as session-altering.
+- fd 3 forgery: a command can write its own D + snapshot + E to fd 3 and run() returns it as success. Decide protocol-level: keep fd 3 away from the command, authenticate records, or accept + document.
+- H/V integrity: cksum (CRC-32) is forgeable; decide whether to send raw text for nl-shell to compare or use a real hash (spec change).
+- Implementation fixes to carry into the brief: no external tr/cksum lookup via PATH/hash table in the hook (bash string ops or absolute paths) + a `hash -p` regression; reversible PATH encoding (literal \x1e collides with encoded newline) + regression.
+- Product trade-offs to decide with them: typed-ahead input prepended to the next confirmed command; syntax error/comment-only line degrades the session; capture stops at first forwarded byte; an owner issue for the output rendering filter (OSC 52 etc.) that blocks #78.
+Consider splitting the slice (session core / snapshot integrity / terminal forwarding) — 2 rounds spent, 71 KB patch.

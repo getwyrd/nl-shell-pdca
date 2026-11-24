@@ -1,0 +1,25 @@
+Add a quarantined reader that diagnoses failed commands
+
+When a command fails, nl-shell needs to say why (for "?why" and for
+fix-on-failure) without letting the command's raw output reach the command
+model. That output is untrusted: a crafted error message could carry an
+instruction. Nothing built that boundary yet.
+
+The new nl_shell.reader module sends the raw stdout/stderr in its own model
+request, held to the reader_v1 schema (docs/design/specs/reader-schema/v1.md),
+and checks the answer. Any schema failure gives "no diagnosis"; nothing is
+repaired. Package and unit names are kept only if a lookup the caller passes
+in finds them, never via $PATH. The only text it hands on is built from
+nl-shell templates keyed on the category, plus the names that passed, and is
+labelled untrusted.
+
+To let the reader ask for its own schema, Backend.complete and
+TeacherClient.complete take an optional schema; with none, requests are
+byte-for-byte what they were (proposal_v1). The reader prompt lives in
+targets/ubuntu-26.04/prompts/reader.yaml, apart from the command model's
+prompt. The threat model and architecture docs now describe the built reader.
+
+Wiring the reader into "?why" (#14) and fix-on-failure (#17), and the check
+that raw output never shows up in :context, come with those issues.
+
+Fixes #61

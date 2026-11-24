@@ -1,0 +1,25 @@
+# Adversarial review — issue 94 / architecture-os-targets (round 4)
+
+I re-ran the red→green myself. I used the instance `.venv` Python (pytest 9.1.1) and ran the retained `tests/test_architecture_targets.py` against `git archive HEAD` architecture docs (before the fix) and against the patched docs in `$PDCA_TARGET` (after). Result: **3 failed → 3 passed**. The test reads the real Markdown, not a copy, so the evidence is real. C4's exit 77 (`gate-logs/C4-verify.log`) is the docs-only exception the human accepted in Plan. It is not a refutation. T3 shows `1334 passed, 1 skipped` (`gate-logs/T3-suite.log`).
+
+I tried to refute: the selection/warning claims (`src/nl_shell/cli.py:62-81`, `config.py:70`, `targets.py:98-101`), and they are accurate. The reader/`[command_provider]` claim (`reader.py:44,129-135`, `targets/ubuntu-26.04/target.toml`) is accurate. The §8.5 `dpkg`/`apt` scoping is accurate: `package_exists` is the dpkg/apt index, and the command-not-found DB is checked against it (`reader.py:316-326`). The ADR-0023 model-location, hash and adapter wording (`docs/design/adr/0023-os-targets.md:57-71`) is accurate. Both `[OPEN]` items are kept. I found no unscoped OS-specific text left outside allowed milestones and examples (09:24,26; 08:97). What still holds up:
+
+- NEEDS-HUMAN [impl] — **"State capture" silently lost its planned status.** `docs/design/architecture/05-building-block-view.md:116` narrows the old catch-all row to "PTY session, policy gate integration, confirm UI, session log", and drops "state capture". But state capture is not built. `src/nl_shell/prompts.py:47` says "The state block (#11) fills this slot; until then it is empty". Yet State capture is still a §5.1 component (`05-building-block-view.md:21,53`), and the chapter header at `:11` promises that "Components not yet built are marked *(planned)* in 5.3". So after this patch, an unbuilt component is no longer marked planned anywhere. That breaks the round-3 instruction to "drop only what the new target rows now cover or what is verifiably built". The test pins this wrong row exactly (`tests/test_architecture_targets.py:37`), so putting state capture back would turn the test red. Fix: add "state capture" (#11) back to the planned row and update the pinned string. Model backend and prefix modes really are built (`backend.py`, `input_modes.py`, used by `repl.py:20-22`), so dropping those is fine.
+
+- NEEDS-HUMAN [impl] — **The chapter 05 status wording is still mostly unpinned. Plain overclaims leave the test green.** I tried mutations in a scratch copy, and every one of these still gave `3 passed`:
+  - (a) `05-building-block-view.md:75`: "these consumers are not built" → "the REPL reads them at start-up".
+  - (b) `:90`: "Model integrity and adapter compatibility remain requirements awaiting implementation" → "…are enforced by the REPL".
+  - (c) `:84`: "Targets are not packaged yet" → "Targets ship in the package today". This sentence is pinned only in chapter 07.
+  - (d) `:83`: "Installer and packaging (planned, #48, #50)" → "(built)".
+  - (e) `:81`: "Reader module (built, not yet wired into the REPL)" → "Reader module (built)". Round 3 asked that a plain "built" for the reader must fail. Only the §5.3 row is pinned (`test:33-35`), not this §5.1 bullet, so the same overclaim gets back in one section up.
+  - (f) The diagram edge label at `:34` → `"reader prompt (built)"`.
+
+  The section headers are pinned, but the status text inside each section is not, which is the round-1/2 failure mode. Fix: assert "not built" in the REPL-inputs section, "awaiting implementation" and "not packaged yet" in chapter 05, "(planned" in the installer bullet header, "not yet wired" in the reader bullet, and the reader edge label.
+
+- NEEDS-HUMAN [impl] — **The open-question test doesn't stop a channel being chosen.** `tests/test_architecture_targets.py:403-405` checks only that some `**[OPEN]**` line mentions "URL host"/`model.toml` and "package distribution channel". If I replace the rest of `07-deployment-view.md:72` with "GitHub releases are used.", the test stays at `3 passed`. A weight host could also be named anywhere else in chapter 07 without failing. The brief forbids choosing GitHub, Hugging Face or a PPA. Fix: assert that "resolves neither" is present, and that none of `GitHub`, `Hugging Face` or `PPA` appears in chapter 07.
+
+- NEEDS-HUMAN [human] — **Still open from round 3, not settled by this diff.** `07-deployment-view.md` §7.1 lists `gate-vectors.toml` as "supplies gate tests", which leaves it off the shipped runtime list. ADR-0023:47 marks it "gate tests". But ADR-0023's follow-up ("the gate (#12) loads `allowlist.toml` and `gate-vectors.toml`") and :123 ("ship the runtime files of every target") can be read either way. The human must also still do the full chapter-by-chapter semantic sweep, including 10:55/58/59. Passing tests do not cover that.
+
+I could not refute: the before/after evidence, the start-up/selection, reader and §8.5 claims, the ADR-0023 integrity/adapter wording, or keeping both `[OPEN]` questions.
+
+<!-- pdca:leaf-complete -->

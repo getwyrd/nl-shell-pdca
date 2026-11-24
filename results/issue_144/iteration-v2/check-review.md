@@ -1,0 +1,26 @@
+Review the Unicode 16.0.0 character-safety policy for rejecting hidden characters, excessive combining marks and mixed-script proposal words, while escaping unsafe display text.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The brief defines falsifiable rejection, display, compatibility and data-source criteria, including explicitly approved quoted-command rejection (brief.md:13, brief.md:21). |
+| C2 Reproduction (red pre-fix) | PASS | Independent execution of the target's HEAD render module caught 0/16 supplied hidden vectors; the frozen pytest red leg records 39 failures and 6 passes without collection errors (gate-logs/C4-verify.log:14). |
+| C3 Change | PASS | The parser applies the shared policy at the command boundary and leaves unrelated execution behavior outside this change (target/src/nl_shell/proposal.py:127). |
+| C4 Verification (red→green) | PASS | Frozen pytest evidence shows 39/45 failures pre-fix and 45/45 passes patched; independent hidden, mark and script probes pass, and Unicode 16.0.0 regeneration is byte-identical (gate-logs/C4-verify.log:10; target/scripts/gen_unicode_tables.py:139). |
+| C5 Causal adequacy | PASS | Property-based classification closes the specified omissions without a capability probe or fallback masking a load-time cause; independent positive and negative probes agree with the defined policy (target/src/nl_shell/render.py:96, target/src/nl_shell/render.py:163). |
+| T1 Structure | PASS | One runtime policy and a separate build-only generator preserve consistent rejection/display semantics without adding a runtime package dependency (target/src/nl_shell/render.py:96; target/scripts/gen_unicode_tables.py:1). |
+| T2 Shape | PASS | Direct review confirms the security invariant documents the policy and quoted-command restriction without changing the sudo bullets; the scanner itself reported only “no security-relevant path touched” (target/.oss-scanner/threat_model.md:127; gate-logs/T2-threat-model.log:10). |
+| T3 Runtime | PASS | The frozen whole-suite run reports 526 passing tests with one forkpty deprecation warning; local pytest is absent, so this is log-supported rather than independently reproduced suite evidence (gate-logs/T3-suite.log:25). |
+| T4 Contribution | N/A | Contribution artifacts are intentionally drafted after Check; the substantive audit must rerun at publish (gate-logs/T4-contribution.log:10). |
+| T5 Judgment | NEEDS-HUMAN | Confirm affected-path prior art across merged history and closed/rejected work before sign-off — this snapshot contains only one synthetic base commit, and the brief's keyword searches do not establish that check (brief.md:25). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Confirm the strict mixed-script, quoted-text and two-mark policy is acceptable for real multilingual shell use and the visibility claim fits supported terminals — automated byte-level checks cannot establish visual fitness (brief.md:28; target/.oss-scanner/threat_model.md:132). |
+
+Independent evidence and limits:
+
+- Read the supplied patch, target source and all four frozen gate logs. Target source matches the patch; no stale-target caveat was necessary.
+- `python3 -m pytest tests/test_charsafety.py tests/test_backend.py -q` could not start because the local interpreter has no pytest. No stash cycle was performed because it could not reproduce pytest here. Instead, executed the pre-fix render source obtained with `git -C target show HEAD:src/nl_shell/render.py` in memory: all 16 hidden vectors were missed. Executed patched render probes: all 16 were rejected and escaped, the two/three-mark boundary passed, all three mixed-script rejection vectors passed, and Cyrillic, Greek, Japanese and accented-Latin acceptance probes passed. The full REPL red→green conclusion rests on the frozen gate log, not those narrower probes.
+- Called the generator's `generate(Path('/usr/share/unicode'), '16.0.0')` in memory and compared its result with the committed table module: identical. The declared build-only `unicode-data` dependency was present and exercised; no shim or curated substitute was used.
+- Reran `python3 scripts/docs_links.py`: 63 links across 55 Markdown files, zero broken. `docs_checks.py` requires an immutability BASE/HEAD pair; the synthetic single-base snapshot cannot reproduce that historical audit. The instance-root scanner wrappers are not supplied here; their captured logs were read.
+- Ran affected-path `git log --all --` for the policy, parser, generator and new tests: only synthetic commit `7d76db3` is available. Closed/rejected work is not supplied. No INTEGRATION.md is present in the target snapshot.
+- For visual sign-off, launch `python3 -m nl_shell` in the supported runtime with its configured backend. Enter a request containing U+3164 and inspect `:context` for literal `\u3164`; repeat with `e` plus three U+0301 and expect two raw marks followed by literal `\u0301`. In the same terminal/font, compare accepted Cyrillic, Greek and Japanese proposals with their actual text. `python3 -m pytest tests/test_charsafety.py -q` supplies deterministic stub-driven rejection checks; decide whether the documented exclusions and strictness meet the intended use.
+
+<!-- pdca:leaf-complete -->
